@@ -52,6 +52,7 @@ The active sort column is highlighted and shows its direction.
 | `n` | Sort by activity name |
 | `t` | Sort by terminal ID |
 | `r` | Reverse current sort |
+| `u` | Toggle the usage calendar |
 | `q` or Ctrl-C | Quit |
 
 Use `ghostty-top --once` for script-friendly output, or change the one-second
@@ -76,6 +77,11 @@ ghostty-top --track
 
 The tracker flushes its small local data file every 30 seconds. It does not send
 usage data anywhere.
+
+Press `u` or click `[USAGE]` to open the eight-week calendar. Every dot is one
+day, and brighter dots represent more focused Ghostty time. Hover over a dot to
+see its date and total; click it to show that day's per-tab time and percentage
+breakdown. Click `[MONITOR]` or press `u` to return to live process usage.
 
 ## Measurement notes
 

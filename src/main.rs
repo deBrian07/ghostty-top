@@ -50,13 +50,22 @@ enum InputEvent {
     Mouse(MouseEvent),
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Layout {
     header_row: usize,
     terminal_start_row: usize,
     shown_start: usize,
     shown_count: usize,
     footer_row: usize,
+    calendar_cells: Vec<CalendarCell>,
+}
+
+#[derive(Clone, Debug)]
+struct CalendarCell {
+    start_column: usize,
+    end_column: usize,
+    row: usize,
+    day: String,
 }
 
 #[derive(Default)]
@@ -101,6 +110,12 @@ enum SortBy {
     Age,
     Activity,
     Tty,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Monitor,
+    Usage,
 }
 
 #[derive(Default)]
@@ -158,6 +173,9 @@ struct App {
     last_error: Option<String>,
     memory_history: HashMap<i32, MemoryHistory>,
     usage_tracker: Option<UsageTracker>,
+    view: View,
+    hovered_day: Option<String>,
+    selected_day: Option<String>,
 }
 
 impl App {
@@ -173,6 +191,9 @@ impl App {
             last_error: None,
             memory_history: HashMap::new(),
             usage_tracker: None,
+            view: View::Monitor,
+            hovered_day: None,
+            selected_day: None,
         }
     }
 
@@ -204,6 +225,13 @@ impl App {
             Key::Char(b'a') => self.set_sort(SortBy::Age),
             Key::Char(b'n') => self.set_sort(SortBy::Activity),
             Key::Char(b't') => self.set_sort(SortBy::Tty),
+            Key::Char(b'u') => {
+                self.view = if self.view == View::Monitor {
+                    View::Usage
+                } else {
+                    View::Monitor
+                };
+            }
             Key::Char(b'r') => {
                 self.descending = !self.descending;
                 sort_terminals(&mut self.terminals, self.sort, self.descending);
@@ -218,7 +246,30 @@ impl App {
         true
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent, layout: Layout) -> bool {
+    fn handle_mouse(&mut self, mouse: MouseEvent, layout: &Layout) -> bool {
+        if self.view == View::Usage {
+            self.hovered_day = layout
+                .calendar_cells
+                .iter()
+                .find(|cell| {
+                    mouse.row == cell.row
+                        && mouse.column >= cell.start_column
+                        && mouse.column <= cell.end_column
+                })
+                .map(|cell| cell.day.clone());
+            if mouse.pressed && mouse.button == 0 {
+                if let Some(day) = &self.hovered_day {
+                    self.selected_day = Some(day.clone());
+                } else if mouse.row == layout.footer_row {
+                    match mouse.column {
+                        8..=16 => self.view = View::Monitor,
+                        18..=23 => return false,
+                        _ => {}
+                    }
+                }
+            }
+            return true;
+        }
         if !mouse.pressed {
             return true;
         }
@@ -257,6 +308,7 @@ impl App {
                         48..=57 => self.set_sort(SortBy::Activity),
                         59..=66 => self.expanded = !self.expanded,
                         68..=73 => return false,
+                        75..=81 => self.view = View::Usage,
                         _ => {}
                     }
                 }
@@ -448,6 +500,7 @@ impl UsageTracker {
                 self.last_focus = None;
                 self.last_observed = None;
                 self.last_error = Some(error);
+                self.next_poll = now + Duration::from_secs(30);
             }
         }
         if now >= self.next_flush {
@@ -685,7 +738,7 @@ fn main() {
             for event in decoder.push(&input[..count]) {
                 let keep_running = match event {
                     InputEvent::Key(key) => app.handle_key(key),
-                    InputEvent::Mouse(mouse) => app.handle_mouse(mouse, layout),
+                    InputEvent::Mouse(mouse) => app.handle_mouse(mouse, &layout),
                 };
                 if !keep_running {
                     app.flush_usage();
@@ -752,7 +805,7 @@ impl TerminalGuard {
         if !ok {
             return None;
         }
-        print!("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h");
+        print!("\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h");
         let _ = io::stdout().flush();
         Some(Self { original })
     }
@@ -763,7 +816,7 @@ impl Drop for TerminalGuard {
         let _ = Command::new("stty")
             .args(["-f", "/dev/tty", &self.original])
             .status();
-        print!("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l{RESET}");
+        print!("\x1b[?1003l\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l{RESET}");
         let _ = io::stdout().flush();
     }
 }
@@ -993,6 +1046,13 @@ fn natural_tty(tty: &str) -> u32 {
 }
 
 fn render(app: &App) -> Layout {
+    match app.view {
+        View::Monitor => render_monitor(app),
+        View::Usage => render_usage(app),
+    }
+}
+
+fn render_monitor(app: &App) -> Layout {
     let (height, width) = terminal_size();
     let mut lines = Vec::new();
     let shared_cpu = app.ghostty.as_ref().map_or(0.0, |p| p.cpu);
@@ -1139,15 +1199,246 @@ fn render(app: &App) -> Layout {
     lines.push(String::new());
     layout.footer_row = lines.len() + 1;
     lines.push(format!(
-        "{DIM}Mouse:{RESET} {UNDERLINE}[TTY]{RESET} {UNDERLINE}[CPU]{RESET} {UNDERLINE}[RAM]{RESET} {UNDERLINE}[TREND]{RESET} {UNDERLINE}[PROCS]{RESET} {UNDERLINE}[AGE]{RESET} {UNDERLINE}[ACTIVITY]{RESET} {UNDERLINE}[EXPAND]{RESET} {UNDERLINE}[QUIT]{RESET}"
+        "{DIM}Mouse:{RESET} {UNDERLINE}[TTY]{RESET} {UNDERLINE}[CPU]{RESET} {UNDERLINE}[RAM]{RESET} {UNDERLINE}[TREND]{RESET} {UNDERLINE}[PROCS]{RESET} {UNDERLINE}[AGE]{RESET} {UNDERLINE}[ACTIVITY]{RESET} {UNDERLINE}[EXPAND]{RESET} {UNDERLINE}[QUIT]{RESET} {UNDERLINE}[USAGE]{RESET}"
     ));
     lines.push(format!(
-        "{DIM}Keys: t/c/m/g/p/a/n sort  •  ↑/↓ move  •  enter expand  •  r reverse  •  q quit  •  refresh {:.1}s{RESET}",
+        "{DIM}Keys: t/c/m/g/p/a/n sort  •  ↑/↓ move  •  enter expand  •  r reverse  •  u usage  •  q quit  •  refresh {:.1}s{RESET}",
         app.interval.as_secs_f64()
     ));
     print!("\x1b[H\x1b[2J{}", lines.join("\n"));
     let _ = io::stdout().flush();
     layout
+}
+
+fn render_usage(app: &App) -> Layout {
+    const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const WEEKS: i64 = 8;
+    let (height, _) = terminal_size();
+    let mut lines = vec![format!(
+        "{BOLD}{GREEN}ghostty-top{RESET}  {BOLD}focused tab usage{RESET}"
+    )];
+    let mut layout = Layout::default();
+    let tracker = app.usage_tracker.as_ref();
+    let today = tracker
+        .map(|value| value.current_day.clone())
+        .or_else(local_date)
+        .unwrap_or_else(|| "1970-01-01".to_string());
+    let today_number = date_to_day_number(&today).unwrap_or(0);
+    let current_weekday = (today_number + 3).rem_euclid(7);
+    let start = today_number - current_weekday - (WEEKS - 1) * 7;
+    let range_total: u64 = tracker
+        .map(|value| {
+            value
+                .store
+                .days
+                .iter()
+                .filter_map(|(day, tabs)| {
+                    let number = date_to_day_number(day)?;
+                    (number >= start && number <= today_number)
+                        .then(|| tabs.values().map(|usage| usage.seconds).sum::<u64>())
+                })
+                .sum()
+        })
+        .unwrap_or(0);
+    lines.push(format!(
+        "Last 8 weeks  •  {} total  •  brighter dots mean more focused time",
+        human_duration(range_total)
+    ));
+    if let Some(error) = tracker.and_then(|value| value.last_error.as_ref()) {
+        lines.push(format!("{RED}Tracking paused: {error}{RESET}"));
+    } else {
+        lines.push(format!(
+            "{DIM}Tracking only while Ghostty is frontmost; samples every 5 seconds.{RESET}"
+        ));
+    }
+    lines.push(String::new());
+
+    let mut week_header = String::from("    ");
+    for week in 0..WEEKS {
+        let (year, month, day) = civil_from_day_number(start + week * 7);
+        let _ = year;
+        week_header.push_str(&format!("{month:02}/{day:02} "));
+    }
+    lines.push(format!("{DIM}{week_header}{RESET}"));
+
+    for (weekday, label) in WEEKDAYS.iter().enumerate() {
+        let row = lines.len() + 1;
+        let mut line = format!("{label} ");
+        for week in 0..WEEKS {
+            let number = start + week * 7 + weekday as i64;
+            let day = day_number_to_date(number);
+            let seconds = tracker
+                .and_then(|value| value.store.days.get(&day))
+                .map(|tabs| tabs.values().map(|usage| usage.seconds).sum())
+                .unwrap_or(0);
+            let future = number > today_number;
+            line.push_str(&usage_dot(seconds, future));
+            if !future {
+                layout.calendar_cells.push(CalendarCell {
+                    start_column: 5 + week as usize * 6,
+                    end_column: 10 + week as usize * 6,
+                    row,
+                    day,
+                });
+            }
+        }
+        lines.push(line);
+    }
+
+    lines.push(String::new());
+    if let Some(day) = &app.hovered_day {
+        let seconds = usage_total_for_day(tracker, day);
+        lines.push(format!(
+            "{BOLD}{}{RESET}  •  {}",
+            friendly_date(day),
+            human_duration(seconds)
+        ));
+    } else {
+        lines.push(format!(
+            "{DIM}Hover over a dot for its date and total; click it for the tab breakdown.{RESET}"
+        ));
+    }
+
+    if let Some(day) = &app.selected_day {
+        lines.push(String::new());
+        lines.push(format!(
+            "{BOLD}{} breakdown{RESET}  •  {}",
+            friendly_date(day),
+            human_duration(usage_total_for_day(tracker, day))
+        ));
+        lines.push(format!(
+            "{DIM}{UNDERLINE}  TAB                                      TIME      SHARE{RESET}"
+        ));
+        let mut tabs: Vec<(&String, &TabUsage)> = tracker
+            .and_then(|value| value.store.days.get(day))
+            .map(|values| values.iter().collect())
+            .unwrap_or_default();
+        tabs.sort_by(|(_, a), (_, b)| b.seconds.cmp(&a.seconds));
+        let total = tabs.iter().map(|(_, usage)| usage.seconds).sum::<u64>();
+        let available = height.saturating_sub(lines.len() + 4);
+        if tabs.is_empty() {
+            lines.push("  No focused Ghostty usage recorded for this day.".to_string());
+        } else {
+            for (_, usage) in tabs.into_iter().take(available) {
+                let share = if total == 0 {
+                    0.0
+                } else {
+                    usage.seconds as f64 / total as f64 * 100.0
+                };
+                lines.push(format!(
+                    "  {:<40} {:>8}   {:>5.1}%",
+                    truncate(&usage.name, 40),
+                    human_duration(usage.seconds),
+                    share
+                ));
+            }
+        }
+    }
+
+    lines.push(String::new());
+    layout.footer_row = lines.len() + 1;
+    lines.push(format!(
+        "{DIM}Mouse:{RESET} {UNDERLINE}[MONITOR]{RESET} {UNDERLINE}[QUIT]{RESET}"
+    ));
+    lines.push(format!(
+        "{DIM}Keys: u monitor  •  q quit  •  data: ~/Library/Application Support/ghostty-top/usage.tsv{RESET}"
+    ));
+    print!("\x1b[H\x1b[2J{}", lines.join("\n"));
+    let _ = io::stdout().flush();
+    layout
+}
+
+fn usage_total_for_day(tracker: Option<&UsageTracker>, day: &str) -> u64 {
+    tracker
+        .and_then(|value| value.store.days.get(day))
+        .map(|tabs| tabs.values().map(|usage| usage.seconds).sum())
+        .unwrap_or(0)
+}
+
+fn usage_dot(seconds: u64, future: bool) -> String {
+    if future {
+        return "      ".to_string();
+    }
+    let (color, dot) = match seconds {
+        0 => ("\x1b[38;5;238m", "·"),
+        1..=899 => ("\x1b[38;5;240m", "●"),
+        900..=3_599 => ("\x1b[38;5;75m", "●"),
+        3_600..=10_799 => ("\x1b[38;5;81m", "●"),
+        10_800..=21_599 => ("\x1b[38;5;159m", "●"),
+        _ => ("\x1b[38;5;231m", "●"),
+    };
+    format!("  {color}{dot}{RESET}   ")
+}
+
+fn human_duration(seconds: u64) -> String {
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else if seconds > 0 {
+        "<1m".to_string()
+    } else {
+        "0m".to_string()
+    }
+}
+
+fn friendly_date(day: &str) -> String {
+    const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let Some(number) = date_to_day_number(day) else {
+        return day.to_string();
+    };
+    let (year, month, date) = civil_from_day_number(number);
+    let weekday = WEEKDAYS[(number + 3).rem_euclid(7) as usize];
+    format!("{weekday}, {} {date}, {year}", MONTHS[month as usize - 1])
+}
+
+fn date_to_day_number(day: &str) -> Option<i64> {
+    let mut fields = day.split('-').filter_map(|value| value.parse().ok());
+    let (year, month, date) = (fields.next()?, fields.next()?, fields.next()?);
+    Some(days_from_civil(year, month, date))
+}
+
+fn day_number_to_date(number: i64) -> String {
+    let (year, month, day) = civil_from_day_number(number);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn civil_from_day_number(number: i64) -> (i64, i64, i64) {
+    let shifted = number + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }
 
 fn terminal_size() -> (usize, usize) {
@@ -1454,10 +1745,43 @@ mod tests {
             row: 6,
             pressed: true,
         };
-        assert!(app.handle_mouse(click, layout));
+        assert!(app.handle_mouse(click, &layout));
         assert_eq!(app.selected, 1);
         assert!(!app.expanded);
-        assert!(app.handle_mouse(click, layout));
+        assert!(app.handle_mouse(click, &layout));
         assert!(app.expanded);
+    }
+
+    #[test]
+    fn calendar_dates_round_trip() {
+        for date in ["1970-01-01", "2024-02-29", "2026-08-06", "2030-12-31"] {
+            let number = date_to_day_number(date).unwrap();
+            assert_eq!(day_number_to_date(number), date);
+        }
+        assert_eq!(friendly_date("2026-08-06"), "Thu, Aug 6, 2026");
+    }
+
+    #[test]
+    fn clicking_calendar_day_selects_it() {
+        let mut app = App::new(Duration::from_secs(1));
+        app.view = View::Usage;
+        let layout = Layout {
+            calendar_cells: vec![CalendarCell {
+                start_column: 5,
+                end_column: 9,
+                row: 6,
+                day: "2026-08-06".into(),
+            }],
+            ..Layout::default()
+        };
+        let click = MouseEvent {
+            button: 0,
+            column: 7,
+            row: 6,
+            pressed: true,
+        };
+        assert!(app.handle_mouse(click, &layout));
+        assert_eq!(app.hovered_day.as_deref(), Some("2026-08-06"));
+        assert_eq!(app.selected_day.as_deref(), Some("2026-08-06"));
     }
 }
