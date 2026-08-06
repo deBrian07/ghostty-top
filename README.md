@@ -37,6 +37,7 @@ No runtime dependencies or elevated permissions are required.
 Mouse controls work directly in Ghostty: click a terminal to select it, click
 the selected terminal again to expand its processes, use the scroll wheel to
 move through the list, or click the column headings and footer actions.
+The active sort column is highlighted and shows its direction.
 
 | Key | Action |
 | --- | --- |
@@ -45,6 +46,10 @@ move through the list, or click the column headings and footer actions.
 | `e`, space, or enter | Show/hide processes in the selected terminal |
 | `c` | Sort by CPU (press again to reverse) |
 | `m` | Sort by memory (press again to reverse) |
+| `g` | Sort by memory growth trend |
+| `p` | Sort by process count |
+| `a` | Sort by terminal age |
+| `n` | Sort by activity name |
 | `t` | Sort by terminal ID |
 | `r` | Reverse current sort |
 | `q` or Ctrl-C | Quit |
@@ -60,3 +65,12 @@ refresh with `ghostty-top --interval 0.5`.
   this is an attribution metric rather than a perfect measure of unique memory.
 - A process that daemonizes and gets re-parented can no longer be attributed to
   the terminal that launched it.
+
+## Potential memory leak alerts
+
+`ghostty-top` keeps a five-minute rolling RAM history for each terminal. A row
+is marked as a potential leak only after at least six samples over 30 seconds,
+when its recent average has grown by both 32 MiB and 15% over its baseline.
+This deliberately avoids warning on a single allocation spike. The alert is a
+diagnostic hint—not proof of a leak—because caches and legitimate workloads can
+also grow steadily. Restarting `ghostty-top` resets the history.

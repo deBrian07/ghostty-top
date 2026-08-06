@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
@@ -13,6 +13,14 @@ const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 const SELECTED: &str = "\x1b[48;5;236m";
 const UNDERLINE: &str = "\x1b[4m";
+const RED: &str = "\x1b[38;5;203m";
+const WARNING: &str = "\x1b[48;5;52m\x1b[38;5;231m";
+const ACTIVE_HEADER: &str = "\x1b[1;38;5;232;48;5;114m";
+const HISTORY_WINDOW: Duration = Duration::from_secs(5 * 60);
+const MIN_LEAK_DURATION: Duration = Duration::from_secs(30);
+const MIN_LEAK_SAMPLES: usize = 6;
+const MIN_LEAK_GROWTH_KIB: i64 = 32 * 1024;
+const MIN_LEAK_GROWTH_RATIO: f64 = 0.15;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Key {
@@ -59,24 +67,47 @@ struct Process {
     cpu: f64,
     rss_kib: u64,
     elapsed: String,
+    age_seconds: u64,
     command: String,
 }
 
 #[derive(Clone, Debug, Default)]
 struct Terminal {
+    root_pid: i32,
     tty: String,
     cpu: f64,
     rss_kib: u64,
     processes: Vec<Process>,
     activity: String,
     elapsed: String,
+    age_seconds: u64,
+    memory_growth_kib: i64,
+    memory_slope_kib_per_min: f64,
+    memory_samples: usize,
+    leak_suspected: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum SortBy {
     Cpu,
     Memory,
+    Trend,
+    Processes,
+    Age,
+    Activity,
     Tty,
+}
+
+#[derive(Default)]
+struct MemoryHistory {
+    samples: VecDeque<(Instant, u64)>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MemoryTrend {
+    growth_kib: i64,
+    slope_kib_per_min: f64,
+    suspected: bool,
 }
 
 struct App {
@@ -88,6 +119,7 @@ struct App {
     expanded: bool,
     interval: Duration,
     last_error: Option<String>,
+    memory_history: HashMap<i32, MemoryHistory>,
 }
 
 impl App {
@@ -101,6 +133,7 @@ impl App {
             expanded: false,
             interval,
             last_error: None,
+            memory_history: HashMap::new(),
         }
     }
 
@@ -109,6 +142,7 @@ impl App {
             Ok(processes) => {
                 let selected_tty = self.terminals.get(self.selected).map(|t| t.tty.clone());
                 let (ghostty, mut terminals) = aggregate(&processes);
+                self.update_memory_trends(&mut terminals, Instant::now());
                 sort_terminals(&mut terminals, self.sort, self.descending);
                 self.ghostty = ghostty;
                 self.terminals = terminals;
@@ -126,6 +160,10 @@ impl App {
             Key::Char(b'q' | 3) => return false,
             Key::Char(b'c') => self.set_sort(SortBy::Cpu),
             Key::Char(b'm') => self.set_sort(SortBy::Memory),
+            Key::Char(b'g') => self.set_sort(SortBy::Trend),
+            Key::Char(b'p') => self.set_sort(SortBy::Processes),
+            Key::Char(b'a') => self.set_sort(SortBy::Age),
+            Key::Char(b'n') => self.set_sort(SortBy::Activity),
             Key::Char(b't') => self.set_sort(SortBy::Tty),
             Key::Char(b'r') => {
                 self.descending = !self.descending;
@@ -152,8 +190,12 @@ impl App {
                 if mouse.row == layout.header_row {
                     match mouse.column {
                         1..=12 => self.set_sort(SortBy::Tty),
-                        13..=21 => self.set_sort(SortBy::Cpu),
-                        22..=32 => self.set_sort(SortBy::Memory),
+                        13..=20 => self.set_sort(SortBy::Cpu),
+                        21..=30 => self.set_sort(SortBy::Memory),
+                        31..=43 => self.set_sort(SortBy::Trend),
+                        44..=51 => self.set_sort(SortBy::Processes),
+                        52..=63 => self.set_sort(SortBy::Age),
+                        64.. => self.set_sort(SortBy::Activity),
                         _ => {}
                     }
                 } else if mouse.row >= layout.terminal_start_row
@@ -167,11 +209,15 @@ impl App {
                     }
                 } else if mouse.row == layout.footer_row {
                     match mouse.column {
-                        8..=12 => self.set_sort(SortBy::Cpu),
-                        14..=21 => self.set_sort(SortBy::Memory),
-                        23..=32 => self.set_sort(SortBy::Tty),
-                        34..=41 => self.expanded = !self.expanded,
-                        43..=48 => return false,
+                        8..=12 => self.set_sort(SortBy::Tty),
+                        14..=18 => self.set_sort(SortBy::Cpu),
+                        20..=24 => self.set_sort(SortBy::Memory),
+                        26..=32 => self.set_sort(SortBy::Trend),
+                        34..=40 => self.set_sort(SortBy::Processes),
+                        42..=46 => self.set_sort(SortBy::Age),
+                        48..=57 => self.set_sort(SortBy::Activity),
+                        59..=66 => self.expanded = !self.expanded,
+                        68..=73 => return false,
                         _ => {}
                     }
                 }
@@ -194,6 +240,30 @@ impl App {
             self.descending = sort != SortBy::Tty;
         }
         sort_terminals(&mut self.terminals, self.sort, self.descending);
+    }
+
+    fn update_memory_trends(&mut self, terminals: &mut [Terminal], now: Instant) {
+        self.memory_history.retain(|root_pid, _| {
+            terminals
+                .iter()
+                .any(|terminal| terminal.root_pid == *root_pid)
+        });
+        for terminal in terminals {
+            let history = self.memory_history.entry(terminal.root_pid).or_default();
+            history.samples.push_back((now, terminal.rss_kib));
+            while history
+                .samples
+                .front()
+                .is_some_and(|(time, _)| now.duration_since(*time) > HISTORY_WINDOW)
+            {
+                history.samples.pop_front();
+            }
+            let trend = analyze_memory_history(&history.samples);
+            terminal.memory_growth_kib = trend.growth_kib;
+            terminal.memory_slope_kib_per_min = trend.slope_kib_per_min;
+            terminal.memory_samples = history.samples.len();
+            terminal.leak_suspected = trend.suspected;
+        }
     }
 }
 
@@ -428,6 +498,7 @@ fn parse_process(line: &str) -> Option<Process> {
     let cpu = fields.next()?.replace(',', ".").parse().ok()?;
     let rss_kib = fields.next()?.parse().ok()?;
     let elapsed = fields.next()?.to_string();
+    let age_seconds = parse_elapsed(&elapsed)?;
     let command = fields.collect::<Vec<_>>().join(" ");
     Some(Process {
         pid,
@@ -436,6 +507,7 @@ fn parse_process(line: &str) -> Option<Process> {
         cpu,
         rss_kib,
         elapsed,
+        age_seconds,
         command,
     })
 }
@@ -480,12 +552,18 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
             .map(|p| command_name(&p.command))
             .unwrap_or_else(|| "shell".to_string());
         terminals.push(Terminal {
+            root_pid: root.pid,
             tty: root.tty.clone(),
             cpu,
             rss_kib,
             processes: members,
             activity,
             elapsed: root.elapsed.clone(),
+            age_seconds: root.age_seconds,
+            memory_growth_kib: 0,
+            memory_slope_kib_per_min: 0.0,
+            memory_samples: 0,
+            leak_suspected: false,
         });
     }
     (ghostty, terminals)
@@ -533,11 +611,77 @@ fn command_name(command: &str) -> String {
         .to_string()
 }
 
+fn parse_elapsed(value: &str) -> Option<u64> {
+    let (days, clock) = if let Some((days, clock)) = value.split_once('-') {
+        (days.parse().ok()?, clock)
+    } else {
+        (0, value)
+    };
+    let parts: Vec<u64> = clock
+        .split(':')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let clock_seconds = match parts.as_slice() {
+        [minutes, seconds] => minutes * 60 + seconds,
+        [hours, minutes, seconds] => hours * 3600 + minutes * 60 + seconds,
+        _ => return None,
+    };
+    Some(days * 86_400 + clock_seconds)
+}
+
+fn analyze_memory_history(samples: &VecDeque<(Instant, u64)>) -> MemoryTrend {
+    let Some((first_time, _)) = samples.front() else {
+        return MemoryTrend::default();
+    };
+    let Some((last_time, _)) = samples.back() else {
+        return MemoryTrend::default();
+    };
+    if samples.len() < 2 {
+        return MemoryTrend::default();
+    }
+    let edge_count = (samples.len() / 5).clamp(1, 10);
+    let baseline = samples
+        .iter()
+        .take(edge_count)
+        .map(|(_, rss)| *rss)
+        .sum::<u64>() as f64
+        / edge_count as f64;
+    let recent = samples
+        .iter()
+        .rev()
+        .take(edge_count)
+        .map(|(_, rss)| *rss)
+        .sum::<u64>() as f64
+        / edge_count as f64;
+    let growth = recent - baseline;
+    let duration = last_time.duration_since(*first_time);
+    let minutes = duration.as_secs_f64() / 60.0;
+    let slope = if minutes > 0.0 { growth / minutes } else { 0.0 };
+    let ratio = if baseline > 0.0 {
+        growth / baseline
+    } else {
+        0.0
+    };
+    MemoryTrend {
+        growth_kib: growth.round() as i64,
+        slope_kib_per_min: slope,
+        suspected: samples.len() >= MIN_LEAK_SAMPLES
+            && duration >= MIN_LEAK_DURATION
+            && growth >= MIN_LEAK_GROWTH_KIB as f64
+            && ratio >= MIN_LEAK_GROWTH_RATIO,
+    }
+}
+
 fn sort_terminals(terminals: &mut [Terminal], sort: SortBy, descending: bool) {
     terminals.sort_by(|a, b| {
         let order = match sort {
             SortBy::Cpu => a.cpu.total_cmp(&b.cpu),
             SortBy::Memory => a.rss_kib.cmp(&b.rss_kib),
+            SortBy::Trend => a.memory_growth_kib.cmp(&b.memory_growth_kib),
+            SortBy::Processes => a.processes.len().cmp(&b.processes.len()),
+            SortBy::Age => a.age_seconds.cmp(&b.age_seconds),
+            SortBy::Activity => a.activity.to_lowercase().cmp(&b.activity.to_lowercase()),
             SortBy::Tty => natural_tty(&a.tty).cmp(&natural_tty(&b.tty)),
         };
         if descending {
@@ -559,14 +703,24 @@ fn render(app: &App) -> Layout {
     let shared_ram = app.ghostty.as_ref().map_or(0, |p| p.rss_kib);
     let terminal_cpu: f64 = app.terminals.iter().map(|t| t.cpu).sum();
     let terminal_ram: u64 = app.terminals.iter().map(|t| t.rss_kib).sum();
+    let alert_count = app
+        .terminals
+        .iter()
+        .filter(|terminal| terminal.leak_suspected)
+        .count();
+    let alert_status = if alert_count == 0 {
+        format!("{DIM}no leak alerts{RESET}")
+    } else {
+        format!("{BOLD}{RED}⚠ {alert_count} potential leak alert(s){RESET}")
+    };
     lines.push(format!(
-        "{BOLD}{GREEN}ghostty-top{RESET}  {DIM}per-terminal process usage  •  sort: {} {}{RESET}",
-        sort_name(app.sort),
-        if app.descending { "↓" } else { "↑" }
+        "{BOLD}{GREEN}ghostty-top{RESET}  {DIM}per-terminal process usage{RESET}  •  {alert_status}",
     ));
     lines.push(format!(
-        "Ghostty shared  CPU {YELLOW}{shared_cpu:>6.1}%{RESET}  RAM {CYAN}{:>8}{RESET}    Terminals ({})  CPU {YELLOW}{terminal_cpu:>6.1}%{RESET}  RAM {CYAN}{:>8}{RESET}",
-        human_bytes(shared_ram), app.terminals.len(), human_bytes(terminal_ram)
+        "Ghostty shared  CPU {YELLOW}{shared_cpu:>6.1}%{RESET}  RAM {CYAN}{:>8}{RESET}    Terminals ({})  CPU {YELLOW}{terminal_cpu:>6.1}%{RESET}  RAM {CYAN}{:>8}{RESET}    {DIM}sort: {} {}{RESET}",
+        human_bytes(shared_ram), app.terminals.len(), human_bytes(terminal_ram),
+        sort_name(app.sort),
+        if app.descending { "↓" } else { "↑" }
     ));
     lines.push(String::new());
 
@@ -582,12 +736,19 @@ fn render(app: &App) -> Layout {
         lines.push("No Ghostty terminal processes found.".into());
     } else {
         lines.push(format!(
-            "{DIM}{UNDERLINE}   TERMINAL    CPU       RAM   PROCS   AGE         ACTIVITY{RESET}  {DIM}← click a heading to sort{RESET}"
+            "   {} {} {} {} {} {} {}",
+            header_cell("TERMINAL", 8, SortBy::Tty, app),
+            header_cell("CPU", 7, SortBy::Cpu, app),
+            header_cell("RAM", 9, SortBy::Memory, app),
+            header_cell("TREND", 12, SortBy::Trend, app),
+            header_cell("PROCS", 7, SortBy::Processes, app),
+            header_cell("AGE", 11, SortBy::Age, app),
+            header_cell("ACTIVITY", 8, SortBy::Activity, app),
         ));
         let max_rows = if app.expanded {
-            height.saturating_sub(14).max(3)
+            height.saturating_sub(15).max(3)
         } else {
-            height.saturating_sub(7).max(3)
+            height.saturating_sub(8).max(3)
         }
         .min(app.terminals.len());
         let shown_start = if app.selected >= max_rows {
@@ -598,7 +759,7 @@ fn render(app: &App) -> Layout {
         let shown_end = (shown_start + max_rows).min(app.terminals.len());
         layout.shown_start = shown_start;
         layout.shown_count = shown_end - shown_start;
-        let activity_width = width.saturating_sub(54).max(10);
+        let activity_width = width.saturating_sub(64).max(10);
         for (index, terminal) in app
             .terminals
             .iter()
@@ -608,20 +769,26 @@ fn render(app: &App) -> Layout {
         {
             let selected = index == app.selected;
             let mut line = String::new();
-            if selected {
-                line.push_str(SELECTED);
-            }
+            let row_style = if selected {
+                SELECTED
+            } else if terminal.leak_suspected {
+                WARNING
+            } else {
+                ""
+            };
+            line.push_str(row_style);
             let marker = if selected { "›" } else { " " };
             line.push_str(&format!(
-                "{marker}  {:<8} {YELLOW}{:>6.1}%{RESET}  {CYAN}{:>8}{RESET}  {:>5}   {:<10}  {}",
+                "{marker}  {:<8} {YELLOW}{:>6.1}%{RESET}{row_style} {CYAN}{:>9}{RESET}{row_style} {}{row_style} {:>7} {:>11} {}",
                 terminal.tty,
                 terminal.cpu,
                 human_bytes(terminal.rss_kib),
+                trend_cell(terminal),
                 terminal.processes.len(),
                 terminal.elapsed,
                 truncate(&terminal.activity, activity_width),
             ));
-            if selected {
+            if selected || terminal.leak_suspected {
                 line.push_str(RESET);
             }
             lines.push(line);
@@ -646,6 +813,13 @@ fn render(app: &App) -> Layout {
                 "{BOLD}Processes in {}{RESET}  {DIM}(click the selected row to collapse){RESET}",
                 terminal.tty
             ));
+            if terminal.leak_suspected {
+                lines.push(format!(
+                    "{BOLD}{RED}⚠ Potential memory leak: {} since tracking began ({}/min){RESET}",
+                    signed_human_kib(terminal.memory_growth_kib),
+                    signed_human_kib(terminal.memory_slope_kib_per_min.round() as i64),
+                ));
+            }
             lines.push(format!(
                 "{DIM}{UNDERLINE}     PID     CPU       RAM   COMMAND{RESET}"
             ));
@@ -667,11 +841,14 @@ fn render(app: &App) -> Layout {
         lines.push(format!("\x1b[31mSampling error: {error}{RESET}"));
     }
     lines.push(String::new());
+    layout.footer_row = lines.len() + 1;
     lines.push(format!(
-        "{DIM}Mouse:{RESET} {UNDERLINE}[CPU]{RESET} {UNDERLINE}[MEMORY]{RESET} {UNDERLINE}[TERMINAL]{RESET} {UNDERLINE}[EXPAND]{RESET} {UNDERLINE}[QUIT]{RESET}  {DIM}↑/↓ move  enter expand  r reverse  •  {:.1}s{RESET}",
+        "{DIM}Mouse:{RESET} {UNDERLINE}[TTY]{RESET} {UNDERLINE}[CPU]{RESET} {UNDERLINE}[RAM]{RESET} {UNDERLINE}[TREND]{RESET} {UNDERLINE}[PROCS]{RESET} {UNDERLINE}[AGE]{RESET} {UNDERLINE}[ACTIVITY]{RESET} {UNDERLINE}[EXPAND]{RESET} {UNDERLINE}[QUIT]{RESET}"
+    ));
+    lines.push(format!(
+        "{DIM}Keys: t/c/m/g/p/a/n sort  •  ↑/↓ move  •  enter expand  •  r reverse  •  q quit  •  refresh {:.1}s{RESET}",
         app.interval.as_secs_f64()
     ));
-    layout.footer_row = lines.len();
     print!("\x1b[H\x1b[2J{}", lines.join("\n"));
     let _ = io::stdout().flush();
     layout
@@ -691,10 +868,66 @@ fn terminal_size() -> (usize, usize) {
     (values.next().unwrap_or(24), values.next().unwrap_or(100))
 }
 
+fn header_cell(label: &str, width: usize, column: SortBy, app: &App) -> String {
+    let text = if app.sort == column {
+        format!("{}{}", label, if app.descending { "↓" } else { "↑" })
+    } else {
+        label.to_string()
+    };
+    let padded = format!("{text:<width$}");
+    if app.sort == column {
+        format!("{ACTIVE_HEADER}{padded}{RESET}")
+    } else {
+        format!("{DIM}{UNDERLINE}{padded}{RESET}")
+    }
+}
+
+fn trend_cell(terminal: &Terminal) -> String {
+    let text = if terminal.memory_samples < 2 {
+        "· sampling".to_string()
+    } else if terminal.leak_suspected {
+        format!("⚠ {}", compact_signed_kib(terminal.memory_growth_kib))
+    } else if terminal.memory_growth_kib > 0 {
+        format!("↑ {}", compact_signed_kib(terminal.memory_growth_kib))
+    } else if terminal.memory_growth_kib < 0 {
+        format!("↓ {}", compact_signed_kib(terminal.memory_growth_kib))
+    } else {
+        "→ stable".to_string()
+    };
+    let padded = format!("{:>12}", truncate(&text, 12));
+    if terminal.leak_suspected {
+        format!("{BOLD}{RED}{padded}{RESET}")
+    } else {
+        format!("{DIM}{padded}{RESET}")
+    }
+}
+
+fn compact_signed_kib(kib: i64) -> String {
+    let absolute = kib.unsigned_abs() as f64;
+    let sign = if kib >= 0 { "+" } else { "-" };
+    if absolute >= 1024.0 * 1024.0 {
+        format!("{sign}{:.1}GiB", absolute / (1024.0 * 1024.0))
+    } else if absolute >= 1024.0 {
+        format!("{sign}{:.0}MiB", absolute / 1024.0)
+    } else {
+        format!("{sign}{absolute:.0}KiB")
+    }
+}
+
+fn signed_human_kib(kib: i64) -> String {
+    let absolute = kib.unsigned_abs();
+    let sign = if kib >= 0 { "+" } else { "-" };
+    format!("{sign}{}", human_bytes(absolute))
+}
+
 fn sort_name(sort: SortBy) -> &'static str {
     match sort {
         SortBy::Cpu => "CPU",
         SortBy::Memory => "memory",
+        SortBy::Trend => "memory trend",
+        SortBy::Processes => "processes",
+        SortBy::Age => "age",
+        SortBy::Activity => "activity",
         SortBy::Tty => "terminal",
     }
 }
@@ -713,15 +946,26 @@ fn print_snapshot(app: &App) {
         ghostty.cpu,
         human_bytes(ghostty.rss_kib)
     );
-    println!("TERMINAL     CPU       RAM  PROCS  ACTIVITY");
+    println!("TERMINAL     CPU       RAM        TREND  PROCS          AGE  ACTIVITY");
     for terminal in &app.terminals {
         println!(
-            "{:<10} {:>6.1}%  {:>8}  {:>5}  {}",
+            "{:<10} {:>6.1}%  {:>8}  {:>11}  {:>5}  {:>11}  {}{}",
             terminal.tty,
             terminal.cpu,
             human_bytes(terminal.rss_kib),
+            if terminal.memory_samples < 2 {
+                "sampling".to_string()
+            } else {
+                compact_signed_kib(terminal.memory_growth_kib)
+            },
             terminal.processes.len(),
-            terminal.activity
+            terminal.elapsed,
+            terminal.activity,
+            if terminal.leak_suspected {
+                "  POTENTIAL LEAK"
+            } else {
+                ""
+            }
         );
     }
 }
@@ -761,6 +1005,7 @@ mod tests {
             cpu,
             rss_kib: rss,
             elapsed: "01:00".into(),
+            age_seconds: 60,
             command: command.into(),
         }
     }
@@ -772,6 +1017,40 @@ mod tests {
         assert_eq!(process.pid, 42);
         assert_eq!(process.tty, "ttys002");
         assert_eq!(process.command, "node app.js --flag");
+        assert_eq!(process.age_seconds, 80);
+    }
+
+    #[test]
+    fn parses_process_age_formats() {
+        assert_eq!(parse_elapsed("05:30"), Some(330));
+        assert_eq!(parse_elapsed("02:05:30"), Some(7_530));
+        assert_eq!(parse_elapsed("3-02:05:30"), Some(266_730));
+    }
+
+    #[test]
+    fn flags_sustained_memory_growth() {
+        let start = Instant::now();
+        let samples = VecDeque::from([
+            (start, 100 * 1024),
+            (start + Duration::from_secs(6), 108 * 1024),
+            (start + Duration::from_secs(12), 116 * 1024),
+            (start + Duration::from_secs(18), 124 * 1024),
+            (start + Duration::from_secs(24), 132 * 1024),
+            (start + Duration::from_secs(30), 140 * 1024),
+        ]);
+        let trend = analyze_memory_history(&samples);
+        assert_eq!(trend.growth_kib, 40 * 1024);
+        assert!(trend.suspected);
+    }
+
+    #[test]
+    fn ignores_short_memory_spikes() {
+        let start = Instant::now();
+        let samples = VecDeque::from([
+            (start, 100 * 1024),
+            (start + Duration::from_secs(5), 160 * 1024),
+        ]);
+        assert!(!analyze_memory_history(&samples).suspected);
     }
 
     #[test]
