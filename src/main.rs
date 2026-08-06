@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GREEN: &str = "\x1b[38;5;114m";
 const CYAN: &str = "\x1b[38;5;81m";
@@ -27,6 +27,9 @@ const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const USAGE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(1);
 const LAUNCH_AGENT_LABEL: &str = "com.debrian07.ghostty-top.tracker";
+const INVENTORY_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const INVENTORY_HEARTBEAT: Duration = Duration::from_secs(15 * 60);
+const RESOURCE_HISTORY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Copy)]
 enum ServiceAction {
@@ -159,6 +162,22 @@ struct FocusedTab {
     terminal_name: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct TabObservation {
+    app_frontmost: bool,
+    window_id: String,
+    window_name: String,
+    tab_id: String,
+    tab_name: String,
+    tab_index: u32,
+    selected: bool,
+    terminal_count: u32,
+    terminal_id: String,
+    terminal_name: String,
+    working_directory: String,
+    terminal_focused: bool,
+}
+
 struct UsageTracker {
     store: UsageStore,
     current_day: String,
@@ -167,6 +186,10 @@ struct UsageTracker {
     next_poll: Instant,
     next_date_check: Instant,
     next_flush: Instant,
+    next_inventory: Instant,
+    next_inventory_heartbeat: Instant,
+    next_resource_history: Instant,
+    last_inventory: Vec<TabObservation>,
     last_error: Option<String>,
 }
 
@@ -217,6 +240,13 @@ impl App {
                 self.selected = selected_tty
                     .and_then(|tty| self.terminals.iter().position(|t| t.tty == tty))
                     .unwrap_or(self.selected.min(self.terminals.len().saturating_sub(1)));
+                if let Some(tracker) = &mut self.usage_tracker {
+                    tracker.capture_resources(
+                        Instant::now(),
+                        &self.terminals,
+                        self.ghostty.as_ref(),
+                    );
+                }
                 self.last_error = None;
             }
             Err(error) => self.last_error = Some(error),
@@ -471,6 +501,10 @@ impl UsageTracker {
             next_poll: now,
             next_date_check: now + Duration::from_secs(60),
             next_flush: now + USAGE_FLUSH_INTERVAL,
+            next_inventory: now,
+            next_inventory_heartbeat: now,
+            next_resource_history: now,
+            last_inventory: Vec::new(),
             last_error: None,
         }
     }
@@ -511,6 +545,21 @@ impl UsageTracker {
                 self.next_poll = now + Duration::from_secs(30);
             }
         }
+        if now >= self.next_inventory {
+            match query_tab_inventory() {
+                Ok(inventory) => {
+                    if inventory != self.last_inventory || now >= self.next_inventory_heartbeat {
+                        if let Err(error) = append_tab_inventory(&self.current_day, &inventory) {
+                            self.last_error = Some(format!("could not save tab history: {error}"));
+                        }
+                        self.last_inventory = inventory;
+                        self.next_inventory_heartbeat = now + INVENTORY_HEARTBEAT;
+                    }
+                }
+                Err(error) => self.last_error = Some(error),
+            }
+            self.next_inventory = now + INVENTORY_POLL_INTERVAL;
+        }
         if now >= self.next_flush {
             if let Err(error) = self.store.save() {
                 self.last_error = Some(format!("could not save usage: {error}"));
@@ -518,6 +567,21 @@ impl UsageTracker {
             self.next_flush = now + USAGE_FLUSH_INTERVAL;
         }
         changed
+    }
+
+    fn capture_resources(
+        &mut self,
+        now: Instant,
+        terminals: &[Terminal],
+        ghostty: Option<&Process>,
+    ) {
+        if now < self.next_resource_history {
+            return;
+        }
+        if let Err(error) = append_resource_history(&self.current_day, terminals, ghostty) {
+            self.last_error = Some(format!("could not save resource history: {error}"));
+        }
+        self.next_resource_history = now + RESOURCE_HISTORY_INTERVAL;
     }
 }
 
@@ -718,13 +782,96 @@ set theTerminal to focused terminal of theTab
 set separator to ASCII character 9
 return (id of theTab as text) & separator & (name of theTab as text) & separator & (id of theTerminal as text) & separator & (name of theTerminal as text)
 end tell"#;
+    let output = run_osascript(SCRIPT)?;
+    let output = output.trim();
+    if output.is_empty() {
+        return Ok(None);
+    }
+    let fields: Vec<&str> = output.splitn(4, '\t').collect();
+    if fields.len() != 4 {
+        return Err("Ghostty returned an unexpected focus response".to_string());
+    }
+    Ok(Some(FocusedTab {
+        tab_id: fields[0].to_string(),
+        tab_name: fields[1].to_string(),
+        terminal_id: fields[2].to_string(),
+        terminal_name: fields[3].to_string(),
+    }))
+}
+
+fn query_tab_inventory() -> Result<Vec<TabObservation>, String> {
+    if !ghostty_is_running() {
+        return Ok(Vec::new());
+    }
+    const SCRIPT: &str = r#"tell application "Ghostty"
+set fieldSeparator to ASCII character 31
+set recordSeparator to ASCII character 30
+set resultText to ""
+set appIsFrontmost to frontmost
+repeat with ghosttyWindow in windows
+set windowID to id of ghosttyWindow as text
+set windowName to name of ghosttyWindow as text
+repeat with ghosttyTab in tabs of ghosttyWindow
+    set tabID to id of ghosttyTab as text
+set tabName to name of ghosttyTab as text
+set tabIndex to index of ghosttyTab as text
+set tabIsSelected to (selected of ghosttyTab) as text
+set focusedID to id of focused terminal of ghosttyTab as text
+set terminalCount to count of terminals of ghosttyTab
+repeat with ghosttyTerminal in terminals of ghosttyTab
+set terminalID to id of ghosttyTerminal as text
+set terminalName to name of ghosttyTerminal as text
+set terminalDirectory to working directory of ghosttyTerminal as text
+set terminalIsFocused to (terminalID is focusedID) as text
+set resultText to resultText & (appIsFrontmost as text) & fieldSeparator & windowID & fieldSeparator & windowName & fieldSeparator & tabID & fieldSeparator & tabName & fieldSeparator & tabIndex & fieldSeparator & tabIsSelected & fieldSeparator & (terminalCount as text) & fieldSeparator & terminalID & fieldSeparator & terminalName & fieldSeparator & terminalDirectory & fieldSeparator & terminalIsFocused & recordSeparator
+end repeat
+end repeat
+end repeat
+return resultText
+end tell"#;
+    let output = run_osascript(SCRIPT)?;
+    parse_tab_inventory(&output)
+}
+
+fn parse_tab_inventory(output: &str) -> Result<Vec<TabObservation>, String> {
+    let mut observations = Vec::new();
+    for record in output.trim_end().split('\x1e') {
+        if record.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = record.split('\x1f').collect();
+        if fields.len() != 12 {
+            return Err("Ghostty returned an unexpected tab inventory".to_string());
+        }
+        observations.push(TabObservation {
+            app_frontmost: fields[0] == "true",
+            window_id: fields[1].to_string(),
+            window_name: fields[2].to_string(),
+            tab_id: fields[3].to_string(),
+            tab_name: fields[4].to_string(),
+            tab_index: fields[5].parse().unwrap_or(0),
+            selected: fields[6] == "true",
+            terminal_count: fields[7].parse().unwrap_or(0),
+            terminal_id: fields[8].to_string(),
+            terminal_name: fields[9].to_string(),
+            working_directory: fields[10].to_string(),
+            terminal_focused: fields[11] == "true",
+        });
+    }
+    observations.sort_by(|a, b| {
+        (&a.window_id, &a.tab_id, &a.terminal_id).cmp(&(&b.window_id, &b.tab_id, &b.terminal_id))
+    });
+    Ok(observations)
+}
+
+fn run_osascript(script: &str) -> Result<String, String> {
     let mut child = Command::new("osascript")
-        .args(["-e", SCRIPT])
+        .args(["-e", script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| format!("could not start focus tracking: {error}"))?;
+        .map_err(|error| format!("could not start Ghostty tracking: {error}"))?;
     let deadline = Instant::now() + USAGE_SAMPLE_TIMEOUT;
     loop {
         match child.try_wait() {
@@ -736,22 +883,9 @@ end tell"#;
                 if let Some(mut stdout) = child.stdout.take() {
                     stdout
                         .read_to_string(&mut output)
-                        .map_err(|error| format!("could not read focused tab: {error}"))?;
+                        .map_err(|error| format!("could not read Ghostty state: {error}"))?;
                 }
-                let output = output.trim();
-                if output.is_empty() {
-                    return Ok(None);
-                }
-                let fields: Vec<&str> = output.splitn(4, '\t').collect();
-                if fields.len() != 4 {
-                    return Err("Ghostty returned an unexpected focus response".to_string());
-                }
-                return Ok(Some(FocusedTab {
-                    tab_id: fields[0].to_string(),
-                    tab_name: fields[1].to_string(),
-                    terminal_id: fields[2].to_string(),
-                    terminal_name: fields[3].to_string(),
-                }));
+                return Ok(output);
             }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
             Ok(None) => {
@@ -762,6 +896,102 @@ end tell"#;
             Err(error) => return Err(format!("could not query focused tab: {error}")),
         }
     }
+}
+
+fn append_tab_inventory(day: &str, observations: &[TabObservation]) -> io::Result<()> {
+    let Some(path) = default_data_dir().map(|directory| directory.join("tab-history-v1.tsv"))
+    else {
+        return Ok(());
+    };
+    let mut file = open_history_file(
+        &path,
+        "timestamp\tday\trecord\tapp_frontmost\twindow_id\twindow_name\ttab_id\ttab_name\ttab_index\tselected\tterminal_count\tterminal_id\tterminal_name\tworking_directory\tterminal_focused",
+    )?;
+    let timestamp = unix_timestamp();
+    if observations.is_empty() {
+        writeln!(file, "{timestamp}\t{}\tapp_closed", clean_field(day))?;
+        return Ok(());
+    }
+    for value in observations {
+        writeln!(
+            file,
+            "{timestamp}\t{}\tsnapshot\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            clean_field(day),
+            value.app_frontmost,
+            clean_field(&value.window_id),
+            clean_field(&value.window_name),
+            clean_field(&value.tab_id),
+            clean_field(&value.tab_name),
+            value.tab_index,
+            value.selected,
+            value.terminal_count,
+            clean_field(&value.terminal_id),
+            clean_field(&value.terminal_name),
+            clean_field(&value.working_directory),
+            value.terminal_focused,
+        )?;
+    }
+    Ok(())
+}
+
+fn append_resource_history(
+    day: &str,
+    terminals: &[Terminal],
+    ghostty: Option<&Process>,
+) -> io::Result<()> {
+    let Some(path) = default_data_dir().map(|directory| directory.join("resources-v1.tsv")) else {
+        return Ok(());
+    };
+    let mut file = open_history_file(
+        &path,
+        "timestamp\tday\tkind\tid\tcpu_percent\trss_kib\tprocesses\tage_seconds\tactivity\tmemory_growth_kib\tleak_suspected",
+    )?;
+    let timestamp = unix_timestamp();
+    if let Some(process) = ghostty {
+        writeln!(
+            file,
+            "{timestamp}\t{}\tapp\tghostty\t{:.1}\t{}\t1\t{}\tghostty\t0\tfalse",
+            clean_field(day),
+            process.cpu,
+            process.rss_kib,
+            process.age_seconds,
+        )?;
+    }
+    for terminal in terminals {
+        writeln!(
+            file,
+            "{timestamp}\t{}\tterminal\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}",
+            clean_field(day),
+            clean_field(&terminal.tty),
+            terminal.cpu,
+            terminal.rss_kib,
+            terminal.processes.len(),
+            terminal.age_seconds,
+            clean_field(&terminal.activity),
+            terminal.memory_growth_kib,
+            terminal.leak_suspected,
+        )?;
+    }
+    Ok(())
+}
+
+fn open_history_file(path: &PathBuf, header: &str) -> io::Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let needs_header = fs::metadata(path).map_or(true, |metadata| metadata.len() == 0);
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    if needs_header {
+        writeln!(file, "{header}")?;
+    }
+    Ok(file)
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn ghostty_is_running() -> bool {
@@ -897,8 +1127,14 @@ fn main() {
 
     if track_only {
         println!("Tracking focused Ghostty tab usage. Press Ctrl-C to stop.");
+        let mut next_resource_refresh = Instant::now();
         loop {
-            app.track_usage(Instant::now());
+            let now = Instant::now();
+            if now >= next_resource_refresh {
+                app.refresh();
+                next_resource_refresh = now + Duration::from_secs(60);
+            }
+            app.track_usage(now);
             thread::sleep(Duration::from_millis(200));
         }
     }
@@ -1982,5 +2218,32 @@ mod tests {
             xml_escape("A & B <tracker> \"path\""),
             "A &amp; B &lt;tracker&gt; &quot;path&quot;"
         );
+    }
+
+    #[test]
+    fn parses_versioned_tab_inventory_records() {
+        let record = [
+            "true",
+            "window-1",
+            "Main",
+            "tab-1",
+            "Project",
+            "2",
+            "true",
+            "1",
+            "terminal-1",
+            "zsh",
+            "/Users/test/project",
+            "true",
+        ]
+        .join("\x1f")
+            + "\x1e";
+        let inventory = parse_tab_inventory(&record).unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].tab_name, "Project");
+        assert_eq!(inventory[0].tab_index, 2);
+        assert_eq!(inventory[0].working_directory, "/Users/test/project");
+        assert!(inventory[0].app_frontmost);
+        assert!(inventory[0].terminal_focused);
     }
 }
