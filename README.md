@@ -75,6 +75,24 @@ To collect usage without leaving the full monitor open, run:
 ghostty-top --track
 ```
 
+For automatic tracking at login, install the included LaunchAgent:
+
+```sh
+ghostty-top --install-tracker
+ghostty-top --tracker-status
+```
+
+The service starts immediately, launches again at login, and is restarted by
+macOS if it exits. Re-run `--install-tracker` after replacing the binary to
+upgrade the background copy. To remove only the service and its installed
+binary:
+
+```sh
+ghostty-top --uninstall-tracker
+```
+
+Installing, upgrading, or uninstalling the service never removes `usage.tsv`.
+
 The tracker flushes its small local data file every 30 seconds. It does not send
 usage data anywhere.
 

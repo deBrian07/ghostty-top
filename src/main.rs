@@ -26,6 +26,14 @@ const MIN_LEAK_GROWTH_RATIO: f64 = 0.15;
 const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const USAGE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(1);
+const LAUNCH_AGENT_LABEL: &str = "com.debrian07.ghostty-top.tracker";
+
+#[derive(Clone, Copy)]
+enum ServiceAction {
+    Install,
+    Uninstall,
+    Status,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Key {
@@ -514,13 +522,166 @@ impl UsageTracker {
 }
 
 fn default_usage_path() -> Option<PathBuf> {
+    default_data_dir().map(|directory| directory.join("usage.tsv"))
+}
+
+fn default_data_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| {
         PathBuf::from(home)
             .join("Library")
             .join("Application Support")
             .join("ghostty-top")
-            .join("usage.tsv")
     })
+}
+
+fn launch_agent_path() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{LAUNCH_AGENT_LABEL}.plist"))
+    })
+}
+
+fn install_login_tracker() -> Result<(), String> {
+    let data_dir = default_data_dir().ok_or("could not find the home directory")?;
+    let agent_path = launch_agent_path().ok_or("could not find the LaunchAgents directory")?;
+    let installed_binary = data_dir.join("bin").join("ghostty-top");
+    let source_binary = env::current_exe()
+        .map_err(|error| format!("could not locate this executable: {error}"))?
+        .canonicalize()
+        .map_err(|error| format!("could not resolve this executable: {error}"))?;
+
+    fs::create_dir_all(installed_binary.parent().expect("binary has a parent"))
+        .map_err(|error| format!("could not create tracker directory: {error}"))?;
+    if source_binary != installed_binary {
+        let temporary_binary = installed_binary.with_extension("new");
+        fs::copy(&source_binary, &temporary_binary)
+            .map_err(|error| format!("could not install tracker binary: {error}"))?;
+        fs::rename(&temporary_binary, &installed_binary)
+            .map_err(|error| format!("could not activate tracker binary: {error}"))?;
+    }
+
+    let log_path = data_dir.join("tracker.log");
+    let error_log_path = data_dir.join("tracker-error.log");
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{LAUNCH_AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{}</string>
+    <string>--track</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>{}</string>
+  <key>StandardErrorPath</key>
+  <string>{}</string>
+</dict>
+</plist>
+"#,
+        xml_escape(&installed_binary.to_string_lossy()),
+        xml_escape(&log_path.to_string_lossy()),
+        xml_escape(&error_log_path.to_string_lossy()),
+    );
+    let agent_parent = agent_path.parent().expect("launch agent has a parent");
+    fs::create_dir_all(agent_parent)
+        .map_err(|error| format!("could not create LaunchAgents directory: {error}"))?;
+    let temporary_agent = agent_path.with_extension("plist.new");
+    fs::write(&temporary_agent, plist)
+        .map_err(|error| format!("could not write LaunchAgent: {error}"))?;
+    fs::rename(&temporary_agent, &agent_path)
+        .map_err(|error| format!("could not activate LaunchAgent file: {error}"))?;
+
+    let domain = launchd_domain();
+    let service = format!("{domain}/{LAUNCH_AGENT_LABEL}");
+    let _ = Command::new("launchctl")
+        .args(["bootout", &service])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    run_launchctl(["bootstrap", &domain, &agent_path.to_string_lossy()])?;
+    run_launchctl(["enable", &service])?;
+    run_launchctl(["kickstart", "-k", &service])?;
+    println!("Installed and started {LAUNCH_AGENT_LABEL}.");
+    println!(
+        "Usage history remains at {}.",
+        data_dir.join("usage.tsv").display()
+    );
+    Ok(())
+}
+
+fn uninstall_login_tracker() -> Result<(), String> {
+    let data_dir = default_data_dir().ok_or("could not find the home directory")?;
+    let agent_path = launch_agent_path().ok_or("could not find the LaunchAgents directory")?;
+    let service = format!("{}/{LAUNCH_AGENT_LABEL}", launchd_domain());
+    let _ = Command::new("launchctl")
+        .args(["bootout", &service])
+        .status();
+    remove_if_present(&agent_path)?;
+    remove_if_present(&data_dir.join("bin").join("ghostty-top"))?;
+    println!("Removed the login tracker and installed tracker binary.");
+    println!(
+        "Usage history was preserved at {}.",
+        data_dir.join("usage.tsv").display()
+    );
+    Ok(())
+}
+
+fn tracker_status() -> Result<(), String> {
+    let service = format!("{}/{LAUNCH_AGENT_LABEL}", launchd_domain());
+    let status = Command::new("launchctl")
+        .args(["print", &service])
+        .status()
+        .map_err(|error| format!("could not query launchd: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("login tracker is not loaded; run --install-tracker".to_string())
+    }
+}
+
+fn launchd_domain() -> String {
+    format!("gui/{}", unsafe { getuid() })
+}
+
+fn run_launchctl<const N: usize>(arguments: [&str; N]) -> Result<(), String> {
+    let status = Command::new("launchctl")
+        .args(arguments)
+        .status()
+        .map_err(|error| format!("could not run launchctl: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("launchctl exited with {status}"))
+}
+
+fn remove_if_present(path: &PathBuf) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not remove {}: {error}", path.display())),
+    }
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn display_tab_name(focus: &FocusedTab) -> String {
@@ -546,6 +707,9 @@ fn local_date() -> Option<String> {
 }
 
 fn query_focused_tab() -> Result<Option<FocusedTab>, String> {
+    if !ghostty_is_running() {
+        return Ok(None);
+    }
     const SCRIPT: &str = r#"tell application "Ghostty"
 if not frontmost then return ""
 set theWindow to front window
@@ -598,6 +762,15 @@ end tell"#;
             Err(error) => return Err(format!("could not query focused tab: {error}")),
         }
     }
+}
+
+fn ghostty_is_running() -> bool {
+    Command::new("pgrep")
+        .args(["-x", "ghostty"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 impl InputDecoder {
@@ -664,6 +837,7 @@ impl InputDecoder {
 fn main() {
     let mut once = false;
     let mut track_only = false;
+    let mut service_action = None;
     let mut interval = Duration::from_secs(1);
     let args: Vec<String> = env::args().skip(1).collect();
     let mut index = 0;
@@ -671,6 +845,9 @@ fn main() {
         match args[index].as_str() {
             "--once" => once = true,
             "--track" => track_only = true,
+            "--install-tracker" => service_action = Some(ServiceAction::Install),
+            "--uninstall-tracker" => service_action = Some(ServiceAction::Uninstall),
+            "--tracker-status" => service_action = Some(ServiceAction::Status),
             "--interval" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -693,6 +870,19 @@ fn main() {
     if !cfg!(target_os = "macos") {
         eprintln!("ghostty-top currently supports macOS only.");
         std::process::exit(1);
+    }
+
+    if let Some(action) = service_action {
+        let result = match action {
+            ServiceAction::Install => install_login_tracker(),
+            ServiceAction::Uninstall => uninstall_login_tracker(),
+            ServiceAction::Status => tracker_status(),
+        };
+        if let Err(error) = result {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     let mut app = App::new(interval);
@@ -777,6 +967,7 @@ impl IsTerminal for io::Stdout {
 
 extern "C" {
     fn isatty(fd: i32) -> i32;
+    fn getuid() -> u32;
 }
 
 struct TerminalGuard {
@@ -822,7 +1013,7 @@ impl Drop for TerminalGuard {
 }
 
 fn usage_and_exit(code: i32) -> ! {
-    eprintln!("Usage: ghostty-top [--once | --track] [--interval SECONDS]\n\n  --once              print one process sample and exit\n  --track             track focused-tab usage without the TUI\n  --interval SECONDS  process refresh rate from 0.2 to 60 (default: 1)");
+    eprintln!("Usage: ghostty-top [OPTIONS]\n\n  --once               print one process sample and exit\n  --track              track focused-tab usage without the TUI\n  --install-tracker    install and start tracking automatically at login\n  --uninstall-tracker  remove the login service but preserve usage history\n  --tracker-status     show the login tracker's launchd status\n  --interval SECONDS   process refresh rate from 0.2 to 60 (default: 1)");
     std::process::exit(code);
 }
 
@@ -1783,5 +1974,13 @@ mod tests {
         assert!(app.handle_mouse(click, &layout));
         assert_eq!(app.hovered_day.as_deref(), Some("2026-08-06"));
         assert_eq!(app.selected_day.as_deref(), Some("2026-08-06"));
+    }
+
+    #[test]
+    fn escapes_launch_agent_paths() {
+        assert_eq!(
+            xml_escape("A & B <tracker> \"path\""),
+            "A &amp; B &lt;tracker&gt; &quot;path&quot;"
+        );
     }
 }
