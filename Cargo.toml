@@ -1,0 +1,17 @@
+[package]
+name = "ghostty-top"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight per-terminal CPU and memory monitor for Ghostty on macOS"
+license = "MIT"
+
+[[bin]]
+name = "ghostty-top"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+
