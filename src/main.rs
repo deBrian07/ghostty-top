@@ -44,6 +44,12 @@ enum ServiceAction {
     Status,
 }
 
+#[derive(Clone, Copy)]
+enum DemoHistoryAction {
+    Seed,
+    Clear,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Key {
     Char(u8),
@@ -616,6 +622,68 @@ fn default_usage_path() -> Option<PathBuf> {
     default_data_dir().map(|directory| directory.join("usage.tsv"))
 }
 
+fn seed_demo_history() -> io::Result<usize> {
+    let today = local_date().unwrap_or_else(|| "1970-01-01".to_string());
+    seed_demo_history_at(default_usage_path(), &today)
+}
+
+fn seed_demo_history_at(path: Option<PathBuf>, today: &str) -> io::Result<usize> {
+    const DEMO_TABS: [(&str, &str); 4] = [
+        ("demo:editor", "Demo · editor"),
+        ("demo:server", "Demo · server"),
+        ("demo:tests", "Demo · tests"),
+        ("demo:shell", "Demo · shell"),
+    ];
+    let today_number = date_to_day_number(today)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid current date"))?;
+    let mut store = UsageStore::load(path);
+    let mut seeded_days = 0;
+    for offset in 1_u64..=55 {
+        if offset % 5 == 0 || offset % 13 == 0 {
+            continue;
+        }
+        let day = day_number_to_date(today_number - offset as i64);
+        let tab_count = 1 + (offset as usize % DEMO_TABS.len());
+        let entries = store.days.entry(day).or_default();
+        for (tab_index, (tab_id, tab_name)) in DEMO_TABS.iter().take(tab_count).enumerate() {
+            let seconds = 15 * 60 + (offset * 977 + tab_index as u64 * 1_597) % (2 * 60 * 60);
+            entries.insert(
+                (*tab_id).to_string(),
+                TabUsage {
+                    name: (*tab_name).to_string(),
+                    seconds,
+                },
+            );
+        }
+        seeded_days += 1;
+    }
+    store.dirty = true;
+    store.save()?;
+    Ok(seeded_days)
+}
+
+fn clear_demo_history() -> io::Result<usize> {
+    clear_demo_history_at(default_usage_path())
+}
+
+fn clear_demo_history_at(path: Option<PathBuf>) -> io::Result<usize> {
+    let mut store = UsageStore::load(path);
+    let mut changed_days = 0;
+    store.days.retain(|_, tabs| {
+        let previous_len = tabs.len();
+        tabs.retain(|tab_id, _| !tab_id.starts_with("demo:"));
+        if tabs.len() != previous_len {
+            changed_days += 1;
+        }
+        !tabs.is_empty()
+    });
+    if changed_days > 0 {
+        store.dirty = true;
+        store.save()?;
+    }
+    Ok(changed_days)
+}
+
 fn default_data_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| {
         PathBuf::from(home)
@@ -1185,6 +1253,7 @@ fn main() {
     let mut once = false;
     let mut track_only = false;
     let mut service_action = None;
+    let mut demo_history_action = None;
     let mut interval = Duration::from_secs(1);
     let args: Vec<String> = env::args().skip(1).collect();
     let mut index = 0;
@@ -1195,6 +1264,8 @@ fn main() {
             "--install-tracker" => service_action = Some(ServiceAction::Install),
             "--uninstall-tracker" => service_action = Some(ServiceAction::Uninstall),
             "--tracker-status" => service_action = Some(ServiceAction::Status),
+            "--seed-demo-history" => demo_history_action = Some(DemoHistoryAction::Seed),
+            "--clear-demo-history" => demo_history_action = Some(DemoHistoryAction::Clear),
             "--interval" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -1228,6 +1299,28 @@ fn main() {
         if let Err(error) = result {
             eprintln!("Error: {error}");
             std::process::exit(1);
+        }
+        return;
+    }
+
+    if let Some(action) = demo_history_action {
+        let result = match action {
+            DemoHistoryAction::Seed => seed_demo_history(),
+            DemoHistoryAction::Clear => clear_demo_history(),
+        };
+        match result {
+            Ok(days) => println!(
+                "{} demo history for {days} day(s).",
+                if matches!(action, DemoHistoryAction::Seed) {
+                    "Seeded"
+                } else {
+                    "Cleared"
+                }
+            ),
+            Err(error) => {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -1381,7 +1474,7 @@ impl Drop for TerminalGuard {
 }
 
 fn usage_and_exit(code: i32) -> ! {
-    eprintln!("Usage: ghostty-top [OPTIONS]\n\n  --once               print one process sample and exit\n  --track              track focused-tab usage without the TUI\n  --install-tracker    install and start tracking automatically at login\n  --uninstall-tracker  remove the login service but preserve usage history\n  --tracker-status     show the login tracker's launchd status\n  --interval SECONDS   process refresh rate from 0.2 to 60 (default: 1)");
+    eprintln!("Usage: ghostty-top [OPTIONS]\n\n  --once                print one process sample and exit\n  --track               track focused-tab usage without the TUI\n  --install-tracker     install and start tracking automatically at login\n  --uninstall-tracker   remove the login service but preserve usage history\n  --tracker-status      show the login tracker's launchd status\n  --seed-demo-history   add removable calendar test data for prior days\n  --clear-demo-history  remove demo data without touching real history\n  --interval SECONDS    process refresh rate from 0.2 to 60 (default: 1)");
     std::process::exit(code);
 }
 
@@ -2335,6 +2428,46 @@ mod tests {
         let loaded = UsageStore::load(Some(path));
         assert_eq!(loaded.days["2026-08-06"]["tab-123"].seconds, 25);
         assert_eq!(loaded.days["2026-08-06"]["tab-123"].name, "project shell");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn demo_history_is_varied_removable_and_preserves_real_usage() {
+        let directory =
+            env::temp_dir().join(format!("ghostty-top-demo-test-{}", std::process::id()));
+        let path = directory.join("usage.tsv");
+        let mut original = UsageStore::load(Some(path.clone()));
+        original
+            .days
+            .entry("2026-08-01".into())
+            .or_default()
+            .insert(
+                "real-tab".into(),
+                TabUsage {
+                    name: "Real work".into(),
+                    seconds: 321,
+                },
+            );
+        original.dirty = true;
+        original.save().unwrap();
+
+        assert_eq!(
+            seed_demo_history_at(Some(path.clone()), "2026-08-06").unwrap(),
+            40
+        );
+        let seeded = UsageStore::load(Some(path.clone()));
+        assert!(!seeded.days.contains_key("2026-08-06"));
+        assert_eq!(seeded.days["2026-08-01"]["real-tab"].seconds, 321);
+        assert!(seeded.days.values().any(|tabs| tabs
+            .keys()
+            .filter(|id| id.starts_with("demo:"))
+            .count()
+            > 1));
+
+        assert_eq!(clear_demo_history_at(Some(path.clone())).unwrap(), 40);
+        let cleared = UsageStore::load(Some(path));
+        assert_eq!(cleared.days.len(), 1);
+        assert_eq!(cleared.days["2026-08-01"]["real-tab"].seconds, 321);
         fs::remove_dir_all(directory).unwrap();
     }
 
