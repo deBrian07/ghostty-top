@@ -63,10 +63,10 @@ refresh with `ghostty-top --interval 0.5`.
 The interactive monitor automatically records time only when Ghostty is the
 frontmost app and a tab remains selected across consecutive five-second
 samples. Ghostty 1.3 or newer and the one-time macOS Automation permission are
-required. Usage is stored at:
+required. History is stored outside the application and repository at:
 
 ```text
-~/Library/Application Support/ghostty-top/usage.tsv
+~/Library/Application Support/ghostty-top/
 ```
 
 To collect usage without leaving the full monitor open, run:
@@ -91,10 +91,35 @@ binary:
 ghostty-top --uninstall-tracker
 ```
 
-Installing, upgrading, or uninstalling the service never removes `usage.tsv`.
+Installing, upgrading, or uninstalling the service never removes this directory
+or its historical files.
 
-The tracker flushes its small local data file every 30 seconds. It does not send
-usage data anywhere.
+The tracker maintains five complementary datasets:
+
+- `usage.tsv`: daily focused time per stable Ghostty tab ID.
+- `tab-history-v1.tsv`: append-only snapshots of every window, tab, and split,
+  including IDs, titles, indexes, focus/selection, and working directories.
+- `resources-v1.tsv`: periodic Ghostty and terminal CPU, RAM, process, age,
+  activity, memory-growth, and leak-alert summaries.
+- `processes-v1.tsv`: joinable per-process snapshots with terminal ownership,
+  PID/parent PID, CPU, RAM, age, derived start time, executable name, and path.
+- `tracker-events-v1.tsv`: collector starts, schema and app versions, process ID,
+  OS/architecture, and the sampling intervals used for that session.
+
+Tab snapshots are recorded when state changes and at a 15-minute heartbeat;
+resource summaries are recorded every five minutes. These files are never
+automatically pruned or replaced during an update or reboot. New schemas use new
+versioned files so older history remains readable.
+
+Together these preserve stable UI identity, names and working directories,
+focus/selection state, daily duration, process-tree identity, resource trends,
+and the collection context needed to interpret old samples. The normalized
+timestamps and IDs let later features join datasets without rewriting history.
+
+The tracker does not capture terminal contents, keystrokes, environment
+variables, or full command arguments, which may contain secrets. It retains the
+executable name and path so workloads remain classifiable without storing
+tokens or passwords. It does not send usage data anywhere.
 
 Press `u` or click `[USAGE]` to open the eight-week calendar. Every dot is one
 day, and brighter dots represent more focused Ghostty time. Hover over a dot to
