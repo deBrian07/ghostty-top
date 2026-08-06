@@ -30,6 +30,7 @@ const LAUNCH_AGENT_LABEL: &str = "com.debrian07.ghostty-top.tracker";
 const INVENTORY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const INVENTORY_HEARTBEAT: Duration = Duration::from_secs(15 * 60);
 const RESOURCE_HISTORY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const HISTORY_SCHEMA_VERSION: &str = "1";
 
 #[derive(Clone, Copy)]
 enum ServiceAction {
@@ -493,7 +494,7 @@ impl UsageStore {
 
 impl UsageTracker {
     fn load(now: Instant) -> Self {
-        Self {
+        let mut tracker = Self {
             store: UsageStore::load(default_usage_path()),
             current_day: local_date().unwrap_or_else(|| "unknown".to_string()),
             last_focus: None,
@@ -506,7 +507,11 @@ impl UsageTracker {
             next_resource_history: now,
             last_inventory: Vec::new(),
             last_error: None,
+        };
+        if let Err(error) = append_tracker_event("start") {
+            tracker.last_error = Some(format!("could not save tracker event: {error}"));
         }
+        tracker
     }
 
     fn tick(&mut self, now: Instant) -> bool {
@@ -972,7 +977,97 @@ fn append_resource_history(
             terminal.leak_suspected,
         )?;
     }
+    append_process_history(timestamp, day, terminals, ghostty)?;
     Ok(())
+}
+
+fn append_process_history(
+    timestamp: u64,
+    day: &str,
+    terminals: &[Terminal],
+    ghostty: Option<&Process>,
+) -> io::Result<()> {
+    let Some(path) = default_data_dir().map(|directory| directory.join("processes-v1.tsv")) else {
+        return Ok(());
+    };
+    let mut file = open_history_file(
+        &path,
+        "timestamp\tday\tkind\tterminal_tty\tterminal_root_pid\tpid\tppid\tcpu_percent\trss_kib\tage_seconds\tstarted_at\texecutable_name\texecutable_path",
+    )?;
+    if let Some(process) = ghostty {
+        writeln!(
+            file,
+            "{}",
+            process_history_row(timestamp, day, "app", "", 0, process)
+        )?;
+    }
+    for terminal in terminals {
+        for process in &terminal.processes {
+            writeln!(
+                file,
+                "{}",
+                process_history_row(
+                    timestamp,
+                    day,
+                    "terminal",
+                    &terminal.tty,
+                    terminal.root_pid,
+                    process,
+                )
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn process_history_row(
+    timestamp: u64,
+    day: &str,
+    kind: &str,
+    terminal_tty: &str,
+    terminal_root_pid: i32,
+    process: &Process,
+) -> String {
+    let executable_path = process.command.split_whitespace().next().unwrap_or("?");
+    format!(
+        "{timestamp}\t{}\t{}\t{}\t{terminal_root_pid}\t{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}",
+        clean_field(day),
+        clean_field(kind),
+        clean_field(terminal_tty),
+        process.pid,
+        process.ppid,
+        process.cpu,
+        process.rss_kib,
+        process.age_seconds,
+        timestamp.saturating_sub(process.age_seconds),
+        clean_field(&command_name(&process.command)),
+        clean_field(executable_path),
+    )
+}
+
+fn append_tracker_event(event: &str) -> io::Result<()> {
+    let Some(path) = default_data_dir().map(|directory| directory.join("tracker-events-v1.tsv"))
+    else {
+        return Ok(());
+    };
+    let mut file = open_history_file(
+        &path,
+        "timestamp\tevent\tschema_version\tapp_version\tpid\tos\tarchitecture\tfocus_interval_seconds\tinventory_interval_seconds\tresource_interval_seconds",
+    )?;
+    writeln!(
+        file,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        unix_timestamp(),
+        clean_field(event),
+        HISTORY_SCHEMA_VERSION,
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        env::consts::OS,
+        env::consts::ARCH,
+        USAGE_POLL_INTERVAL.as_secs(),
+        INVENTORY_POLL_INTERVAL.as_secs(),
+        RESOURCE_HISTORY_INTERVAL.as_secs(),
+    )
 }
 
 fn open_history_file(path: &PathBuf, header: &str) -> io::Result<fs::File> {
@@ -2245,5 +2340,22 @@ mod tests {
         assert_eq!(inventory[0].working_directory, "/Users/test/project");
         assert!(inventory[0].app_frontmost);
         assert!(inventory[0].terminal_focused);
+    }
+
+    #[test]
+    fn process_history_keeps_identity_without_command_arguments() {
+        let process = p(
+            42,
+            7,
+            "ttys001",
+            12.5,
+            4096,
+            "/usr/bin/python3 server.py --token secret",
+        );
+        let row = process_history_row(1_000, "2026-08-06", "terminal", "ttys001", 7, &process);
+        assert!(row.contains("\t42\t7\t12.5\t4096\t"));
+        assert!(row.ends_with("\tpython3\t/usr/bin/python3"));
+        assert!(!row.contains("server.py"));
+        assert!(!row.contains("secret"));
     }
 }
