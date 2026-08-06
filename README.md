@@ -32,9 +32,14 @@ No runtime dependencies or elevated permissions are required.
 
 ## Controls
 
+Mouse controls work directly in Ghostty: click a terminal to select it, click
+the selected terminal again to expand its processes, use the scroll wheel to
+move through the list, or click the column headings and footer actions.
+
 | Key | Action |
 | --- | --- |
-| `j` / `k` | Select terminal |
+| `↑` / `↓` or `j` / `k` | Select terminal |
+| Home / End | Jump to the first or last terminal |
 | `e`, space, or enter | Show/hide processes in the selected terminal |
 | `c` | Sort by CPU (press again to reverse) |
 | `m` | Sort by memory (press again to reverse) |

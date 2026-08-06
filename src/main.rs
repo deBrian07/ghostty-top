@@ -12,6 +12,44 @@ const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 const SELECTED: &str = "\x1b[48;5;236m";
+const UNDERLINE: &str = "\x1b[4m";
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Key {
+    Char(u8),
+    Up,
+    Down,
+    Home,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MouseEvent {
+    button: u16,
+    column: usize,
+    row: usize,
+    pressed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum InputEvent {
+    Key(Key),
+    Mouse(MouseEvent),
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Layout {
+    header_row: usize,
+    terminal_start_row: usize,
+    shown_start: usize,
+    shown_count: usize,
+    footer_row: usize,
+}
+
+#[derive(Default)]
+struct InputDecoder {
+    pending: Vec<u8>,
+}
 
 #[derive(Clone, Debug)]
 struct Process {
@@ -83,19 +121,69 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, key: u8) -> bool {
+    fn handle_key(&mut self, key: Key) -> bool {
         match key {
-            b'q' | 3 => return false,
-            b'c' => self.set_sort(SortBy::Cpu),
-            b'm' => self.set_sort(SortBy::Memory),
-            b't' => self.set_sort(SortBy::Tty),
-            b'r' => self.descending = !self.descending,
-            b'j' => self.selected = (self.selected + 1).min(self.terminals.len().saturating_sub(1)),
-            b'k' => self.selected = self.selected.saturating_sub(1),
-            b'e' | b'\n' | b' ' => self.expanded = !self.expanded,
+            Key::Char(b'q' | 3) => return false,
+            Key::Char(b'c') => self.set_sort(SortBy::Cpu),
+            Key::Char(b'm') => self.set_sort(SortBy::Memory),
+            Key::Char(b't') => self.set_sort(SortBy::Tty),
+            Key::Char(b'r') => {
+                self.descending = !self.descending;
+                sort_terminals(&mut self.terminals, self.sort, self.descending);
+            }
+            Key::Char(b'j') | Key::Down => self.move_selection(1),
+            Key::Char(b'k') | Key::Up => self.move_selection(-1),
+            Key::Home => self.selected = 0,
+            Key::End => self.selected = self.terminals.len().saturating_sub(1),
+            Key::Char(b'e' | b'\n' | b' ') => self.expanded = !self.expanded,
             _ => {}
         }
         true
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, layout: Layout) -> bool {
+        if !mouse.pressed {
+            return true;
+        }
+        match mouse.button {
+            64 => self.move_selection(-3),
+            65 => self.move_selection(3),
+            0 => {
+                if mouse.row == layout.header_row {
+                    match mouse.column {
+                        1..=12 => self.set_sort(SortBy::Tty),
+                        13..=21 => self.set_sort(SortBy::Cpu),
+                        22..=32 => self.set_sort(SortBy::Memory),
+                        _ => {}
+                    }
+                } else if mouse.row >= layout.terminal_start_row
+                    && mouse.row < layout.terminal_start_row + layout.shown_count
+                {
+                    let clicked = layout.shown_start + mouse.row - layout.terminal_start_row;
+                    if clicked == self.selected {
+                        self.expanded = !self.expanded;
+                    } else {
+                        self.selected = clicked;
+                    }
+                } else if mouse.row == layout.footer_row {
+                    match mouse.column {
+                        8..=12 => self.set_sort(SortBy::Cpu),
+                        14..=21 => self.set_sort(SortBy::Memory),
+                        23..=32 => self.set_sort(SortBy::Tty),
+                        34..=41 => self.expanded = !self.expanded,
+                        43..=48 => return false,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn move_selection(&mut self, offset: isize) {
+        let last = self.terminals.len().saturating_sub(1) as isize;
+        self.selected = (self.selected as isize + offset).clamp(0, last) as usize;
     }
 
     fn set_sort(&mut self, sort: SortBy) {
@@ -106,6 +194,67 @@ impl App {
             self.descending = sort != SortBy::Tty;
         }
         sort_terminals(&mut self.terminals, self.sort, self.descending);
+    }
+}
+
+impl InputDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Vec<InputEvent> {
+        self.pending.extend_from_slice(bytes);
+        let mut events = Vec::new();
+        loop {
+            if self.pending.is_empty() {
+                break;
+            }
+            if self.pending[0] != 0x1b {
+                events.push(InputEvent::Key(Key::Char(self.pending.remove(0))));
+                continue;
+            }
+            if self.pending.len() < 2 {
+                break;
+            }
+            if self.pending.starts_with(b"\x1b[<") {
+                let Some(end) = self
+                    .pending
+                    .iter()
+                    .position(|byte| *byte == b'M' || *byte == b'm')
+                else {
+                    break;
+                };
+                let pressed = self.pending[end] == b'M';
+                let body = String::from_utf8_lossy(&self.pending[3..end]);
+                let values: Vec<u16> = body
+                    .split(';')
+                    .filter_map(|part| part.parse().ok())
+                    .collect();
+                if values.len() == 3 {
+                    events.push(InputEvent::Mouse(MouseEvent {
+                        button: values[0],
+                        column: values[1] as usize,
+                        row: values[2] as usize,
+                        pressed,
+                    }));
+                }
+                self.pending.drain(..=end);
+                continue;
+            }
+            if self.pending.len() < 3 {
+                break;
+            }
+            let key = match &self.pending[..3] {
+                b"\x1b[A" => Some(Key::Up),
+                b"\x1b[B" => Some(Key::Down),
+                b"\x1b[H" => Some(Key::Home),
+                b"\x1b[F" => Some(Key::End),
+                _ => None,
+            };
+            if let Some(key) = key {
+                events.push(InputEvent::Key(key));
+                self.pending.drain(..3);
+            } else {
+                self.pending.remove(0);
+            }
+        }
+        events
     }
 }
 
@@ -160,17 +309,23 @@ fn main() {
     };
 
     let mut stdin = io::stdin();
+    let mut decoder = InputDecoder::default();
     let mut next_sample = Instant::now() + app.interval;
     let mut dirty = true;
+    let mut layout = Layout::default();
     loop {
         if dirty {
-            render(&app);
+            layout = render(&app);
             dirty = false;
         }
-        let mut input = [0_u8; 16];
+        let mut input = [0_u8; 64];
         if let Ok(count) = stdin.read(&mut input) {
-            for key in &input[..count] {
-                if !app.handle_key(*key) {
+            for event in decoder.push(&input[..count]) {
+                let keep_running = match event {
+                    InputEvent::Key(key) => app.handle_key(key),
+                    InputEvent::Mouse(mouse) => app.handle_mouse(mouse, layout),
+                };
+                if !keep_running {
                     return;
                 }
                 dirty = true;
@@ -231,7 +386,7 @@ impl TerminalGuard {
         if !ok {
             return None;
         }
-        print!("\x1b[?1049h\x1b[?25l");
+        print!("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h");
         let _ = io::stdout().flush();
         Some(Self { original })
     }
@@ -242,7 +397,7 @@ impl Drop for TerminalGuard {
         let _ = Command::new("stty")
             .args(["-f", "/dev/tty", &self.original])
             .status();
-        print!("\x1b[?25h\x1b[?1049l{RESET}");
+        print!("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l{RESET}");
         let _ = io::stdout().flush();
     }
 }
@@ -397,74 +552,151 @@ fn natural_tty(tty: &str) -> u32 {
     tty.trim_start_matches("ttys").parse().unwrap_or(u32::MAX)
 }
 
-fn render(app: &App) {
-    let mut out = String::from("\x1b[H\x1b[2J");
+fn render(app: &App) -> Layout {
+    let (height, width) = terminal_size();
+    let mut lines = Vec::new();
     let shared_cpu = app.ghostty.as_ref().map_or(0.0, |p| p.cpu);
     let shared_ram = app.ghostty.as_ref().map_or(0, |p| p.rss_kib);
     let terminal_cpu: f64 = app.terminals.iter().map(|t| t.cpu).sum();
     let terminal_ram: u64 = app.terminals.iter().map(|t| t.rss_kib).sum();
-    out.push_str(&format!(
-        "{BOLD}{GREEN}ghostty-top{RESET}  {DIM}per-terminal process usage on macOS{RESET}\n"
+    lines.push(format!(
+        "{BOLD}{GREEN}ghostty-top{RESET}  {DIM}per-terminal process usage  •  sort: {} {}{RESET}",
+        sort_name(app.sort),
+        if app.descending { "↓" } else { "↑" }
     ));
-    out.push_str(&format!(
-        "Ghostty shared  CPU {YELLOW}{shared_cpu:>6.1}%{RESET}  RAM {CYAN}{:>8}{RESET}    Terminals ({})  CPU {YELLOW}{terminal_cpu:>6.1}%{RESET}  RAM {CYAN}{:>8}{RESET}\n\n",
+    lines.push(format!(
+        "Ghostty shared  CPU {YELLOW}{shared_cpu:>6.1}%{RESET}  RAM {CYAN}{:>8}{RESET}    Terminals ({})  CPU {YELLOW}{terminal_cpu:>6.1}%{RESET}  RAM {CYAN}{:>8}{RESET}",
         human_bytes(shared_ram), app.terminals.len(), human_bytes(terminal_ram)
     ));
+    lines.push(String::new());
+
+    let mut layout = Layout {
+        header_row: 4,
+        terminal_start_row: 5,
+        ..Layout::default()
+    };
 
     if app.ghostty.is_none() {
-        out.push_str("Ghostty is not running, or its process is not visible.\n");
+        lines.push("Ghostty is not running, or its process is not visible.".into());
     } else if app.terminals.is_empty() {
-        out.push_str("No Ghostty terminal processes found.\n");
+        lines.push("No Ghostty terminal processes found.".into());
     } else {
-        out.push_str(&format!(
-            "{DIM}   TERMINAL    CPU       RAM   PROCS   AGE         ACTIVITY{RESET}\n"
+        lines.push(format!(
+            "{DIM}{UNDERLINE}   TERMINAL    CPU       RAM   PROCS   AGE         ACTIVITY{RESET}  {DIM}← click a heading to sort{RESET}"
         ));
-        for (index, terminal) in app.terminals.iter().enumerate() {
+        let max_rows = if app.expanded {
+            height.saturating_sub(14).max(3)
+        } else {
+            height.saturating_sub(7).max(3)
+        }
+        .min(app.terminals.len());
+        let shown_start = if app.selected >= max_rows {
+            app.selected + 1 - max_rows
+        } else {
+            0
+        };
+        let shown_end = (shown_start + max_rows).min(app.terminals.len());
+        layout.shown_start = shown_start;
+        layout.shown_count = shown_end - shown_start;
+        let activity_width = width.saturating_sub(54).max(10);
+        for (index, terminal) in app
+            .terminals
+            .iter()
+            .enumerate()
+            .take(shown_end)
+            .skip(shown_start)
+        {
             let selected = index == app.selected;
+            let mut line = String::new();
             if selected {
-                out.push_str(SELECTED);
+                line.push_str(SELECTED);
             }
             let marker = if selected { "›" } else { " " };
-            out.push_str(&format!(
+            line.push_str(&format!(
                 "{marker}  {:<8} {YELLOW}{:>6.1}%{RESET}  {CYAN}{:>8}{RESET}  {:>5}   {:<10}  {}",
                 terminal.tty,
                 terminal.cpu,
                 human_bytes(terminal.rss_kib),
                 terminal.processes.len(),
                 terminal.elapsed,
-                truncate(&terminal.activity, 42),
+                truncate(&terminal.activity, activity_width),
             ));
             if selected {
-                out.push_str(RESET);
+                line.push_str(RESET);
             }
-            out.push('\n');
+            lines.push(line);
+        }
+        if shown_end < app.terminals.len() {
+            lines.push(format!(
+                "{DIM}   … {} more terminal{} below (scroll or use ↓){RESET}",
+                app.terminals.len() - shown_end,
+                if app.terminals.len() - shown_end == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
         }
     }
 
     if app.expanded {
         if let Some(terminal) = app.terminals.get(app.selected) {
-            out.push_str(&format!("\n{BOLD}Processes in {}{RESET}  {DIM}(RSS is resident memory; shared pages may be counted more than once){RESET}\n", terminal.tty));
-            out.push_str(&format!(
-                "{DIM}     PID     CPU       RAM   COMMAND{RESET}\n"
+            lines.push(String::new());
+            lines.push(format!(
+                "{BOLD}Processes in {}{RESET}  {DIM}(click the selected row to collapse){RESET}",
+                terminal.tty
             ));
-            for process in terminal.processes.iter().take(12) {
-                out.push_str(&format!(
-                    "  {:>6}  {YELLOW}{:>6.1}%{RESET}  {CYAN}{:>8}{RESET}   {}\n",
+            lines.push(format!(
+                "{DIM}{UNDERLINE}     PID     CPU       RAM   COMMAND{RESET}"
+            ));
+            let process_rows = height.saturating_sub(lines.len() + 2);
+            let command_width = width.saturating_sub(29).max(12);
+            for process in terminal.processes.iter().take(process_rows) {
+                lines.push(format!(
+                    "  {:>6}  {YELLOW}{:>6.1}%{RESET}  {CYAN}{:>8}{RESET}   {}",
                     process.pid,
                     process.cpu,
                     human_bytes(process.rss_kib),
-                    truncate(&process.command, 70),
+                    truncate(&process.command, command_width),
                 ));
             }
         }
     }
 
     if let Some(error) = &app.last_error {
-        out.push_str(&format!("\n\x1b[31mSampling error: {error}{RESET}\n"));
+        lines.push(format!("\x1b[31mSampling error: {error}{RESET}"));
     }
-    out.push_str(&format!("\n{DIM}j/k select  e/space expand  c CPU  m memory  t terminal  r reverse  q quit  •  refresh {:.1}s{RESET}", app.interval.as_secs_f64()));
-    print!("{out}");
+    lines.push(String::new());
+    lines.push(format!(
+        "{DIM}Mouse:{RESET} {UNDERLINE}[CPU]{RESET} {UNDERLINE}[MEMORY]{RESET} {UNDERLINE}[TERMINAL]{RESET} {UNDERLINE}[EXPAND]{RESET} {UNDERLINE}[QUIT]{RESET}  {DIM}↑/↓ move  enter expand  r reverse  •  {:.1}s{RESET}",
+        app.interval.as_secs_f64()
+    ));
+    layout.footer_row = lines.len();
+    print!("\x1b[H\x1b[2J{}", lines.join("\n"));
     let _ = io::stdout().flush();
+    layout
+}
+
+fn terminal_size() -> (usize, usize) {
+    let output = Command::new("stty")
+        .args(["-f", "/dev/tty", "size"])
+        .output();
+    let Some(output) = output.ok().filter(|value| value.status.success()) else {
+        return (24, 100);
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut values = text
+        .split_whitespace()
+        .filter_map(|value| value.parse().ok());
+    (values.next().unwrap_or(24), values.next().unwrap_or(100))
+}
+
+fn sort_name(sort: SortBy) -> &'static str {
+    match sort {
+        SortBy::Cpu => "CPU",
+        SortBy::Memory => "memory",
+        SortBy::Tty => "terminal",
+    }
 }
 
 fn print_snapshot(app: &App) {
@@ -578,5 +810,58 @@ mod tests {
         assert_eq!(terminals[0].rss_kib, 60);
         assert_eq!(terminals[0].activity, "node");
         assert_eq!(terminals[1].cpu, 1.0);
+    }
+
+    #[test]
+    fn decodes_arrow_and_mouse_input() {
+        let mut decoder = InputDecoder::default();
+        let events = decoder.push(b"\x1b[A\x1b[<0;18;7M");
+        assert_eq!(events[0], InputEvent::Key(Key::Up));
+        assert_eq!(
+            events[1],
+            InputEvent::Mouse(MouseEvent {
+                button: 0,
+                column: 18,
+                row: 7,
+                pressed: true,
+            })
+        );
+    }
+
+    #[test]
+    fn keeps_partial_mouse_input_until_complete() {
+        let mut decoder = InputDecoder::default();
+        assert!(decoder.push(b"\x1b[<0;12").is_empty());
+        assert_eq!(
+            decoder.push(b";5M"),
+            vec![InputEvent::Mouse(MouseEvent {
+                button: 0,
+                column: 12,
+                row: 5,
+                pressed: true,
+            })]
+        );
+    }
+
+    #[test]
+    fn clicking_a_row_selects_then_expands_it() {
+        let mut app = App::new(Duration::from_secs(1));
+        app.terminals = vec![Terminal::default(), Terminal::default()];
+        let layout = Layout {
+            terminal_start_row: 5,
+            shown_count: 2,
+            ..Layout::default()
+        };
+        let click = MouseEvent {
+            button: 0,
+            column: 8,
+            row: 6,
+            pressed: true,
+        };
+        assert!(app.handle_mouse(click, layout));
+        assert_eq!(app.selected, 1);
+        assert!(!app.expanded);
+        assert!(app.handle_mouse(click, layout));
+        assert!(app.expanded);
     }
 }
