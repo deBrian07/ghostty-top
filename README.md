@@ -3,7 +3,8 @@
 A small, htop-style macOS monitor for CPU and resident memory used by each
 Ghostty terminal surface.
 
-<img width="872" height="380" alt="image" src="https://github.com/user-attachments/assets/59604e3c-ed13-41d9-891b-bf0ddfcac675" />
+<img width="883" height="384" alt="image" src="https://github.com/user-attachments/assets/494d4c51-4db0-4890-a681-e6bd081cff39" />
+
 
 
 Ghostty renders all tabs and split panes inside one shared app process. macOS
