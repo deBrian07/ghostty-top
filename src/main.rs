@@ -28,6 +28,20 @@ const MIN_LEAK_R_SQUARED: f64 = 0.70;
 const MIN_UPWARD_SAMPLE_RATIO: f64 = 0.70;
 const LEAK_CONFIRMATION_WINDOWS: u8 = 3;
 const LEAK_CLEAR_WINDOWS: u8 = 10;
+const CALENDAR_GUTTER: usize = 4;
+const CALENDAR_CELL_WIDTH: usize = 2;
+const CALENDAR_MIN_WEEKS: usize = 4;
+const CALENDAR_MAX_WEEKS: usize = 53;
+const CALENDAR_BLOCK: &str = "■";
+const CALENDAR_HOVER: &str = "\x1b[48;5;238m";
+const CALENDAR_SELECTED: &str = "\x1b[48;5;24m";
+const CALENDAR_RAMP: [&str; 5] = [
+    "\x1b[38;5;237m",
+    "\x1b[38;5;25m",
+    "\x1b[38;5;32m",
+    "\x1b[38;5;39m",
+    "\x1b[38;5;81m",
+];
 const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const USAGE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -75,12 +89,11 @@ enum InputEvent {
 
 #[derive(Clone, Debug, Default)]
 struct Layout {
-    header_row: usize,
     terminal_start_row: usize,
     shown_start: usize,
     shown_count: usize,
-    footer_row: usize,
     calendar_cells: Vec<CalendarCell>,
+    zones: Vec<ClickZone>,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +102,33 @@ struct CalendarCell {
     end_column: usize,
     row: usize,
     day: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ClickAction {
+    Sort(SortBy),
+    ReverseSort,
+    ToggleExpand,
+    ShowUsage,
+    ShowMonitor,
+    Quit,
+    SetScale(UsageScale),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ClickZone {
+    start_column: usize,
+    end_column: usize,
+    row: usize,
+    action: ClickAction,
+}
+
+impl ClickZone {
+    fn contains(&self, mouse: &MouseEvent) -> bool {
+        mouse.row == self.row
+            && mouse.column >= self.start_column
+            && mouse.column <= self.end_column
+    }
 }
 
 #[derive(Default)]
@@ -124,7 +164,7 @@ struct Terminal {
     leak_suspected: bool,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum SortBy {
     Cpu,
     Memory,
@@ -139,6 +179,35 @@ enum SortBy {
 enum View {
     Monitor,
     Usage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum UsageScale {
+    Daily,
+    Weekly,
+    Cumulative,
+}
+
+impl UsageScale {
+    const ALL: [Self; 3] = [Self::Daily, Self::Weekly, Self::Cumulative];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Cumulative => "cumulative",
+        }
+    }
+
+    /// Smallest value that still counts as a full-brightness cell, so a quiet
+    /// stretch of days does not light up the grid as if it were a busy one.
+    fn brightness_floor(self) -> u64 {
+        match self {
+            Self::Daily => 4 * 3_600,
+            Self::Weekly => 20 * 3_600,
+            Self::Cumulative => 0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -221,6 +290,7 @@ struct App {
     memory_history: HashMap<i32, MemoryHistory>,
     usage_tracker: Option<UsageTracker>,
     view: View,
+    usage_scale: UsageScale,
     hovered_day: Option<String>,
     selected_day: Option<String>,
 }
@@ -239,6 +309,7 @@ impl App {
             memory_history: HashMap::new(),
             usage_tracker: None,
             view: View::Monitor,
+            usage_scale: UsageScale::Daily,
             hovered_day: None,
             selected_day: None,
         }
@@ -270,6 +341,25 @@ impl App {
     }
 
     fn handle_key(&mut self, key: Key) -> bool {
+        // The calendar reuses letters that sort columns in the monitor view, so
+        // claim them here before the shared bindings see them.
+        if self.view == View::Usage {
+            match key {
+                Key::Char(b'd') => {
+                    self.usage_scale = UsageScale::Daily;
+                    return true;
+                }
+                Key::Char(b'w') => {
+                    self.usage_scale = UsageScale::Weekly;
+                    return true;
+                }
+                Key::Char(b'c') => {
+                    self.usage_scale = UsageScale::Cumulative;
+                    return true;
+                }
+                _ => {}
+            }
+        }
         match key {
             Key::Char(b'q' | 3) => return false,
             Key::Char(b'c') => self.set_sort(SortBy::Cpu),
@@ -314,12 +404,8 @@ impl App {
             if mouse.pressed && mouse.button == 0 {
                 if let Some(day) = &self.hovered_day {
                     self.selected_day = Some(day.clone());
-                } else if mouse.row == layout.footer_row {
-                    match mouse.column {
-                        8..=16 => self.view = View::Monitor,
-                        18..=23 => return false,
-                        _ => {}
-                    }
+                } else if let Some(zone) = layout.zones.iter().find(|zone| zone.contains(&mouse)) {
+                    return self.apply(zone.action);
                 }
             }
             return true;
@@ -331,18 +417,7 @@ impl App {
             64 => self.move_selection(-3),
             65 => self.move_selection(3),
             0 => {
-                if mouse.row == layout.header_row {
-                    match mouse.column {
-                        1..=12 => self.set_sort(SortBy::Tty),
-                        13..=20 => self.set_sort(SortBy::Cpu),
-                        21..=30 => self.set_sort(SortBy::Memory),
-                        31..=43 => self.set_sort(SortBy::Trend),
-                        44..=51 => self.set_sort(SortBy::Processes),
-                        52..=63 => self.set_sort(SortBy::Age),
-                        64.. => self.set_sort(SortBy::Activity),
-                        _ => {}
-                    }
-                } else if mouse.row >= layout.terminal_start_row
+                if mouse.row >= layout.terminal_start_row
                     && mouse.row < layout.terminal_start_row + layout.shown_count
                 {
                     let clicked = layout.shown_start + mouse.row - layout.terminal_start_row;
@@ -351,23 +426,28 @@ impl App {
                     } else {
                         self.selected = clicked;
                     }
-                } else if mouse.row == layout.footer_row {
-                    match mouse.column {
-                        8..=12 => self.set_sort(SortBy::Tty),
-                        14..=18 => self.set_sort(SortBy::Cpu),
-                        20..=24 => self.set_sort(SortBy::Memory),
-                        26..=32 => self.set_sort(SortBy::Trend),
-                        34..=40 => self.set_sort(SortBy::Processes),
-                        42..=46 => self.set_sort(SortBy::Age),
-                        48..=57 => self.set_sort(SortBy::Activity),
-                        59..=66 => self.expanded = !self.expanded,
-                        68..=73 => return false,
-                        75..=81 => self.view = View::Usage,
-                        _ => {}
-                    }
+                } else if let Some(zone) = layout.zones.iter().find(|zone| zone.contains(&mouse)) {
+                    return self.apply(zone.action);
                 }
             }
             _ => {}
+        }
+        true
+    }
+
+    /// Runs a click target's action, returning false when the app should exit.
+    fn apply(&mut self, action: ClickAction) -> bool {
+        match action {
+            ClickAction::Sort(sort) => self.set_sort(sort),
+            ClickAction::ReverseSort => {
+                self.descending = !self.descending;
+                sort_terminals(&mut self.terminals, self.sort, self.descending);
+            }
+            ClickAction::ToggleExpand => self.expanded = !self.expanded,
+            ClickAction::ShowUsage => self.view = View::Usage,
+            ClickAction::ShowMonitor => self.view = View::Monitor,
+            ClickAction::SetScale(scale) => self.usage_scale = scale,
+            ClickAction::Quit => return false,
         }
         true
     }
@@ -1782,24 +1862,26 @@ fn render_monitor(app: &App) -> Layout {
         .iter()
         .filter(|terminal| terminal.leak_suspected)
         .count();
+    // Stay quiet unless something is actually wrong.
     let alert_status = if alert_count == 0 {
-        format!("{DIM}no leak alerts{RESET}")
+        String::new()
     } else {
-        format!("{BOLD}{RED}⚠ {alert_count} potential leak alert(s){RESET}")
+        format!("  {BOLD}{RED}⚠ {alert_count} potential leak alert(s){RESET}")
     };
     lines.push(format!(
-        "{BOLD}{GREEN}ghostty-top{RESET}  {DIM}per-terminal process usage{RESET}  •  {alert_status}",
+        "{BOLD}{GREEN}ghostty-top{RESET}  {DIM}per-terminal process usage{RESET}{alert_status}",
     ));
     lines.push(format!(
-        "Ghostty shared  CPU {YELLOW}{shared_cpu:>6.1}%{RESET}  RAM {CYAN}{:>8}{RESET}    Terminals ({})  CPU {YELLOW}{terminal_cpu:>6.1}%{RESET}  RAM {CYAN}{:>8}{RESET}    {DIM}sort: {} {}{RESET}",
-        human_bytes(shared_ram), app.terminals.len(), human_bytes(terminal_ram),
+        "Ghostty  {YELLOW}{shared_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}    {} terminals  {YELLOW}{terminal_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}    {DIM}sort: {} {}{RESET}",
+        human_bytes(shared_ram),
+        app.terminals.len(),
+        human_bytes(terminal_ram),
         sort_name(app.sort),
         if app.descending { "↓" } else { "↑" }
     ));
     lines.push(String::new());
 
     let mut layout = Layout {
-        header_row: 4,
         terminal_start_row: 5,
         ..Layout::default()
     };
@@ -1809,16 +1891,9 @@ fn render_monitor(app: &App) -> Layout {
     } else if app.terminals.is_empty() {
         lines.push("No Ghostty terminal processes found.".into());
     } else {
-        lines.push(format!(
-            "   {} {} {} {} {} {} {}",
-            header_cell("TERMINAL", 8, SortBy::Tty, app),
-            header_cell("CPU", 7, SortBy::Cpu, app),
-            header_cell("RAM", 9, SortBy::Memory, app),
-            header_cell("TREND", 12, SortBy::Trend, app),
-            header_cell("PROCS", 7, SortBy::Processes, app),
-            header_cell("AGE", 11, SortBy::Age, app),
-            header_cell("ACTIVITY", 8, SortBy::Activity, app),
-        ));
+        let (header_line, header_zones) = monitor_header(lines.len() + 1, width, app);
+        layout.zones.extend(header_zones);
+        lines.push(header_line);
         let max_rows = if app.expanded {
             height.saturating_sub(15).max(3)
         } else {
@@ -1915,23 +1990,28 @@ fn render_monitor(app: &App) -> Layout {
         lines.push(format!("\x1b[31mSampling error: {error}{RESET}"));
     }
     lines.push(String::new());
-    layout.footer_row = lines.len() + 1;
-    lines.push(format!(
-        "{DIM}Mouse:{RESET} {UNDERLINE}[TTY]{RESET} {UNDERLINE}[CPU]{RESET} {UNDERLINE}[RAM]{RESET} {UNDERLINE}[TREND]{RESET} {UNDERLINE}[PROCS]{RESET} {UNDERLINE}[AGE]{RESET} {UNDERLINE}[ACTIVITY]{RESET} {UNDERLINE}[EXPAND]{RESET} {UNDERLINE}[QUIT]{RESET} {UNDERLINE}[USAGE]{RESET}"
-    ));
-    lines.push(format!(
-        "{DIM}Keys: t/c/m/g/p/a/n sort  •  ↑/↓ move  •  enter expand  •  r reverse  •  u usage  •  q quit  •  refresh {:.1}s{RESET}",
-        app.interval.as_secs_f64()
-    ));
+    let (hint, hint_zones) = hint_line(
+        lines.len() + 1,
+        &[
+            ("click a column to sort", None),
+            ("↑↓ select", None),
+            ("enter expand", Some(ClickAction::ToggleExpand)),
+            ("r reverse", Some(ClickAction::ReverseSort)),
+            ("u usage", Some(ClickAction::ShowUsage)),
+            ("q quit", Some(ClickAction::Quit)),
+        ],
+    );
+    layout.zones.extend(hint_zones);
+    lines.push(hint);
     print!("\x1b[H\x1b[2J{}", lines.join("\n"));
     let _ = io::stdout().flush();
     layout
 }
 
 fn render_usage(app: &App) -> Layout {
-    const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    const WEEKS: i64 = 8;
-    let (height, _) = terminal_size();
+    const WEEKDAYS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+    let (height, width) = terminal_size();
+    let weeks = visible_weeks(width);
     let mut lines = vec![format!(
         "{BOLD}{GREEN}ghostty-top{RESET}  {BOLD}focused tab usage{RESET}"
     )];
@@ -1942,25 +2022,19 @@ fn render_usage(app: &App) -> Layout {
         .or_else(local_date)
         .unwrap_or_else(|| "1970-01-01".to_string());
     let today_number = date_to_day_number(&today).unwrap_or(0);
-    let current_weekday = (today_number + 3).rem_euclid(7);
-    let start = today_number - current_weekday - (WEEKS - 1) * 7;
-    let range_total: u64 = tracker
-        .map(|value| {
-            value
-                .store
-                .days
-                .iter()
-                .filter_map(|(day, tabs)| {
-                    let number = date_to_day_number(day)?;
-                    (number >= start && number <= today_number)
-                        .then(|| tabs.values().map(|usage| usage.seconds).sum::<u64>())
-                })
-                .sum()
-        })
-        .unwrap_or(0);
+    let start = today_number - sunday_index(today_number) - (weeks as i64 - 1) * 7;
+
+    let daily = daily_totals(tracker, start, weeks, today_number);
+    let values = scaled_usage(&daily, app.usage_scale);
+    let peak = usage_peak(&values, app.usage_scale);
+    let range_total: u64 = daily.iter().sum();
+    let busiest = daily.iter().copied().max().unwrap_or(0);
+
     lines.push(format!(
-        "Last 8 weeks  •  {} total  •  brighter dots mean more focused time",
-        human_duration(range_total)
+        "Last {weeks} weeks  •  {} total  •  busiest day {}  •  {BOLD}{}{RESET} shading",
+        human_duration(range_total),
+        human_duration(busiest),
+        app.usage_scale.label(),
     ));
     if let Some(error) = tracker.and_then(|value| value.last_error.as_ref()) {
         lines.push(format!("{RED}Tracking paused: {error}{RESET}"));
@@ -1970,38 +2044,45 @@ fn render_usage(app: &App) -> Layout {
         ));
     }
     lines.push(String::new());
-
-    let mut week_header = String::from("    ");
-    for week in 0..WEEKS {
-        let (year, month, day) = civil_from_day_number(start + week * 7);
-        let _ = year;
-        week_header.push_str(&format!("{month:02}/{day:02} "));
-    }
-    lines.push(format!("{DIM}{week_header}{RESET}"));
+    lines.push(format!("{DIM}{}{RESET}", month_header(start, weeks)));
 
     for (weekday, label) in WEEKDAYS.iter().enumerate() {
         let row = lines.len() + 1;
-        let mut line = format!("{label} ");
-        for week in 0..WEEKS {
-            let number = start + week * 7 + weekday as i64;
-            let day = day_number_to_date(number);
-            let seconds = tracker
-                .and_then(|value| value.store.days.get(&day))
-                .map(|tabs| tabs.values().map(|usage| usage.seconds).sum())
-                .unwrap_or(0);
-            let future = number > today_number;
-            line.push_str(&usage_dot(seconds, future));
-            if !future {
-                layout.calendar_cells.push(CalendarCell {
-                    start_column: 5 + week as usize * 6,
-                    end_column: 10 + week as usize * 6,
-                    row,
-                    day,
-                });
+        let mut line = format!(" {label} ");
+        for week in 0..weeks {
+            let index = week * 7 + weekday;
+            let number = start + index as i64;
+            if number > today_number {
+                line.push_str(&" ".repeat(CALENDAR_CELL_WIDTH));
+                continue;
             }
+            let day = day_number_to_date(number);
+            let highlight = if app.selected_day.as_deref() == Some(day.as_str()) {
+                CALENDAR_SELECTED
+            } else if app.hovered_day.as_deref() == Some(day.as_str()) {
+                CALENDAR_HOVER
+            } else {
+                ""
+            };
+            line.push_str(&format!(
+                "{highlight}{}{CALENDAR_BLOCK} {RESET}",
+                CALENDAR_RAMP[usage_level(values[index], peak)]
+            ));
+            layout.calendar_cells.push(CalendarCell {
+                start_column: CALENDAR_GUTTER + 1 + week * CALENDAR_CELL_WIDTH,
+                end_column: CALENDAR_GUTTER + week * CALENDAR_CELL_WIDTH + CALENDAR_CELL_WIDTH,
+                row,
+                day,
+            });
         }
         lines.push(line);
     }
+
+    lines.push(String::new());
+    lines.push(legend_line());
+    let (scale_line, scale_zones) = scale_selector(lines.len() + 1, app.usage_scale);
+    layout.zones.extend(scale_zones);
+    lines.push(scale_line);
 
     lines.push(String::new());
     if let Some(day) = &app.hovered_day {
@@ -2011,9 +2092,13 @@ fn render_usage(app: &App) -> Layout {
             friendly_date(day),
             human_duration(seconds)
         ));
+    } else if range_total == 0 {
+        lines.push(format!(
+            "{DIM}Nothing recorded yet. Time is logged while Ghostty is frontmost; run{RESET} ghostty-top --install-tracker {DIM}to keep it running.{RESET}"
+        ));
     } else {
         lines.push(format!(
-            "{DIM}Hover over a dot for its date and total; click it for the tab breakdown.{RESET}"
+            "{DIM}Hover a square for its total; click it for the tab breakdown.{RESET}"
         ));
     }
 
@@ -2054,13 +2139,17 @@ fn render_usage(app: &App) -> Layout {
     }
 
     lines.push(String::new());
-    layout.footer_row = lines.len() + 1;
-    lines.push(format!(
-        "{DIM}Mouse:{RESET} {UNDERLINE}[MONITOR]{RESET} {UNDERLINE}[QUIT]{RESET}"
-    ));
-    lines.push(format!(
-        "{DIM}Keys: u monitor  •  q quit  •  data: ~/Library/Application Support/ghostty-top/usage.tsv{RESET}"
-    ));
+    let (hint, hint_zones) = hint_line(
+        lines.len() + 1,
+        &[
+            ("click a square for details", None),
+            ("d/w/c shading", None),
+            ("u monitor", Some(ClickAction::ShowMonitor)),
+            ("q quit", Some(ClickAction::Quit)),
+        ],
+    );
+    layout.zones.extend(hint_zones);
+    lines.push(hint);
     print!("\x1b[H\x1b[2J{}", lines.join("\n"));
     let _ = io::stdout().flush();
     layout
@@ -2073,19 +2162,201 @@ fn usage_total_for_day(tracker: Option<&UsageTracker>, day: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn usage_dot(seconds: u64, future: bool) -> String {
-    if future {
-        return "      ".to_string();
+/// Weeks that fit the terminal, newest on the right, capped at a full year.
+fn visible_weeks(width: usize) -> usize {
+    (width.saturating_sub(CALENDAR_GUTTER + 1) / CALENDAR_CELL_WIDTH)
+        .clamp(CALENDAR_MIN_WEEKS, CALENDAR_MAX_WEEKS)
+}
+
+/// Day of the week with Sunday as 0, matching the calendar's row order.
+fn sunday_index(day_number: i64) -> i64 {
+    (day_number + 4).rem_euclid(7)
+}
+
+/// Focused seconds per grid cell, in chronological (and therefore index) order.
+fn daily_totals(
+    tracker: Option<&UsageTracker>,
+    start: i64,
+    weeks: usize,
+    today_number: i64,
+) -> Vec<u64> {
+    (0..weeks * 7)
+        .map(|index| {
+            let number = start + index as i64;
+            if number > today_number {
+                return 0;
+            }
+            usage_total_for_day(tracker, &day_number_to_date(number))
+        })
+        .collect()
+}
+
+/// Restates daily totals as the quantity the chosen shading mode colors by.
+fn scaled_usage(daily: &[u64], scale: UsageScale) -> Vec<u64> {
+    match scale {
+        UsageScale::Daily => daily.to_vec(),
+        UsageScale::Weekly => daily
+            .chunks(7)
+            .flat_map(|week| {
+                let total: u64 = week.iter().sum();
+                std::iter::repeat_n(total, week.len())
+            })
+            .collect(),
+        UsageScale::Cumulative => daily
+            .iter()
+            .scan(0, |running, seconds| {
+                *running += seconds;
+                Some(*running)
+            })
+            .collect(),
     }
-    let (color, dot) = match seconds {
-        0 => ("\x1b[38;5;238m", "·"),
-        1..=899 => ("\x1b[38;5;240m", "●"),
-        900..=3_599 => ("\x1b[38;5;75m", "●"),
-        3_600..=10_799 => ("\x1b[38;5;81m", "●"),
-        10_800..=21_599 => ("\x1b[38;5;159m", "●"),
-        _ => ("\x1b[38;5;231m", "●"),
-    };
-    format!("  {color}{dot}{RESET}   ")
+}
+
+fn usage_peak(values: &[u64], scale: UsageScale) -> u64 {
+    values
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(scale.brightness_floor())
+}
+
+/// Buckets a value into the ramp: 0 is "no usage", 1-4 are quarters of the peak.
+fn usage_level(value: u64, peak: u64) -> usize {
+    if value == 0 || peak == 0 {
+        return 0;
+    }
+    (value.saturating_mul(4).div_ceil(peak) as usize).clamp(1, 4)
+}
+
+/// Month names above the week columns they start in, GitHub-calendar style.
+fn month_header(start: i64, weeks: usize) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let grid_width = CALENDAR_GUTTER + weeks * CALENDAR_CELL_WIDTH;
+    let mut header = " ".repeat(CALENDAR_GUTTER);
+    let mut previous_month = None;
+    for week in 0..weeks {
+        let (_, month, day) = civil_from_day_number(start + week as i64 * 7);
+        let starts_here = match previous_month {
+            // Only label the leading column when its month really begins there,
+            // so a partial first month cannot crowd out the next label.
+            None => day <= 7,
+            Some(previous) => previous != month,
+        };
+        previous_month = Some(month);
+        let column = CALENDAR_GUTTER + week * CALENDAR_CELL_WIDTH;
+        let label = MONTHS[month as usize - 1];
+        if starts_here && column >= header.len() && column + label.len() <= grid_width {
+            header.push_str(&" ".repeat(column - header.len()));
+            header.push_str(label);
+        }
+    }
+    header
+}
+
+fn legend_line() -> String {
+    let mut line = format!("{}{DIM}Less{RESET} ", " ".repeat(CALENDAR_GUTTER));
+    for color in CALENDAR_RAMP {
+        line.push_str(&format!("{color}{CALENDAR_BLOCK}{RESET} "));
+    }
+    line.push_str(&format!("{DIM}More{RESET}"));
+    line
+}
+
+/// Renders `daily · weekly · cumulative` and the columns each word occupies.
+fn scale_selector(row: usize, active: UsageScale) -> (String, Vec<ClickZone>) {
+    const SEPARATOR_WIDTH: usize = 3;
+    let mut line = " ".repeat(CALENDAR_GUTTER);
+    let mut column = CALENDAR_GUTTER + 1;
+    let mut zones = Vec::with_capacity(UsageScale::ALL.len());
+    for (index, scale) in UsageScale::ALL.iter().enumerate() {
+        if index > 0 {
+            line.push_str(&format!("{DIM} · {RESET}"));
+            column += SEPARATOR_WIDTH;
+        }
+        let label = scale.label();
+        if *scale == active {
+            line.push_str(&format!("{BOLD}{}{label}{RESET}", CALENDAR_RAMP[4]));
+        } else {
+            line.push_str(&format!("{DIM}{label}{RESET}"));
+        }
+        zones.push(ClickZone {
+            start_column: column,
+            end_column: column + label.len() - 1,
+            row,
+            action: ClickAction::SetScale(*scale),
+        });
+        column += label.len();
+    }
+    (line, zones)
+}
+
+/// The single dim line of chrome at the bottom of a view. Segments naming an
+/// action are also click targets, so the hint doubles as the mouse affordance.
+fn hint_line(row: usize, segments: &[(&str, Option<ClickAction>)]) -> (String, Vec<ClickZone>) {
+    const SEPARATOR: &str = "  ·  ";
+    let mut line = String::from(DIM);
+    let mut column = 1;
+    let mut zones = Vec::new();
+    for (index, (label, action)) in segments.iter().enumerate() {
+        if index > 0 {
+            line.push_str(SEPARATOR);
+            column += SEPARATOR.chars().count();
+        }
+        line.push_str(label);
+        if let Some(action) = action {
+            zones.push(ClickZone {
+                start_column: column,
+                end_column: column + label.chars().count() - 1,
+                row,
+                action: *action,
+            });
+        }
+        column += label.chars().count();
+    }
+    line.push_str(RESET);
+    (line, zones)
+}
+
+/// Renders the sortable column headings and the columns each one occupies.
+fn monitor_header(row: usize, width: usize, app: &App) -> (String, Vec<ClickZone>) {
+    // Headings are aligned like the values beneath them: text left, numbers right.
+    const COLUMNS: [(&str, usize, SortBy, bool); 7] = [
+        ("TERMINAL", 8, SortBy::Tty, false),
+        ("CPU", 7, SortBy::Cpu, true),
+        ("RAM", 9, SortBy::Memory, true),
+        ("TREND", 12, SortBy::Trend, true),
+        ("PROCS", 7, SortBy::Processes, true),
+        ("AGE", 11, SortBy::Age, true),
+        ("ACTIVITY", 8, SortBy::Activity, false),
+    ];
+    const INDENT: usize = 3;
+    let mut line = " ".repeat(INDENT);
+    let mut column = INDENT + 1;
+    let mut zones = Vec::with_capacity(COLUMNS.len());
+    for (index, (label, cell_width, sort, right_aligned)) in COLUMNS.iter().enumerate() {
+        if index > 0 {
+            line.push(' ');
+            column += 1;
+        }
+        line.push_str(&header_cell(label, *cell_width, *sort, *right_aligned, app));
+        let last = index + 1 == COLUMNS.len();
+        zones.push(ClickZone {
+            start_column: column,
+            // The final column owns the rest of the row so its wide values stay clickable.
+            end_column: if last {
+                width.max(column + cell_width)
+            } else {
+                column + cell_width - 1
+            },
+            row,
+            action: ClickAction::Sort(*sort),
+        });
+        column += cell_width;
+    }
+    (line, zones)
 }
 
 fn human_duration(seconds: u64) -> String {
@@ -2173,13 +2444,20 @@ fn terminal_size() -> (usize, usize) {
     (values.next().unwrap_or(24), values.next().unwrap_or(100))
 }
 
-fn header_cell(label: &str, width: usize, column: SortBy, app: &App) -> String {
-    let text = if app.sort == column {
-        format!("{}{}", label, if app.descending { "↓" } else { "↑" })
+fn header_cell(
+    label: &str,
+    width: usize,
+    column: SortBy,
+    right_aligned: bool,
+    app: &App,
+) -> String {
+    // No sort arrow here: it would overflow the narrow headings and push the
+    // whole row out of step with the data. The summary line carries direction.
+    let padded = if right_aligned {
+        format!("{label:>width$}")
     } else {
-        label.to_string()
+        format!("{label:<width$}")
     };
-    let padded = format!("{text:<width$}");
     if app.sort == column {
         format!("{ACTIVE_HEADER}{padded}{RESET}")
     } else {
@@ -2593,6 +2871,177 @@ mod tests {
         assert!(app.handle_mouse(click, &layout));
         assert_eq!(app.hovered_day.as_deref(), Some("2026-08-06"));
         assert_eq!(app.selected_day.as_deref(), Some("2026-08-06"));
+    }
+
+    /// Drops SGR sequences so a rendered line can be measured in visible columns.
+    fn strip_ansi(value: &str) -> String {
+        let mut plain = String::new();
+        let mut characters = value.chars();
+        while let Some(character) = characters.next() {
+            if character != '\x1b' {
+                plain.push(character);
+                continue;
+            }
+            for escape in characters.by_ref() {
+                if escape.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        plain
+    }
+
+    fn text_at(line: &str, zone: &ClickZone) -> String {
+        let plain = strip_ansi(line);
+        let end = zone.end_column.min(plain.chars().count());
+        plain
+            .chars()
+            .skip(zone.start_column - 1)
+            .take((end + 1).saturating_sub(zone.start_column))
+            .collect()
+    }
+
+    #[test]
+    fn monitor_headings_line_up_with_their_click_targets() {
+        let app = App::new(Duration::from_secs(1));
+        let (line, zones) = monitor_header(4, 100, &app);
+        let labels = [
+            "TERMINAL", "CPU", "RAM", "TREND", "PROCS", "AGE", "ACTIVITY",
+        ];
+        assert_eq!(zones.len(), labels.len());
+        for (zone, label) in zones.iter().zip(labels) {
+            assert_eq!(text_at(&line, zone).trim(), label);
+            assert_eq!(zone.row, 4);
+        }
+    }
+
+    #[test]
+    fn hint_segments_are_clickable_where_they_are_drawn() {
+        let (line, zones) = hint_line(
+            20,
+            &[
+                ("↑↓ select", None),
+                ("u usage", Some(ClickAction::ShowUsage)),
+                ("q quit", Some(ClickAction::Quit)),
+            ],
+        );
+        assert_eq!(zones.len(), 2);
+        for (zone, label) in zones.iter().zip(["u usage", "q quit"]) {
+            assert_eq!(text_at(&line, zone), label);
+        }
+
+        let mut app = App::new(Duration::from_secs(1));
+        let layout = Layout {
+            zones,
+            ..Layout::default()
+        };
+        let quit = MouseEvent {
+            button: 0,
+            column: layout.zones[1].start_column,
+            row: 20,
+            pressed: true,
+        };
+        assert!(!app.handle_mouse(quit, &layout));
+    }
+
+    #[test]
+    fn calendar_rows_start_on_sunday_and_end_with_today() {
+        assert_eq!(sunday_index(date_to_day_number("1970-01-01").unwrap()), 4);
+        assert_eq!(sunday_index(date_to_day_number("2026-08-02").unwrap()), 0);
+        assert_eq!(sunday_index(date_to_day_number("2026-08-06").unwrap()), 4);
+
+        let today = date_to_day_number("2026-08-06").unwrap();
+        let weeks = 12_i64;
+        let start = today - sunday_index(today) - (weeks - 1) * 7;
+        assert_eq!(sunday_index(start), 0);
+        // Today sits in the final column, so the grid never shows a stale week.
+        assert!((today - start) >= (weeks - 1) * 7 && (today - start) < weeks * 7);
+    }
+
+    #[test]
+    fn month_labels_sit_above_the_week_they_begin_in() {
+        // 2026-01-04 is a Sunday, so February starts exactly four columns in.
+        let start = date_to_day_number("2026-01-04").unwrap();
+        let header = month_header(start, 12);
+        assert!(header.starts_with(&format!("{}Jan", " ".repeat(CALENDAR_GUTTER))));
+        let february = CALENDAR_GUTTER + 4 * CALENDAR_CELL_WIDTH;
+        assert!(header[february..].starts_with("Feb"));
+
+        // A partial leading month is left unlabelled rather than crowding the next one.
+        let mid_month = date_to_day_number("2026-01-25").unwrap();
+        let header = month_header(mid_month, 12);
+        assert!(header.trim_start().starts_with("Feb"));
+    }
+
+    #[test]
+    fn shading_buckets_split_the_peak_into_quarters() {
+        assert_eq!(usage_level(0, 100), 0);
+        assert_eq!(usage_level(1, 100), 1);
+        assert_eq!(usage_level(25, 100), 1);
+        assert_eq!(usage_level(26, 100), 2);
+        assert_eq!(usage_level(75, 100), 3);
+        assert_eq!(usage_level(100, 100), 4);
+        // A quiet stretch stays dim instead of maxing out the ramp.
+        assert_eq!(usage_peak(&[600], UsageScale::Daily), 4 * 3_600);
+        assert_eq!(usage_level(600, usage_peak(&[600], UsageScale::Daily)), 1);
+    }
+
+    #[test]
+    fn shading_modes_restate_the_same_daily_totals() {
+        let daily: Vec<u64> = (1..=14).collect();
+        assert_eq!(scaled_usage(&daily, UsageScale::Daily), daily);
+        assert_eq!(
+            scaled_usage(&daily, UsageScale::Weekly),
+            [vec![28_u64; 7], vec![77_u64; 7]].concat()
+        );
+        assert_eq!(
+            &scaled_usage(&daily, UsageScale::Cumulative)[..5],
+            &[1, 3, 6, 10, 15]
+        );
+    }
+
+    #[test]
+    fn calendar_width_adapts_but_never_exceeds_a_year() {
+        assert_eq!(visible_weeks(100), 47);
+        assert_eq!(visible_weeks(200), CALENDAR_MAX_WEEKS);
+        assert_eq!(visible_weeks(10), CALENDAR_MIN_WEEKS);
+    }
+
+    #[test]
+    fn calendar_keys_do_not_disturb_the_monitor_sort() {
+        let mut app = App::new(Duration::from_secs(1));
+        app.view = View::Usage;
+        assert!(app.handle_key(Key::Char(b'c')));
+        assert_eq!(app.usage_scale, UsageScale::Cumulative);
+        assert_eq!(app.sort, SortBy::Memory);
+
+        app.view = View::Monitor;
+        assert!(app.handle_key(Key::Char(b'c')));
+        assert_eq!(app.sort, SortBy::Cpu);
+    }
+
+    #[test]
+    fn clicking_a_shading_mode_switches_it() {
+        let (line, zones) = scale_selector(9, UsageScale::Daily);
+        for (zone, scale) in zones.iter().zip(UsageScale::ALL) {
+            assert_eq!(text_at(&line, zone), scale.label());
+        }
+
+        let mut app = App::new(Duration::from_secs(1));
+        app.view = View::Usage;
+        let column = zones[2].start_column;
+        let layout = Layout {
+            zones,
+            ..Layout::default()
+        };
+        let click = MouseEvent {
+            button: 0,
+            column,
+            row: 9,
+            pressed: true,
+        };
+        assert!(app.handle_mouse(click, &layout));
+        assert_eq!(app.usage_scale, UsageScale::Cumulative);
     }
 
     #[test]
