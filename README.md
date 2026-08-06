@@ -57,6 +57,26 @@ The active sort column is highlighted and shows its direction.
 Use `ghostty-top --once` for script-friendly output, or change the one-second
 refresh with `ghostty-top --interval 0.5`.
 
+## Focused tab usage tracking
+
+The interactive monitor automatically records time only when Ghostty is the
+frontmost app and a tab remains selected across consecutive five-second
+samples. Ghostty 1.3 or newer and the one-time macOS Automation permission are
+required. Usage is stored at:
+
+```text
+~/Library/Application Support/ghostty-top/usage.tsv
+```
+
+To collect usage without leaving the full monitor open, run:
+
+```sh
+ghostty-top --track
+```
+
+The tracker flushes its small local data file every 30 seconds. It does not send
+usage data anywhere.
+
 ## Measurement notes
 
 - CPU is the sum of macOS `ps` CPU percentages for the process tree. It can

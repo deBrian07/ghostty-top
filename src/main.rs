@@ -1,6 +1,8 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
+use std::fs;
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,6 +23,9 @@ const MIN_LEAK_DURATION: Duration = Duration::from_secs(30);
 const MIN_LEAK_SAMPLES: usize = 6;
 const MIN_LEAK_GROWTH_KIB: i64 = 32 * 1024;
 const MIN_LEAK_GROWTH_RATIO: f64 = 0.15;
+const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+const USAGE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Key {
@@ -110,6 +115,38 @@ struct MemoryTrend {
     suspected: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TabUsage {
+    name: String,
+    seconds: u64,
+}
+
+#[derive(Default)]
+struct UsageStore {
+    path: Option<PathBuf>,
+    days: BTreeMap<String, BTreeMap<String, TabUsage>>,
+    dirty: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FocusedTab {
+    tab_id: String,
+    tab_name: String,
+    terminal_id: String,
+    terminal_name: String,
+}
+
+struct UsageTracker {
+    store: UsageStore,
+    current_day: String,
+    last_focus: Option<FocusedTab>,
+    last_observed: Option<Instant>,
+    next_poll: Instant,
+    next_date_check: Instant,
+    next_flush: Instant,
+    last_error: Option<String>,
+}
+
 struct App {
     terminals: Vec<Terminal>,
     ghostty: Option<Process>,
@@ -120,6 +157,7 @@ struct App {
     interval: Duration,
     last_error: Option<String>,
     memory_history: HashMap<i32, MemoryHistory>,
+    usage_tracker: Option<UsageTracker>,
 }
 
 impl App {
@@ -134,6 +172,7 @@ impl App {
             interval,
             last_error: None,
             memory_history: HashMap::new(),
+            usage_tracker: None,
         }
     }
 
@@ -265,6 +304,247 @@ impl App {
             terminal.leak_suspected = trend.suspected;
         }
     }
+
+    fn enable_usage_tracking(&mut self) {
+        self.usage_tracker = Some(UsageTracker::load(Instant::now()));
+    }
+
+    fn track_usage(&mut self, now: Instant) -> bool {
+        self.usage_tracker
+            .as_mut()
+            .is_some_and(|tracker| tracker.tick(now))
+    }
+
+    fn flush_usage(&mut self) {
+        if let Some(tracker) = &mut self.usage_tracker {
+            let _ = tracker.store.save();
+        }
+    }
+}
+
+impl UsageStore {
+    fn load(path: Option<PathBuf>) -> Self {
+        let mut store = Self {
+            path,
+            ..Self::default()
+        };
+        let Some(path) = &store.path else {
+            return store;
+        };
+        let Ok(contents) = fs::read_to_string(path) else {
+            return store;
+        };
+        for line in contents.lines() {
+            let mut fields = line.splitn(4, '\t');
+            let (Some(day), Some(tab_id), Some(seconds), Some(name)) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let Ok(seconds) = seconds.parse() else {
+                continue;
+            };
+            store.days.entry(day.to_string()).or_default().insert(
+                tab_id.to_string(),
+                TabUsage {
+                    name: name.to_string(),
+                    seconds,
+                },
+            );
+        }
+        store
+    }
+
+    fn add(&mut self, day: &str, focus: &FocusedTab, seconds: u64) {
+        if seconds == 0 {
+            return;
+        }
+        let entry = self
+            .days
+            .entry(day.to_string())
+            .or_default()
+            .entry(focus.tab_id.clone())
+            .or_default();
+        entry.name = display_tab_name(focus);
+        entry.seconds += seconds;
+        self.dirty = true;
+    }
+
+    fn save(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let Some(path) = &self.path else {
+            self.dirty = false;
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut contents = String::new();
+        for (day, tabs) in &self.days {
+            for (tab_id, usage) in tabs {
+                contents.push_str(&format!(
+                    "{}\t{}\t{}\t{}\n",
+                    clean_field(day),
+                    clean_field(tab_id),
+                    usage.seconds,
+                    clean_field(&usage.name)
+                ));
+            }
+        }
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, contents)?;
+        fs::rename(temporary, path)?;
+        self.dirty = false;
+        Ok(())
+    }
+}
+
+impl UsageTracker {
+    fn load(now: Instant) -> Self {
+        Self {
+            store: UsageStore::load(default_usage_path()),
+            current_day: local_date().unwrap_or_else(|| "unknown".to_string()),
+            last_focus: None,
+            last_observed: None,
+            next_poll: now,
+            next_date_check: now + Duration::from_secs(60),
+            next_flush: now + USAGE_FLUSH_INTERVAL,
+            last_error: None,
+        }
+    }
+
+    fn tick(&mut self, now: Instant) -> bool {
+        if now < self.next_poll {
+            return false;
+        }
+        self.next_poll = now + USAGE_POLL_INTERVAL;
+        if now >= self.next_date_check {
+            if let Some(day) = local_date() {
+                self.current_day = day;
+            }
+            self.next_date_check = now + Duration::from_secs(60);
+        }
+
+        let mut changed = false;
+        match query_focused_tab() {
+            Ok(focus) => {
+                if let (Some(previous), Some(previous_time), Some(current)) =
+                    (&self.last_focus, self.last_observed, &focus)
+                {
+                    let elapsed = now.duration_since(previous_time);
+                    if previous.tab_id == current.tab_id && elapsed <= USAGE_POLL_INTERVAL * 3 {
+                        self.store
+                            .add(&self.current_day, current, elapsed.as_secs());
+                        changed = true;
+                    }
+                }
+                self.last_focus = focus;
+                self.last_observed = Some(now);
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.last_focus = None;
+                self.last_observed = None;
+                self.last_error = Some(error);
+            }
+        }
+        if now >= self.next_flush {
+            if let Err(error) = self.store.save() {
+                self.last_error = Some(format!("could not save usage: {error}"));
+            }
+            self.next_flush = now + USAGE_FLUSH_INTERVAL;
+        }
+        changed
+    }
+}
+
+fn default_usage_path() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("ghostty-top")
+            .join("usage.tsv")
+    })
+}
+
+fn display_tab_name(focus: &FocusedTab) -> String {
+    if !focus.tab_name.trim().is_empty() {
+        focus.tab_name.clone()
+    } else if !focus.terminal_name.trim().is_empty() {
+        focus.terminal_name.clone()
+    } else {
+        format!("Tab {}", truncate(&focus.tab_id, 8))
+    }
+}
+
+fn clean_field(value: &str) -> String {
+    value.replace(['\t', '\n', '\r'], " ")
+}
+
+fn local_date() -> Option<String> {
+    let output = Command::new("date").arg("+%F").output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn query_focused_tab() -> Result<Option<FocusedTab>, String> {
+    const SCRIPT: &str = r#"tell application "Ghostty"
+if not frontmost then return ""
+set theWindow to front window
+set theTab to selected tab of theWindow
+set theTerminal to focused terminal of theTab
+set separator to ASCII character 9
+return (id of theTab as text) & separator & (name of theTab as text) & separator & (id of theTerminal as text) & separator & (name of theTerminal as text)
+end tell"#;
+    let mut child = Command::new("osascript")
+        .args(["-e", SCRIPT])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("could not start focus tracking: {error}"))?;
+    let deadline = Instant::now() + USAGE_SAMPLE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return Err("Ghostty Automation permission is unavailable".to_string());
+                }
+                let mut output = String::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    stdout
+                        .read_to_string(&mut output)
+                        .map_err(|error| format!("could not read focused tab: {error}"))?;
+                }
+                let output = output.trim();
+                if output.is_empty() {
+                    return Ok(None);
+                }
+                let fields: Vec<&str> = output.splitn(4, '\t').collect();
+                if fields.len() != 4 {
+                    return Err("Ghostty returned an unexpected focus response".to_string());
+                }
+                return Ok(Some(FocusedTab {
+                    tab_id: fields[0].to_string(),
+                    tab_name: fields[1].to_string(),
+                    terminal_id: fields[2].to_string(),
+                    terminal_name: fields[3].to_string(),
+                }));
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("Ghostty focus query timed out; allow Automation access".to_string());
+            }
+            Err(error) => return Err(format!("could not query focused tab: {error}")),
+        }
+    }
 }
 
 impl InputDecoder {
@@ -330,12 +610,14 @@ impl InputDecoder {
 
 fn main() {
     let mut once = false;
+    let mut track_only = false;
     let mut interval = Duration::from_secs(1);
     let args: Vec<String> = env::args().skip(1).collect();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--once" => once = true,
+            "--track" => track_only = true,
             "--interval" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -368,6 +650,16 @@ fn main() {
         return;
     }
 
+    app.enable_usage_tracking();
+
+    if track_only {
+        println!("Tracking focused Ghostty tab usage. Press Ctrl-C to stop.");
+        loop {
+            app.track_usage(Instant::now());
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         eprintln!("Interactive mode needs a terminal. Use --once for plain output.");
         std::process::exit(1);
@@ -396,6 +688,7 @@ fn main() {
                     InputEvent::Mouse(mouse) => app.handle_mouse(mouse, layout),
                 };
                 if !keep_running {
+                    app.flush_usage();
                     return;
                 }
                 dirty = true;
@@ -404,6 +697,9 @@ fn main() {
         if Instant::now() >= next_sample {
             app.refresh();
             next_sample = Instant::now() + app.interval;
+            dirty = true;
+        }
+        if app.track_usage(Instant::now()) {
             dirty = true;
         }
         thread::sleep(Duration::from_millis(50));
@@ -473,7 +769,7 @@ impl Drop for TerminalGuard {
 }
 
 fn usage_and_exit(code: i32) -> ! {
-    eprintln!("Usage: ghostty-top [--once] [--interval SECONDS]\n\n  --once              print one sample and exit\n  --interval SECONDS  refresh rate from 0.2 to 60 (default: 1)");
+    eprintln!("Usage: ghostty-top [--once | --track] [--interval SECONDS]\n\n  --once              print one process sample and exit\n  --track             track focused-tab usage without the TUI\n  --interval SECONDS  process refresh rate from 0.2 to 60 (default: 1)");
     std::process::exit(code);
 }
 
@@ -1051,6 +1347,27 @@ mod tests {
             (start + Duration::from_secs(5), 160 * 1024),
         ]);
         assert!(!analyze_memory_history(&samples).suspected);
+    }
+
+    #[test]
+    fn saves_and_loads_daily_tab_usage() {
+        let directory =
+            env::temp_dir().join(format!("ghostty-top-usage-test-{}", std::process::id()));
+        let path = directory.join("usage.tsv");
+        let focus = FocusedTab {
+            tab_id: "tab-123".into(),
+            tab_name: "project shell".into(),
+            terminal_id: "terminal-456".into(),
+            terminal_name: "zsh".into(),
+        };
+        let mut store = UsageStore::load(Some(path.clone()));
+        store.add("2026-08-06", &focus, 25);
+        store.save().unwrap();
+
+        let loaded = UsageStore::load(Some(path));
+        assert_eq!(loaded.days["2026-08-06"]["tab-123"].seconds, 25);
+        assert_eq!(loaded.days["2026-08-06"]["tab-123"].name, "project shell");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
