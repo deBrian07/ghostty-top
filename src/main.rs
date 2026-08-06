@@ -1223,6 +1223,7 @@ fn main() {
     if track_only {
         println!("Tracking focused Ghostty tab usage. Press Ctrl-C to stop.");
         let mut next_resource_refresh = Instant::now();
+        let mut reported_tracking_error: Option<String> = None;
         loop {
             let now = Instant::now();
             if now >= next_resource_refresh {
@@ -1230,6 +1231,20 @@ fn main() {
                 next_resource_refresh = now + Duration::from_secs(60);
             }
             app.track_usage(now);
+            let tracking_error = app
+                .usage_tracker
+                .as_ref()
+                .and_then(|tracker| tracker.last_error.clone());
+            if tracking_error != reported_tracking_error {
+                match &tracking_error {
+                    Some(error) => eprintln!("tracking warning: {error}"),
+                    None if reported_tracking_error.is_some() => {
+                        eprintln!("tracking recovered");
+                    }
+                    None => {}
+                }
+                reported_tracking_error = tracking_error;
+            }
             thread::sleep(Duration::from_millis(200));
         }
     }
