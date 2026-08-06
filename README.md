@@ -126,6 +126,17 @@ day, and brighter dots represent more focused Ghostty time. Hover over a dot to
 see its date and total; click it to show that day's per-tab time and percentage
 breakdown. Click `[MONITOR]` or press `u` to return to live process usage.
 
+To populate most of the previous 55 days with deterministic, varied calendar
+test data, run `ghostty-top --seed-demo-history`. Demo rows use reserved
+`demo:` tab IDs, so they can be removed without changing real usage:
+
+```sh
+ghostty-top --clear-demo-history
+```
+
+Stop or reinstall the login tracker around either operation so its in-memory
+copy cannot overwrite the edited usage file.
+
 ## Measurement notes
 
 - CPU is the sum of macOS `ps` CPU percentages for the process tree. It can
@@ -137,9 +148,16 @@ breakdown. Click `[MONITOR]` or press `u` to return to live process usage.
 
 ## Potential memory leak alerts
 
-`ghostty-top` keeps a five-minute rolling RAM history for each terminal. A row
-is marked as a potential leak only after at least six samples over 30 seconds,
-when its recent average has grown by both 32 MiB and 15% over its baseline.
-This deliberately avoids warning on a single allocation spike. The alert is a
-diagnostic hint—not proof of a leak—because caches and legitimate workloads can
-also grow steadily. Restarting `ghostty-top` resets the history.
+`ghostty-top` keeps a 15-minute rolling RAM history for each terminal. A row is
+marked only after at least eight samples spanning three minutes show all of the
+following: at least 48 MiB and 10% growth, a regression slope of at least
+4 MiB/minute, a strong linear fit, mostly upward samples, and continued growth
+in the recent half of the window. Three consecutive qualifying windows are
+required before an alert appears, and ten clear windows are required to remove
+an active alert.
+
+Starting or stopping a process resets that terminal's evidence so a compiler,
+server, or other newly launched workload is not mistaken for growth in an
+existing process. Large allocations that settle into a stable plateau are also
+rejected. The alert remains a diagnostic hint—not proof of a leak—and restarting
+`ghostty-top` resets its in-memory detector state.
