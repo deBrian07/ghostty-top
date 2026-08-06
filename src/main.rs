@@ -18,11 +18,16 @@ const UNDERLINE: &str = "\x1b[4m";
 const RED: &str = "\x1b[38;5;203m";
 const WARNING: &str = "\x1b[48;5;52m\x1b[38;5;231m";
 const ACTIVE_HEADER: &str = "\x1b[1;38;5;232;48;5;114m";
-const HISTORY_WINDOW: Duration = Duration::from_secs(5 * 60);
-const MIN_LEAK_DURATION: Duration = Duration::from_secs(30);
-const MIN_LEAK_SAMPLES: usize = 6;
-const MIN_LEAK_GROWTH_KIB: i64 = 32 * 1024;
-const MIN_LEAK_GROWTH_RATIO: f64 = 0.15;
+const HISTORY_WINDOW: Duration = Duration::from_secs(15 * 60);
+const MIN_LEAK_DURATION: Duration = Duration::from_secs(3 * 60);
+const MIN_LEAK_SAMPLES: usize = 8;
+const MIN_LEAK_GROWTH_KIB: i64 = 48 * 1024;
+const MIN_LEAK_GROWTH_RATIO: f64 = 0.10;
+const MIN_LEAK_SLOPE_KIB_PER_MIN: f64 = 4.0 * 1024.0;
+const MIN_LEAK_R_SQUARED: f64 = 0.70;
+const MIN_UPWARD_SAMPLE_RATIO: f64 = 0.70;
+const LEAK_CONFIRMATION_WINDOWS: u8 = 3;
+const LEAK_CLEAR_WINDOWS: u8 = 10;
 const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const USAGE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -133,6 +138,10 @@ enum View {
 #[derive(Default)]
 struct MemoryHistory {
     samples: VecDeque<(Instant, u64)>,
+    process_ids: Vec<i32>,
+    suspicious_windows: u8,
+    clear_windows: u8,
+    alert_active: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -380,6 +389,19 @@ impl App {
         });
         for terminal in terminals {
             let history = self.memory_history.entry(terminal.root_pid).or_default();
+            let mut process_ids: Vec<i32> = terminal
+                .processes
+                .iter()
+                .map(|process| process.pid)
+                .collect();
+            process_ids.sort_unstable();
+            if history.process_ids != process_ids {
+                history.samples.clear();
+                history.suspicious_windows = 0;
+                history.clear_windows = 0;
+                history.alert_active = false;
+                history.process_ids = process_ids;
+            }
             history.samples.push_back((now, terminal.rss_kib));
             while history
                 .samples
@@ -392,7 +414,7 @@ impl App {
             terminal.memory_growth_kib = trend.growth_kib;
             terminal.memory_slope_kib_per_min = trend.slope_kib_per_min;
             terminal.memory_samples = history.samples.len();
-            terminal.leak_suspected = trend.suspected;
+            terminal.leak_suspected = update_leak_state(history, trend.suspected);
         }
     }
 
@@ -1542,21 +1564,87 @@ fn analyze_memory_history(samples: &VecDeque<(Instant, u64)>) -> MemoryTrend {
         / edge_count as f64;
     let growth = recent - baseline;
     let duration = last_time.duration_since(*first_time);
-    let minutes = duration.as_secs_f64() / 60.0;
-    let slope = if minutes > 0.0 { growth / minutes } else { 0.0 };
     let ratio = if baseline > 0.0 {
         growth / baseline
     } else {
         0.0
     };
+    let points: Vec<(f64, f64)> = samples
+        .iter()
+        .map(|(time, rss)| (time.duration_since(*first_time).as_secs_f64(), *rss as f64))
+        .collect();
+    let (slope_per_second, r_squared) = linear_regression(&points);
+    let slope_kib_per_min = slope_per_second * 60.0;
+    let recent_start = points.len() / 2;
+    let (recent_slope_per_second, _) = linear_regression(&points[recent_start..]);
+    let tolerance = (baseline * 0.01).max(2.0 * 1024.0);
+    let upward_samples = samples
+        .iter()
+        .zip(samples.iter().skip(1))
+        .filter(|((_, previous), (_, current))| *current as f64 + tolerance >= *previous as f64)
+        .count();
+    let upward_ratio = upward_samples as f64 / (samples.len() - 1) as f64;
     MemoryTrend {
         growth_kib: growth.round() as i64,
-        slope_kib_per_min: slope,
+        slope_kib_per_min,
         suspected: samples.len() >= MIN_LEAK_SAMPLES
             && duration >= MIN_LEAK_DURATION
             && growth >= MIN_LEAK_GROWTH_KIB as f64
-            && ratio >= MIN_LEAK_GROWTH_RATIO,
+            && ratio >= MIN_LEAK_GROWTH_RATIO
+            && slope_kib_per_min >= MIN_LEAK_SLOPE_KIB_PER_MIN
+            && r_squared >= MIN_LEAK_R_SQUARED
+            && recent_slope_per_second >= slope_per_second * 0.35
+            && upward_ratio >= MIN_UPWARD_SAMPLE_RATIO,
     }
+}
+
+fn linear_regression(points: &[(f64, f64)]) -> (f64, f64) {
+    if points.len() < 2 {
+        return (0.0, 0.0);
+    }
+    let count = points.len() as f64;
+    let mean_x = points.iter().map(|(x, _)| x).sum::<f64>() / count;
+    let mean_y = points.iter().map(|(_, y)| y).sum::<f64>() / count;
+    let mut sum_xx = 0.0;
+    let mut sum_xy = 0.0;
+    let mut sum_yy = 0.0;
+    for (x, y) in points {
+        let centered_x = x - mean_x;
+        let centered_y = y - mean_y;
+        sum_xx += centered_x * centered_x;
+        sum_xy += centered_x * centered_y;
+        sum_yy += centered_y * centered_y;
+    }
+    if sum_xx <= f64::EPSILON {
+        return (0.0, 0.0);
+    }
+    let slope = sum_xy / sum_xx;
+    let r_squared = if sum_yy <= f64::EPSILON {
+        0.0
+    } else {
+        (sum_xy * sum_xy / (sum_xx * sum_yy)).clamp(0.0, 1.0)
+    };
+    (slope, r_squared)
+}
+
+fn update_leak_state(history: &mut MemoryHistory, suspicious: bool) -> bool {
+    if suspicious {
+        history.suspicious_windows = history.suspicious_windows.saturating_add(1);
+        history.clear_windows = 0;
+        if history.suspicious_windows >= LEAK_CONFIRMATION_WINDOWS {
+            history.alert_active = true;
+        }
+    } else {
+        history.suspicious_windows = 0;
+        if history.alert_active {
+            history.clear_windows = history.clear_windows.saturating_add(1);
+            if history.clear_windows >= LEAK_CLEAR_WINDOWS {
+                history.alert_active = false;
+                history.clear_windows = 0;
+            }
+        }
+    }
+    history.alert_active
 }
 
 fn sort_terminals(terminals: &mut [Terminal], sort: SortBy, descending: bool) {
@@ -2154,16 +2242,16 @@ mod tests {
     #[test]
     fn flags_sustained_memory_growth() {
         let start = Instant::now();
-        let samples = VecDeque::from([
-            (start, 100 * 1024),
-            (start + Duration::from_secs(6), 108 * 1024),
-            (start + Duration::from_secs(12), 116 * 1024),
-            (start + Duration::from_secs(18), 124 * 1024),
-            (start + Duration::from_secs(24), 132 * 1024),
-            (start + Duration::from_secs(30), 140 * 1024),
-        ]);
+        let samples = (0..=12)
+            .map(|index| {
+                (
+                    start + Duration::from_secs(index * 20),
+                    (100 + index * 8) * 1024,
+                )
+            })
+            .collect();
         let trend = analyze_memory_history(&samples);
-        assert_eq!(trend.growth_kib, 40 * 1024);
+        assert!(trend.growth_kib >= 80 * 1024);
         assert!(trend.suspected);
     }
 
@@ -2175,6 +2263,58 @@ mod tests {
             (start + Duration::from_secs(5), 160 * 1024),
         ]);
         assert!(!analyze_memory_history(&samples).suspected);
+    }
+
+    #[test]
+    fn ignores_large_allocation_that_plateaus() {
+        let start = Instant::now();
+        let samples = (0..=12)
+            .map(|index| {
+                let rss = if index < 3 { 100 * 1024 } else { 220 * 1024 };
+                (start + Duration::from_secs(index * 20), rss)
+            })
+            .collect();
+        assert!(!analyze_memory_history(&samples).suspected);
+    }
+
+    #[test]
+    fn leak_alert_requires_confirmation_and_clears_slowly() {
+        let mut history = MemoryHistory::default();
+        assert!(!update_leak_state(&mut history, true));
+        assert!(!update_leak_state(&mut history, true));
+        assert!(update_leak_state(&mut history, true));
+        for _ in 0..LEAK_CLEAR_WINDOWS - 1 {
+            assert!(update_leak_state(&mut history, false));
+        }
+        assert!(!update_leak_state(&mut history, false));
+    }
+
+    #[test]
+    fn process_tree_changes_reset_leak_evidence() {
+        let start = Instant::now();
+        let mut app = App::new(Duration::from_secs(1));
+        let mut terminals = vec![Terminal {
+            root_pid: 10,
+            tty: "ttys001".into(),
+            rss_kib: 100 * 1024,
+            processes: vec![p(10, 1, "ttys001", 0.0, 100 * 1024, "zsh")],
+            ..Terminal::default()
+        }];
+        app.update_memory_trends(&mut terminals, start);
+        let history = app.memory_history.get_mut(&10).unwrap();
+        history.alert_active = true;
+        history.suspicious_windows = LEAK_CONFIRMATION_WINDOWS;
+
+        terminals[0]
+            .processes
+            .push(p(11, 10, "ttys001", 0.0, 80 * 1024, "node server.js"));
+        terminals[0].rss_kib = 180 * 1024;
+        app.update_memory_trends(&mut terminals, start + Duration::from_secs(1));
+
+        let history = &app.memory_history[&10];
+        assert_eq!(history.samples.len(), 1);
+        assert!(!history.alert_active);
+        assert!(!terminals[0].leak_suspected);
     }
 
     #[test]
