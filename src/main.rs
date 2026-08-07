@@ -50,6 +50,10 @@ const CALENDAR_RAMP: [&str; 5] = [
 ];
 /// How long the user may sit untouched before their focused time stops counting.
 const MAX_IDLE: Duration = Duration::from_secs(5 * 60);
+/// A tab cannot be focused for longer than the day it is recorded against, so
+/// any larger value is corrupt. Bounding it here keeps every later total well
+/// inside u64 instead of overflowing on a hand-edited or truncated file.
+const MAX_DAILY_SECONDS: u64 = 24 * 60 * 60;
 const TAB_LABEL_REFRESH: Duration = Duration::from_secs(15);
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(8);
 const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -349,6 +353,7 @@ struct App {
     labels: LabelCache,
     usage_tracker: Option<UsageTracker>,
     view: View,
+    tracker_outdated: bool,
     usage_scale: UsageScale,
     hovered_day: Option<String>,
     selected_day: Option<String>,
@@ -369,6 +374,7 @@ impl App {
             labels: LabelCache::default(),
             usage_tracker: None,
             view: View::Monitor,
+            tracker_outdated: false,
             usage_scale: UsageScale::Daily,
             hovered_day: None,
             selected_day: None,
@@ -611,9 +617,10 @@ impl UsageStore {
             else {
                 continue;
             };
-            let Ok(seconds) = seconds.parse() else {
+            let Ok(seconds) = seconds.parse::<u64>() else {
                 continue;
             };
+            let seconds = seconds.min(MAX_DAILY_SECONDS);
             store.days.entry(day.to_string()).or_default().insert(
                 tab_id.to_string(),
                 TabUsage {
@@ -636,7 +643,7 @@ impl UsageStore {
             .entry(focus.tab_id.clone())
             .or_default();
         entry.name = display_tab_name(focus);
-        entry.seconds += seconds;
+        entry.seconds = entry.seconds.saturating_add(seconds).min(MAX_DAILY_SECONDS);
         self.dirty = true;
     }
 
@@ -1131,6 +1138,23 @@ fn launch_agent_path() -> Option<PathBuf> {
             .join("LaunchAgents")
             .join(format!("{LAUNCH_AGENT_LABEL}.plist"))
     })
+}
+
+/// True when a login tracker is installed but is a different build than this
+/// one. `--install-tracker` copies the binary to a fixed path, so upgrading
+/// leaves that copy behind and the background tracker silently runs old code.
+fn tracker_is_outdated() -> bool {
+    let Some(installed) = default_data_dir().map(|dir| dir.join("bin").join("ghostty-top")) else {
+        return false;
+    };
+    let Ok(current) = env::current_exe() else {
+        return false;
+    };
+    match (fs::read(&installed), fs::read(&current)) {
+        (Ok(installed), Ok(current)) => installed != current,
+        // Nothing installed, or unreadable: there is nothing to warn about.
+        _ => false,
+    }
 }
 
 fn install_login_tracker() -> Result<(), String> {
@@ -1725,6 +1749,10 @@ fn main() {
                 }
                 interval = Duration::from_secs_f64(seconds);
             }
+            "-V" | "--version" => {
+                println!("ghostty-top {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
             "-h" | "--help" => usage_and_exit(0),
             _ => usage_and_exit(2),
         }
@@ -1788,6 +1816,7 @@ fn main() {
     }
 
     app.enable_usage_tracking();
+    app.tracker_outdated = tracker_is_outdated();
 
     if track_only {
         println!("Tracking focused Ghostty tab usage. Press Ctrl-C to stop.");
@@ -1933,7 +1962,7 @@ impl Drop for TerminalGuard {
 }
 
 fn usage_and_exit(code: i32) -> ! {
-    eprintln!("Usage: ghostty-top [OPTIONS]\n\n  --once                print one process sample and exit\n  --track               track focused-tab usage without the TUI\n  --install-tracker     install and start tracking automatically at login\n  --uninstall-tracker   remove the login service but preserve usage history\n  --tracker-status      show the login tracker's launchd status\n  --seed-demo-history   add removable calendar test data for prior days\n  --clear-demo-history  remove demo data without touching real history\n  --interval SECONDS    process refresh rate from 0.2 to 60 (default: 1)");
+    eprintln!("Usage: ghostty-top [OPTIONS]\n\n  --once                print one process sample and exit\n  --track               track focused-tab usage without the TUI\n  --install-tracker     install and start tracking automatically at login\n  --uninstall-tracker   remove the login service but preserve usage history\n  --tracker-status      show the login tracker's launchd status\n  --seed-demo-history   add removable calendar test data for prior days\n  --clear-demo-history  remove demo data without touching real history\n  --interval SECONDS    process refresh rate from 0.2 to 60 (default: 1)\n  -V, --version         print the version and exit");
     std::process::exit(code);
 }
 
@@ -2228,14 +2257,19 @@ fn natural_tty(tty: &str) -> u32 {
 }
 
 fn render(app: &App) -> Layout {
-    match app.view {
-        View::Monitor => render_monitor(app),
-        View::Usage => render_usage(app),
-    }
+    let (height, width) = terminal_size();
+    let lines = match app.view {
+        View::Monitor => render_monitor(app, height, width),
+        View::Usage => render_usage(app, height, width),
+    };
+    print!("\x1b[H\x1b[2J{}", lines.0.join("\n"));
+    let _ = io::stdout().flush();
+    lines.1
 }
 
-fn render_monitor(app: &App) -> Layout {
-    let (height, width) = terminal_size();
+/// Builds the monitor frame and its click targets. Size is passed in so the
+/// layout can be exercised at any terminal geometry without a real terminal.
+fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layout) {
     let mut lines = Vec::new();
     let shared_cpu = app.ghostty.as_ref().map_or(0.0, |p| p.cpu);
     let shared_ram = app.ghostty.as_ref().map_or(0, |p| p.rss_kib);
@@ -2247,7 +2281,11 @@ fn render_monitor(app: &App) -> Layout {
         .filter(|terminal| terminal.leak_suspected)
         .count();
     // Stay quiet unless something is actually wrong.
-    let alert_status = if alert_count == 0 {
+    let alert_status = if app.tracker_outdated {
+        format!(
+            "  {BOLD}{RED}⚠ background tracker is an old build — rerun --install-tracker{RESET}"
+        )
+    } else if alert_count == 0 {
         String::new()
     } else {
         format!("  {BOLD}{RED}⚠ {alert_count} potential leak alert(s){RESET}")
@@ -2396,14 +2434,16 @@ fn render_monitor(app: &App) -> Layout {
     );
     layout.zones.extend(hint_zones);
     lines.push(hint);
-    print!("\x1b[H\x1b[2J{}", lines.join("\n"));
-    let _ = io::stdout().flush();
-    layout
+    fit_targets(&mut layout, width);
+    let lines = lines
+        .into_iter()
+        .map(|line| fit_to_width(&line, width))
+        .collect();
+    (lines, layout)
 }
 
-fn render_usage(app: &App) -> Layout {
+fn render_usage(app: &App, height: usize, width: usize) -> (Vec<String>, Layout) {
     const WEEKDAYS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
-    let (height, width) = terminal_size();
     let weeks = visible_weeks(width);
     let mut lines = vec![format!(
         "{BOLD}{GREEN}ghostty-top{RESET}  {BOLD}usage calendar{RESET}  {DIM}time spent with each Ghostty tab focused{RESET}"
@@ -2418,7 +2458,7 @@ fn render_usage(app: &App) -> Layout {
     let start = today_number - sunday_index(today_number) - (weeks as i64 - 1) * 7;
 
     let daily = daily_totals(tracker, start, weeks, today_number);
-    let range_total: u64 = daily.iter().sum();
+    let range_total = sum_seconds(daily.iter().copied());
     let busiest = daily.iter().copied().max().unwrap_or(0);
 
     lines.push(format!(
@@ -2554,7 +2594,7 @@ fn render_usage(app: &App) -> Layout {
         lines.push(format!(
             "{DIM}{UNDERLINE}  TAB                                      TIME      SHARE{RESET}"
         ));
-        let total = tabs.iter().map(|(_, seconds)| seconds).sum::<u64>();
+        let total = sum_seconds(tabs.iter().map(|(_, seconds)| *seconds));
         let available = height.saturating_sub(lines.len() + 4);
         if tabs.is_empty() {
             lines.push(format!(
@@ -2588,9 +2628,12 @@ fn render_usage(app: &App) -> Layout {
     );
     layout.zones.extend(hint_zones);
     lines.push(hint);
-    print!("\x1b[H\x1b[2J{}", lines.join("\n"));
-    let _ = io::stdout().flush();
-    layout
+    fit_targets(&mut layout, width);
+    let lines = lines
+        .into_iter()
+        .map(|line| fit_to_width(&line, width))
+        .collect();
+    (lines, layout)
 }
 
 /// Days a selected column covers: one day in the grid, a whole week in a chart.
@@ -2621,9 +2664,7 @@ fn selection_label(anchor: &str, by_week: bool) -> String {
 }
 
 fn usage_total_for_days(tracker: Option<&UsageTracker>, days: &[String]) -> u64 {
-    days.iter()
-        .map(|day| usage_total_for_day(tracker, day))
-        .sum()
+    sum_seconds(days.iter().map(|day| usage_total_for_day(tracker, day)))
 }
 
 /// Focused time per tab across the selected days, busiest first. Totals merge
@@ -2635,7 +2676,8 @@ fn usage_breakdown(tracker: Option<&UsageTracker>, days: &[String]) -> Vec<(Stri
             continue;
         };
         for usage in tabs.values() {
-            *totals.entry(usage.name.clone()).or_default() += usage.seconds;
+            let total = totals.entry(usage.name.clone()).or_default();
+            *total = total.saturating_add(usage.seconds);
         }
     }
     let mut rows: Vec<(String, u64)> = totals.into_iter().collect();
@@ -2648,8 +2690,12 @@ fn usage_breakdown(tracker: Option<&UsageTracker>, days: &[String]) -> Vec<(Stri
 fn usage_total_for_day(tracker: Option<&UsageTracker>, day: &str) -> u64 {
     tracker
         .and_then(|value| value.store.days.get(day))
-        .map(|tabs| tabs.values().map(|usage| usage.seconds).sum())
+        .map(|tabs| sum_seconds(tabs.values().map(|usage| usage.seconds)))
         .unwrap_or(0)
+}
+
+fn sum_seconds(values: impl Iterator<Item = u64>) -> u64 {
+    values.fold(0, u64::saturating_add)
 }
 
 /// Weeks that fit the terminal, newest on the right, capped at a full year.
@@ -2685,11 +2731,13 @@ fn daily_totals(
 /// the range. A week is the unit here because a bar has a single height, unlike
 /// the daily grid where every day gets its own square.
 fn weekly_usage(daily: &[u64], scale: UsageScale) -> Vec<u64> {
-    let totals = daily.chunks(7).map(|week| week.iter().sum());
+    let totals = daily
+        .chunks(7)
+        .map(|week| sum_seconds(week.iter().copied()));
     match scale {
         UsageScale::Cumulative => totals
-            .scan(0, |running, seconds: u64| {
-                *running += seconds;
+            .scan(0, |running: &mut u64, seconds: u64| {
+                *running = running.saturating_add(seconds);
                 Some(*running)
             })
             .collect(),
@@ -3080,6 +3128,53 @@ fn human_bytes(kib: u64) -> String {
         format!("{:.1} MiB", bytes / (1024.0 * 1024.0))
     } else {
         format!("{:.0} KiB", bytes / 1024.0)
+    }
+}
+
+/// Cuts a rendered line to the terminal width, counting only visible columns.
+/// Colour escapes are copied through rather than counted, so a long line is
+/// clipped at the edge instead of wrapping and tearing the frame apart.
+fn fit_to_width(line: &str, width: usize) -> String {
+    let mut fitted = String::new();
+    let mut visible = 0;
+    let mut characters = line.chars();
+    let mut clipped = false;
+    while let Some(character) = characters.next() {
+        if character == '\x1b' {
+            fitted.push(character);
+            for escape in characters.by_ref() {
+                fitted.push(escape);
+                if escape.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if visible == width {
+            clipped = true;
+            break;
+        }
+        fitted.push(character);
+        visible += 1;
+    }
+    if clipped {
+        fitted.push_str(RESET);
+    }
+    fitted
+}
+
+/// Drops click targets the frame has no room to draw and clamps the rest to the
+/// visible edge, so no target sits where the user cannot reach it.
+fn fit_targets(layout: &mut Layout, width: usize) {
+    layout.zones.retain(|zone| zone.start_column <= width);
+    for zone in &mut layout.zones {
+        zone.end_column = zone.end_column.min(width);
+    }
+    layout
+        .calendar_cells
+        .retain(|cell| cell.start_column <= width);
+    for cell in &mut layout.calendar_cells {
+        cell.end_column = cell.end_column.min(width);
     }
 }
 
@@ -3684,7 +3779,7 @@ mod tests {
         app.usage_tracker = Some(tracker_with(days, today));
 
         app.usage_scale = UsageScale::Weekly;
-        let chart = render_usage(&app);
+        let (_, chart) = render_usage(&app, 40, 100);
         assert!(!chart.calendar_cells.is_empty());
         for cell in &chart.calendar_cells {
             let number = date_to_day_number(&cell.day).unwrap();
@@ -3703,7 +3798,7 @@ mod tests {
         assert_eq!(app.selected_day.as_deref(), Some(column.day.as_str()));
 
         app.usage_scale = UsageScale::Daily;
-        let grid = render_usage(&app);
+        let (_, grid) = render_usage(&app, 40, 100);
         let anchors: Vec<i64> = grid
             .calendar_cells
             .iter()
@@ -3777,6 +3872,223 @@ mod tests {
         };
         assert!(app.handle_mouse(click, &layout));
         assert_eq!(app.usage_scale, UsageScale::Cumulative);
+    }
+
+    pub(super) fn populated_app(scale: UsageScale) -> App {
+        let today = "2026-08-06";
+        let today_number = date_to_day_number(today).unwrap();
+        let mut days = BTreeMap::new();
+        for offset in 0..400_i64 {
+            let mut tabs = BTreeMap::new();
+            for index in 0..3 {
+                tabs.insert(
+                    format!("tab-{index}"),
+                    TabUsage {
+                        name: format!("a rather long tab name number {index}"),
+                        seconds: (offset as u64 * 37 + index * 900) % 20_000,
+                    },
+                );
+            }
+            days.insert(day_number_to_date(today_number - offset), tabs);
+        }
+        let mut app = App::new(Duration::from_secs(1));
+        app.usage_scale = scale;
+        app.usage_tracker = Some(tracker_with(days, today));
+        app.ghostty = Some(p(
+            1,
+            0,
+            "??",
+            5.0,
+            100_000,
+            "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+        ));
+        for index in 0..12 {
+            app.terminals.push(Terminal {
+                root_pid: 100 + index,
+                tty: format!("ttys{index:03}"),
+                label: format!("a tab name that is quite long {index}"),
+                cpu: index as f64 * 7.5,
+                rss_kib: 4096 * (index as u64 + 1),
+                processes: vec![p(
+                    200 + index,
+                    100 + index,
+                    "ttys000",
+                    1.0,
+                    4096,
+                    "node server.js --flag",
+                )],
+                activity: "node".into(),
+                elapsed: "01:02:03".into(),
+                age_seconds: 3_723,
+                memory_growth_kib: 1024,
+                memory_slope_kib_per_min: 12.0,
+                memory_samples: 20,
+                leak_suspected: index % 4 == 0,
+            });
+        }
+        app
+    }
+
+    /// Renders every view at every plausible geometry, including degenerate
+    /// ones, so a size-dependent slice or subtraction cannot panic in the wild.
+    #[test]
+    fn every_view_renders_at_any_terminal_size() {
+        for scale in UsageScale::ALL {
+            let mut full = populated_app(scale);
+            let mut empty = App::new(Duration::from_secs(1));
+            empty.usage_scale = scale;
+
+            for app in [&mut full, &mut empty] {
+                for (selected, hovered) in [
+                    (None, None),
+                    (
+                        Some("2026-08-02".to_string()),
+                        Some("2026-07-19".to_string()),
+                    ),
+                    // A selection outside the drawn range, and a malformed one.
+                    (
+                        Some("1999-01-01".to_string()),
+                        Some("not-a-date".to_string()),
+                    ),
+                ] {
+                    app.selected_day = selected;
+                    app.hovered_day = hovered;
+                    for expanded in [false, true] {
+                        app.expanded = expanded;
+                        for height in [0, 1, 2, 3, 5, 8, 12, 20, 24, 40, 60, 200] {
+                            for width in [0, 1, 2, 3, 5, 10, 20, 40, 60, 80, 100, 140, 300] {
+                                let (monitor, _) = render_monitor(app, height, width);
+                                let (usage, _) = render_usage(app, height, width);
+                                assert!(!monitor.is_empty());
+                                assert!(!usage.is_empty());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A line wider than the terminal wraps and tears the layout apart, so no
+    /// frame may exceed the width it was drawn for.
+    #[test]
+    fn no_rendered_line_is_wider_than_the_terminal() {
+        for scale in UsageScale::ALL {
+            let mut app = populated_app(scale);
+            app.selected_day = Some("2026-08-02".to_string());
+            app.hovered_day = Some("2026-08-02".to_string());
+            for expanded in [false, true] {
+                app.expanded = expanded;
+                for width in [40, 60, 80, 100, 120, 160, 200] {
+                    for height in [10, 24, 40, 60] {
+                        for (name, frame) in [
+                            ("monitor", render_monitor(&app, height, width).0),
+                            ("usage", render_usage(&app, height, width).0),
+                        ] {
+                            for line in frame {
+                                let visible = strip_ansi(&line).chars().count();
+                                assert!(
+                                    visible <= width,
+                                    "{name} line of {visible} columns at width {width}: {:?}",
+                                    strip_ansi(&line)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Click targets must land on the frame they were built for; a zone off the
+    /// end of a line is a target the user can never hit.
+    #[test]
+    fn every_click_target_lands_on_its_own_frame() {
+        for scale in UsageScale::ALL {
+            let app = populated_app(scale);
+            for width in [60, 80, 100, 140] {
+                for (frame, layout) in [
+                    render_monitor(&app, 40, width),
+                    render_usage(&app, 40, width),
+                ] {
+                    let targets = layout
+                        .zones
+                        .iter()
+                        .map(|zone| (zone.row, zone.start_column, zone.end_column))
+                        .chain(
+                            layout
+                                .calendar_cells
+                                .iter()
+                                .map(|cell| (cell.row, cell.start_column, cell.end_column)),
+                        );
+                    for (row, start, end) in targets {
+                        assert!(row >= 1 && row <= frame.len(), "row {row} is off the frame");
+                        assert!(start <= end, "empty target at row {row}");
+                        // The last monitor column deliberately runs to the edge.
+                        assert!(start <= width, "target starts past the terminal edge");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The history file is plain text on disk and can be edited, truncated, or
+    /// corrupted. Nothing in it may crash the tool or the renderer.
+    #[test]
+    fn malformed_history_is_survivable() {
+        let directory = env::temp_dir().join(format!("ghostty-top-robust-{}", std::process::id()));
+        let path = directory.join("usage.tsv");
+        fs::create_dir_all(&directory).unwrap();
+        let rubbish = [
+            "",
+            "\t\t\t",
+            "not-a-date\ttab\t60\tName",
+            "2026-08-06\ttab\tnot-a-number\tName",
+            "2026-08-06",
+            "2026-08-06\ttab",
+            "2026-08-06\ttab\t60",
+            "2026-08-06\ttab-ok\t60\tGood",
+            // Out-of-range and overflowing date fields.
+            "9999-99-99\ttab\t60\tName",
+            "-4000-01-01\ttab\t60\tName",
+            "999999999999999-01-01\ttab\t60\tName",
+            "0000-00-00\ttab\t60\tName",
+            // Extremes and unusual text.
+            &format!("2026-08-05\thuge\t{}\tBig", u64::MAX),
+            "2026-08-04\temoji\t60\t🐈‍⬛ 日本語 tab",
+            "2026-08-03\tlong\t60\txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "2026-08-02\tansi\t60\tname\x1b[31mwith escape",
+        ]
+        .join("\n");
+        fs::write(&path, rubbish).unwrap();
+
+        let store = UsageStore::load(Some(path.clone()));
+        assert_eq!(store.days["2026-08-06"]["tab-ok"].seconds, 60);
+
+        let mut app = App::new(Duration::from_secs(1));
+        app.usage_tracker = Some(tracker_with(store.days.clone(), "2026-08-06"));
+        for scale in UsageScale::ALL {
+            app.usage_scale = scale;
+            for day in store.days.keys() {
+                app.selected_day = Some(day.clone());
+                app.hovered_day = Some(day.clone());
+                for width in [40, 100, 200] {
+                    let (lines, _) = render_usage(&app, 30, width);
+                    for line in lines {
+                        assert!(strip_ansi(&line).chars().count() <= width);
+                    }
+                }
+            }
+        }
+
+        // Rewriting must not lose or mangle the rows that did parse.
+        let mut reloaded = UsageStore::load(Some(path.clone()));
+        reloaded.dirty = true;
+        reloaded.save().unwrap();
+        let again = UsageStore::load(Some(path));
+        assert_eq!(again.days["2026-08-06"]["tab-ok"].seconds, 60);
+        assert_eq!(again.days["2026-08-04"]["emoji"].name, "🐈‍⬛ 日本語 tab");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
