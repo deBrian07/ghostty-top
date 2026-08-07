@@ -1,7 +1,7 @@
 # ghostty-top
 
-A per-terminal CPU and memory monitor for Ghostty on macOS, with a calendar of
-where your terminal time actually went.
+Shows how much CPU and memory each Ghostty tab is using, and how much time you
+spend in each one. macOS only.
 
 <img width="990" height="531" alt="image" src="https://github.com/user-attachments/assets/891eb8db-dd48-4bf3-8df8-13ce1d583e77" />
 
@@ -11,74 +11,81 @@ where your terminal time actually went.
 bun install -g ghostty-top
 ```
 
-Also `npm install -g ghostty-top`, or `cargo install --path .` from a clone.
-macOS only. No dependencies, no configuration.
+Or `npm install -g ghostty-top`. Or build it yourself with
+`cargo install --path .`.
 
-## Use
+Nothing else to install and nothing to configure.
+
+## Run it
 
 ```sh
-ghostty-top          # interactive monitor
-ghostty-top --once   # one snapshot, for scripts
+ghostty-top          # the live monitor
+ghostty-top --once   # print once and exit
 ```
 
-Rows are named after their Ghostty tab, falling back to the working directory
-when two tabs share one. Ghostty draws every tab in a single process, so its
-own CPU and memory are listed separately from the terminals.
+Each row is one Ghostty tab. Ghostty draws all tabs in a single process, so the
+memory that process uses is shown on its own line at the top.
 
-Everything is clickable: a column heading sorts (click again to reverse), a row
-selects, the selected row expands, and the controls along the bottom do the
-rest. Or use the keyboard:
+You can use the mouse for everything. Click a column title to sort by it, click
+it again to flip the order, click a row to select it, and click it once more to
+see the processes inside. The controls at the bottom are buttons too.
 
-| Key | |
+Keys, if you prefer them:
+
+| Key | What it does |
 | --- | --- |
-| `↑` `↓` | Select a terminal |
-| `enter` | Show its processes |
+| `↑` `↓` | Move between tabs |
+| `enter` | Show the processes in a tab |
 | `c` `m` `g` `p` `a` `n` `t` | Sort by CPU, memory, trend, processes, age, activity, tab |
-| `u` | Usage calendar |
+| `u` | Open the usage calendar |
 | `q` | Quit |
 
 ## Usage calendar
 
-Press `u`. Three views, switched with `d`, `w`, and `c`:
+Press `u`. There are three ways to look at it, with `d`, `w`, and `c`:
 
-- **daily** — a square per day, brighter for more focused time
-- **weekly** — a bar per week
-- **cumulative** — the running total across the range
+- **daily** – one square per day. Brighter means more time.
+- **weekly** – one bar per week.
+- **cumulative** – the total adding up over time.
 
-Hover any square or column for its total; click it for the per-tab breakdown.
+Point at any square or bar to see its total. Click it to see which tabs the
+time went to.
 
-Time is counted only while Ghostty is frontmost **and** you are at the machine.
-Nothing is recorded while the lid is shut, while the screen has been idle, or
-across a sleep.
+Time only counts when Ghostty is the app you're using and you're actually at
+your Mac. Nothing is counted when the lid is closed, when the screen has been
+idle, or while the Mac is asleep.
 
-To keep recording without the monitor open:
+To keep counting when the monitor isn't open:
 
 ```sh
-ghostty-top --track            # in this terminal
-ghostty-top --install-tracker  # at login, in the background
+ghostty-top --track           # in this window
+ghostty-top --install-tracker # in the background, starting at login
 ```
 
-`--uninstall-tracker` removes the service and keeps the history.
+Run `--install-tracker` again after updating ghostty-top, so the background
+copy is updated too. `--uninstall-tracker` stops it and keeps your history.
 
-## Your data
+## What gets saved
 
-History is written to `~/Library/Application Support/ghostty-top/`, is never
-pruned, and never leaves your Mac. It records tab names, working directories,
-process names, and resource samples — never terminal contents, keystrokes,
-environment variables, or command arguments, which may hold secrets.
+Everything is saved in `~/Library/Application Support/ghostty-top/` and stays
+on your Mac. It saves tab names, folder paths, program names, and CPU and
+memory readings. It does not save anything you type or anything printed in your
+terminal, and it never saves command arguments or environment variables,
+because those can contain passwords and keys.
 
-Reading tab names needs the one-time macOS Automation permission for Ghostty.
+The first time it reads tab names, macOS asks you to allow it to control
+Ghostty. That permission is only needed once.
 
-## Notes
+## Good to know
 
-- CPU is summed across each process tree, so it can exceed 100% on many cores.
-- RAM is summed RSS. Processes share pages, so read it as attribution rather
-  than exact unique memory.
-- A **leak alert** marks a terminal whose memory has climbed steadily for
-  several minutes against a strong linear fit. It is a hint worth a look, not
-  proof of a leak.
+- CPU adds up every process in a tab, so it can go over 100% on a Mac with
+  several cores.
+- Memory adds up each process, and programs often share memory, so treat the
+  number as a rough guide.
+- A **leak warning** means a tab's memory has been climbing steadily for a few
+  minutes. It's worth a look, but it isn't proof of a problem.
 
-`ghostty-top --help` lists every flag.
+Run `ghostty-top --help` to see every option.
 
 ## License
 
