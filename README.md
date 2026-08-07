@@ -3,7 +3,7 @@
 Shows how much CPU and memory each Ghostty tab is using, and how much time you
 spend in each one.
 
-<img width="990" height="531" alt="image" src="https://github.com/user-attachments/assets/891eb8db-dd48-4bf3-8df8-13ce1d583e77" />
+<img width="913" height="605" alt="image" src="https://github.com/user-attachments/assets/b551c9e7-2c95-41e8-bee6-45e56f0fcd9f" />
 
 ## Install
 
