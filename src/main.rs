@@ -3145,17 +3145,26 @@ fn civil_from_day_number(number: i64) -> (i64, i64, i64) {
 }
 
 fn terminal_size() -> (usize, usize) {
+    const DEFAULT_ROWS: usize = 24;
+    const DEFAULT_COLUMNS: usize = 100;
     let output = Command::new("stty")
         .args([STTY_FILE, "/dev/tty", "size"])
         .output();
     let Some(output) = output.ok().filter(|value| value.status.success()) else {
-        return (24, 100);
+        return (DEFAULT_ROWS, DEFAULT_COLUMNS);
     };
     let text = String::from_utf8_lossy(&output.stdout);
     let mut values = text
         .split_whitespace()
         .filter_map(|value| value.parse().ok());
-    (values.next().unwrap_or(24), values.next().unwrap_or(100))
+    let height = values.next().unwrap_or(0);
+    let width = values.next().unwrap_or(0);
+    // A detached or not-yet-sized terminal reports 0x0 without stty failing.
+    // Taking that literally would clip the entire frame away.
+    (
+        if height == 0 { DEFAULT_ROWS } else { height },
+        if width == 0 { DEFAULT_COLUMNS } else { width },
+    )
 }
 
 fn header_cell(
@@ -4110,6 +4119,19 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// A terminal that reports no size still has to be drawn for. Clipping a
+    /// frame to zero columns would leave the screen blank.
+    #[test]
+    fn a_terminal_reporting_no_size_still_draws() {
+        let app = populated_app(UsageScale::Daily);
+        let (rows, columns) = terminal_size();
+        assert!(rows > 0 && columns > 0, "terminal size must never be zero");
+
+        for (frame, _) in [render_monitor(&app, 0, 0), render_usage(&app, 0, 0)] {
+            assert!(!frame.is_empty());
         }
     }
 
