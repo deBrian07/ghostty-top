@@ -4,6 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +43,10 @@ const CALENDAR_RAMP: [&str; 5] = [
     "\x1b[38;5;39m",
     "\x1b[38;5;81m",
 ];
+/// How long the user may sit untouched before their focused time stops counting.
+const MAX_IDLE: Duration = Duration::from_secs(5 * 60);
+const TAB_LABEL_REFRESH: Duration = Duration::from_secs(15);
+const INVENTORY_TIMEOUT: Duration = Duration::from_secs(8);
 const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const USAGE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -148,10 +153,52 @@ struct Process {
     command: String,
 }
 
+/// Tab names resolved off the render thread: the Ghostty query costs hundreds
+/// of milliseconds, far too long to block input handling on.
+#[derive(Default)]
+struct LabelCache {
+    by_tty: HashMap<String, String>,
+    pending: Option<mpsc::Receiver<HashMap<String, String>>>,
+    next_refresh: Option<Instant>,
+}
+
+impl LabelCache {
+    fn poll(&mut self, now: Instant, shells: Vec<(String, i32)>) {
+        if let Some(pending) = &self.pending {
+            match pending.try_recv() {
+                Ok(labels) => self.by_tty = labels,
+                // A worker that died leaves the previous labels in place.
+                Err(mpsc::TryRecvError::Disconnected) => {}
+                Err(mpsc::TryRecvError::Empty) => return,
+            }
+            self.pending = None;
+            self.next_refresh = Some(now + TAB_LABEL_REFRESH);
+        }
+        if shells.is_empty() || self.next_refresh.is_some_and(|next| now < next) {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(resolve_tab_labels(&shells));
+        });
+        self.pending = Some(receiver);
+    }
+
+    fn label_for(&self, tty: &str) -> String {
+        self.by_tty
+            .get(tty)
+            .cloned()
+            .unwrap_or_else(|| tty.to_string())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct Terminal {
     root_pid: i32,
     tty: String,
+    /// The Ghostty tab name when it can be resolved, else the working
+    /// directory, else the tty.
+    label: String,
     cpu: f64,
     rss_kib: u64,
     processes: Vec<Process>,
@@ -172,7 +219,7 @@ enum SortBy {
     Processes,
     Age,
     Activity,
-    Tty,
+    Tab,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -267,7 +314,10 @@ struct UsageTracker {
     store: UsageStore,
     current_day: String,
     last_focus: Option<FocusedTab>,
-    last_observed: Option<Instant>,
+    /// Monotonic and wall-clock stamps of the last observation, so a gap can be
+    /// recognised as a sleep whichever clock the system froze.
+    last_seen: Option<(Instant, SystemTime)>,
+    away: Option<Away>,
     next_poll: Instant,
     next_date_check: Instant,
     next_flush: Instant,
@@ -275,6 +325,8 @@ struct UsageTracker {
     next_inventory_heartbeat: Instant,
     next_resource_history: Instant,
     last_inventory: Vec<TabObservation>,
+    pending_focus: Option<mpsc::Receiver<Result<FocusUpdate, String>>>,
+    pending_inventory: Option<mpsc::Receiver<Result<Vec<TabObservation>, String>>>,
     last_error: Option<String>,
 }
 
@@ -288,6 +340,7 @@ struct App {
     interval: Duration,
     last_error: Option<String>,
     memory_history: HashMap<i32, MemoryHistory>,
+    labels: LabelCache,
     usage_tracker: Option<UsageTracker>,
     view: View,
     usage_scale: UsageScale,
@@ -307,6 +360,7 @@ impl App {
             interval,
             last_error: None,
             memory_history: HashMap::new(),
+            labels: LabelCache::default(),
             usage_tracker: None,
             view: View::Monitor,
             usage_scale: UsageScale::Daily,
@@ -320,6 +374,9 @@ impl App {
             Ok(processes) => {
                 let selected_tty = self.terminals.get(self.selected).map(|t| t.tty.clone());
                 let (ghostty, mut terminals) = aggregate(&processes);
+                for terminal in &mut terminals {
+                    terminal.label = self.labels.label_for(&terminal.tty);
+                }
                 self.update_memory_trends(&mut terminals, Instant::now());
                 sort_terminals(&mut terminals, self.sort, self.descending);
                 self.ghostty = ghostty;
@@ -368,7 +425,7 @@ impl App {
             Key::Char(b'p') => self.set_sort(SortBy::Processes),
             Key::Char(b'a') => self.set_sort(SortBy::Age),
             Key::Char(b'n') => self.set_sort(SortBy::Activity),
-            Key::Char(b't') => self.set_sort(SortBy::Tty),
+            Key::Char(b't') => self.set_sort(SortBy::Tab),
             Key::Char(b'u') => {
                 self.view = if self.view == View::Monitor {
                     View::Usage
@@ -462,7 +519,7 @@ impl App {
             self.descending = !self.descending;
         } else {
             self.sort = sort;
-            self.descending = sort != SortBy::Tty;
+            self.descending = sort != SortBy::Tab;
         }
         sort_terminals(&mut self.terminals, self.sort, self.descending);
     }
@@ -502,6 +559,16 @@ impl App {
             terminal.memory_samples = history.samples.len();
             terminal.leak_suspected = update_leak_state(history, trend.suspected);
         }
+    }
+
+    /// Kicks off a tab-name refresh when the cached names are stale.
+    fn poll_labels(&mut self, now: Instant) {
+        let shells = self
+            .terminals
+            .iter()
+            .map(|terminal| (terminal.tty.clone(), shell_pid(terminal)))
+            .collect();
+        self.labels.poll(now, shells);
     }
 
     fn enable_usage_tracking(&mut self) {
@@ -606,7 +673,8 @@ impl UsageTracker {
             store: UsageStore::load(default_usage_path()),
             current_day: local_date().unwrap_or_else(|| "unknown".to_string()),
             last_focus: None,
-            last_observed: None,
+            last_seen: None,
+            away: None,
             next_poll: now,
             next_date_check: now + Duration::from_secs(60),
             next_flush: now + USAGE_FLUSH_INTERVAL,
@@ -614,6 +682,8 @@ impl UsageTracker {
             next_inventory_heartbeat: now,
             next_resource_history: now,
             last_inventory: Vec::new(),
+            pending_focus: None,
+            pending_inventory: None,
             last_error: None,
         };
         if let Err(error) = append_tracker_event("start") {
@@ -623,44 +693,90 @@ impl UsageTracker {
     }
 
     fn tick(&mut self, now: Instant) -> bool {
-        if now < self.next_poll {
-            return false;
-        }
-        self.next_poll = now + USAGE_POLL_INTERVAL;
         if now >= self.next_date_check {
             if let Some(day) = local_date() {
                 self.current_day = day;
             }
             self.next_date_check = now + Duration::from_secs(60);
         }
-
-        let mut changed = false;
-        match query_focused_tab() {
-            Ok(focus) => {
-                if let (Some(previous), Some(previous_time), Some(current)) =
-                    (&self.last_focus, self.last_observed, &focus)
-                {
-                    let elapsed = now.duration_since(previous_time);
-                    if previous.tab_id == current.tab_id && elapsed <= USAGE_POLL_INTERVAL * 3 {
-                        self.store
-                            .add(&self.current_day, current, elapsed.as_secs());
-                        changed = true;
-                    }
-                }
-                self.last_focus = focus;
-                self.last_observed = Some(now);
-                self.last_error = None;
+        let changed = self.poll_focus(now);
+        self.poll_inventory(now);
+        if now >= self.next_flush {
+            if let Err(error) = self.store.save() {
+                self.last_error = Some(format!("could not save usage: {error}"));
             }
-            Err(error) => {
-                self.last_focus = None;
-                self.last_observed = None;
-                self.last_error = Some(error);
-                self.next_poll = now + Duration::from_secs(30);
-            }
+            self.next_flush = now + USAGE_FLUSH_INTERVAL;
         }
-        if now >= self.next_inventory {
-            match query_tab_inventory() {
-                Ok(inventory) => {
+        changed
+    }
+
+    /// Credits the time since the previous sample and starts the next one.
+    /// Everything that can block — the presence probes and the Ghostty query —
+    /// happens on the worker, so the UI thread only ever moves counters.
+    fn poll_focus(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if let Some(pending) = &self.pending_focus {
+            match pending.try_recv() {
+                Ok(Ok(FocusUpdate::Away(away))) => {
+                    self.away = Some(away);
+                    self.forget_focus();
+                    self.next_poll = now + USAGE_POLL_INTERVAL;
+                }
+                Ok(Ok(FocusUpdate::Sample { focus, at, wall })) => {
+                    self.away = None;
+                    if let (Some(previous), Some(seen), Some(current)) =
+                        (&self.last_focus, self.last_seen, &focus)
+                    {
+                        if previous.tab_id == current.tab_id {
+                            if let Some(elapsed) = credited_time(seen, (at, wall)) {
+                                self.store
+                                    .add(&self.current_day, current, elapsed.as_secs());
+                                changed = true;
+                            }
+                        }
+                    }
+                    self.last_focus = focus;
+                    self.last_seen = Some((at, wall));
+                    self.last_error = None;
+                    self.next_poll = now + USAGE_POLL_INTERVAL;
+                }
+                Ok(Err(error)) => {
+                    self.forget_focus();
+                    self.last_error = Some(error);
+                    self.next_poll = now + Duration::from_secs(30);
+                }
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.next_poll = now + USAGE_POLL_INTERVAL;
+                }
+            }
+            self.pending_focus = None;
+        }
+        if now < self.next_poll {
+            return changed;
+        }
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let update = match away_reason() {
+                Some(away) => Ok(FocusUpdate::Away(away)),
+                None => query_focused_tab().map(|focus| FocusUpdate::Sample {
+                    focus,
+                    at: Instant::now(),
+                    wall: SystemTime::now(),
+                }),
+            };
+            let _ = sender.send(update);
+        });
+        self.pending_focus = Some(receiver);
+        changed
+    }
+
+    /// Collects a finished tab-history snapshot and starts the next one. The
+    /// query is slow enough that running it inline would visibly stall the UI.
+    fn poll_inventory(&mut self, now: Instant) {
+        if let Some(pending) = &self.pending_inventory {
+            match pending.try_recv() {
+                Ok(Ok(inventory)) => {
                     if inventory != self.last_inventory || now >= self.next_inventory_heartbeat {
                         if let Err(error) = append_tab_inventory(&self.current_day, &inventory) {
                             self.last_error = Some(format!("could not save tab history: {error}"));
@@ -669,17 +785,26 @@ impl UsageTracker {
                         self.next_inventory_heartbeat = now + INVENTORY_HEARTBEAT;
                     }
                 }
-                Err(error) => self.last_error = Some(error),
+                Ok(Err(error)) => self.last_error = Some(error),
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {}
             }
+            self.pending_inventory = None;
             self.next_inventory = now + INVENTORY_POLL_INTERVAL;
         }
-        if now >= self.next_flush {
-            if let Err(error) = self.store.save() {
-                self.last_error = Some(format!("could not save usage: {error}"));
-            }
-            self.next_flush = now + USAGE_FLUSH_INTERVAL;
+        if now < self.next_inventory {
+            return;
         }
-        changed
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(query_tab_inventory());
+        });
+        self.pending_inventory = Some(receiver);
+    }
+
+    fn forget_focus(&mut self) {
+        self.last_focus = None;
+        self.last_seen = None;
     }
 
     fn capture_resources(
@@ -696,6 +821,228 @@ impl UsageTracker {
         }
         self.next_resource_history = now + RESOURCE_HISTORY_INTERVAL;
     }
+}
+
+/// Resolves each terminal's tty to a name a human recognises. Ghostty's
+/// scripting dictionary exposes no tty, so a surface is matched to a tty by
+/// working directory; when a directory holds more than one differently-named
+/// tab the match is ambiguous and the directory itself is shown instead.
+fn resolve_tab_labels(shells: &[(String, i32)]) -> HashMap<String, String> {
+    let pids: Vec<i32> = shells.iter().map(|(_, pid)| *pid).collect();
+    let directories = shell_working_directories(&pids);
+    let tabs = query_tab_names().unwrap_or_default();
+
+    let mut surfaces_by_directory: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (name, directory) in &tabs {
+        surfaces_by_directory
+            .entry(directory.as_str())
+            .or_default()
+            .push(name.trim());
+    }
+
+    shells
+        .iter()
+        .filter_map(|(tty, pid)| {
+            let directory = directories.get(pid)?;
+            // A name is only trustworthy when one surface owns the directory.
+            // With several, nothing distinguishes them and a guess would put
+            // the wrong name on a row, which is worse than showing the path.
+            let label = match surfaces_by_directory
+                .get(directory.as_str())
+                .map(Vec::as_slice)
+            {
+                Some([only]) if !only.is_empty() => clean_tab_name(only),
+                _ => shorten_path(directory),
+            };
+            (!label.is_empty()).then(|| (tty.clone(), label))
+        })
+        .collect()
+}
+
+/// Tab names paired with each surface's working directory. Deliberately leaner
+/// than the telemetry inventory because it runs every few seconds.
+fn query_tab_names() -> Result<Vec<(String, String)>, String> {
+    if !ghostty_is_running() {
+        return Ok(Vec::new());
+    }
+    const SCRIPT: &str = r#"tell application "Ghostty"
+set fieldSeparator to ASCII character 31
+set recordSeparator to ASCII character 30
+set resultText to ""
+repeat with ghosttyWindow in windows
+repeat with ghosttyTab in tabs of ghosttyWindow
+set tabName to name of ghosttyTab as text
+repeat with ghosttyTerminal in terminals of ghosttyTab
+set resultText to resultText & tabName & fieldSeparator & (working directory of ghosttyTerminal as text) & recordSeparator
+end repeat
+end repeat
+end repeat
+return resultText
+end tell"#;
+    let output = run_osascript(SCRIPT, INVENTORY_TIMEOUT)?;
+    Ok(output
+        .trim_end()
+        .split('\x1e')
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| {
+            let (name, directory) = record.split_once('\x1f')?;
+            Some((name.to_string(), directory.to_string()))
+        })
+        .collect())
+}
+
+fn shell_working_directories(pids: &[i32]) -> HashMap<i32, String> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    let list = pids
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let Ok(output) = Command::new("lsof")
+        .args(["-a", "-d", "cwd", "-p", &list, "-Fpn"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return HashMap::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut directories = HashMap::new();
+    let mut current = None;
+    for line in text.lines() {
+        if let Some(pid) = line.strip_prefix('p') {
+            current = pid.parse::<i32>().ok();
+        } else if let Some(path) = line.strip_prefix('n') {
+            if let Some(pid) = current {
+                directories.insert(pid, path.to_string());
+            }
+        }
+    }
+    directories
+}
+
+/// Shells title their tab `user@host:~/path`, where only the path is worth
+/// showing. Anything the user named themselves is kept verbatim.
+fn clean_tab_name(name: &str) -> String {
+    match name.split_once(':') {
+        Some((owner, path)) if owner.contains('@') && !path.trim().is_empty() => {
+            path.trim().to_string()
+        }
+        _ => name.trim().to_string(),
+    }
+}
+
+fn shorten_path(path: &str) -> String {
+    let Some(home) = env::var_os("HOME") else {
+        return path.to_string();
+    };
+    let home = home.to_string_lossy();
+    match path.strip_prefix(home.as_ref()) {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// The interactive shell for a terminal, whose working directory is the one
+/// Ghostty reports for the matching surface.
+fn shell_pid(terminal: &Terminal) -> i32 {
+    terminal
+        .processes
+        .iter()
+        .find(|process| process.ppid == terminal.root_pid && is_shell(&process.command))
+        .or_else(|| {
+            terminal
+                .processes
+                .iter()
+                .find(|process| process.ppid == terminal.root_pid)
+        })
+        .map_or(terminal.root_pid, |process| process.pid)
+}
+
+/// Time to credit between two observations, or None when the gap is too large
+/// to have been continuous use. Both clocks must agree: whether the platform
+/// freezes the monotonic clock across a sleep or keeps counting through it, one
+/// of the two readings exposes the gap and the sample is dropped.
+fn credited_time(previous: (Instant, SystemTime), now: (Instant, SystemTime)) -> Option<Duration> {
+    let limit = USAGE_POLL_INTERVAL * 3;
+    let elapsed = now.0.duration_since(previous.0);
+    // A backwards wall clock yields an error here, which also fails the check.
+    let wall_elapsed = now.1.duration_since(previous.1).ok()?;
+    (elapsed <= limit && wall_elapsed <= limit).then_some(elapsed)
+}
+
+/// One reading from the focus worker.
+enum FocusUpdate {
+    Away(Away),
+    Sample {
+        focus: Option<FocusedTab>,
+        at: Instant,
+        wall: SystemTime,
+    },
+}
+
+/// Why focused time is not being counted right now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Away {
+    Idle,
+    LidClosed,
+}
+
+impl Away {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Idle => "you stepped away",
+            Self::LidClosed => "the lid is closed",
+        }
+    }
+}
+
+/// Detects the states where the user is not actually at the machine. System
+/// sleep needs no check here: the elapsed-time guard in `tick` discards the
+/// gap, because a sleeping Mac cannot poll in the first place.
+fn away_reason() -> Option<Away> {
+    if lid_is_closed() {
+        return Some(Away::LidClosed);
+    }
+    // Covers a locked screen, a sleeping display, and simply walking off.
+    if hid_idle_time().is_some_and(|idle| idle > MAX_IDLE) {
+        return Some(Away::Idle);
+    }
+    None
+}
+
+fn lid_is_closed() -> bool {
+    // Desktop Macs have no clamshell key at all, so a missing value means open.
+    ioreg_value(
+        &["-r", "-k", "AppleClamshellState", "-d", "1"],
+        "AppleClamshellState",
+    )
+    .is_some_and(|state| state.trim() == "Yes")
+}
+
+fn hid_idle_time() -> Option<Duration> {
+    let nanoseconds: u64 = ioreg_value(&["-c", "IOHIDSystem", "-d", "4"], "HIDIdleTime")?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_nanos(nanoseconds))
+}
+
+/// Reads `"<key>" = <value>` out of an ioreg dump.
+fn ioreg_value(arguments: &[&str], key: &str) -> Option<String> {
+    let output = Command::new("ioreg")
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let needle = format!("\"{key}\" = ");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| Some(line.split_once(&needle)?.1.to_string()))
 }
 
 fn default_usage_path() -> Option<PathBuf> {
@@ -957,7 +1304,7 @@ set theTerminal to focused terminal of theTab
 set separator to ASCII character 9
 return (id of theTab as text) & separator & (name of theTab as text) & separator & (id of theTerminal as text) & separator & (name of theTerminal as text)
 end tell"#;
-    let output = run_osascript(SCRIPT)?;
+    let output = run_osascript(SCRIPT, USAGE_SAMPLE_TIMEOUT)?;
     let output = output.trim();
     if output.is_empty() {
         return Ok(None);
@@ -1004,7 +1351,9 @@ end repeat
 end repeat
 return resultText
 end tell"#;
-    let output = run_osascript(SCRIPT)?;
+    // Walking every surface scales with tab count and routinely runs past a
+    // second, so this query is given room and is never issued on the UI thread.
+    let output = run_osascript(SCRIPT, INVENTORY_TIMEOUT)?;
     parse_tab_inventory(&output)
 }
 
@@ -1039,7 +1388,7 @@ fn parse_tab_inventory(output: &str) -> Result<Vec<TabObservation>, String> {
     Ok(observations)
 }
 
-fn run_osascript(script: &str) -> Result<String, String> {
+fn run_osascript(script: &str, timeout: Duration) -> Result<String, String> {
     let mut child = Command::new("osascript")
         .args(["-e", script])
         .stdin(Stdio::null())
@@ -1047,7 +1396,7 @@ fn run_osascript(script: &str) -> Result<String, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("could not start Ghostty tracking: {error}"))?;
-    let deadline = Instant::now() + USAGE_SAMPLE_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -1259,13 +1608,26 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
+/// `pgrep -x` compares against the full executable path on macOS, so it never
+/// matched the bundled binary and silently disabled every Ghostty query. The
+/// process list is matched the same way `aggregate` does it instead.
 fn ghostty_is_running() -> bool {
-    Command::new("pgrep")
-        .args(["-x", "ghostty"])
-        .stdout(Stdio::null())
+    let Ok(output) = Command::new("ps")
+        .args(["-axo", "command="])
+        .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(is_ghostty_app)
+}
+
+fn is_ghostty_app(command: &str) -> bool {
+    let command = command.trim_end();
+    command.ends_with("/ghostty") || command == "ghostty"
 }
 
 impl InputDecoder {
@@ -1409,6 +1771,14 @@ fn main() {
     app.refresh();
 
     if once {
+        // One-shot output can afford to resolve tab names inline.
+        let shells = app
+            .terminals
+            .iter()
+            .map(|terminal| (terminal.tty.clone(), shell_pid(terminal)))
+            .collect::<Vec<_>>();
+        app.labels.by_tty = resolve_tab_labels(&shells);
+        app.refresh();
         print_snapshot(&app);
         return;
     }
@@ -1479,6 +1849,7 @@ fn main() {
             }
         }
         if Instant::now() >= next_sample {
+            app.poll_labels(Instant::now());
             app.refresh();
             next_sample = Instant::now() + app.interval;
             dirty = true;
@@ -1596,7 +1967,7 @@ fn parse_process(line: &str) -> Option<Process> {
 fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
     let ghostty = processes
         .iter()
-        .find(|p| p.command.ends_with("/ghostty") || p.command == "ghostty")
+        .find(|p| is_ghostty_app(&p.command))
         .cloned();
     let Some(ref app) = ghostty else {
         return (None, Vec::new());
@@ -1634,6 +2005,7 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
             .unwrap_or_else(|| "shell".to_string());
         terminals.push(Terminal {
             root_pid: root.pid,
+            label: root.tty.clone(),
             tty: root.tty.clone(),
             cpu,
             rss_kib,
@@ -1829,7 +2201,11 @@ fn sort_terminals(terminals: &mut [Terminal], sort: SortBy, descending: bool) {
             SortBy::Processes => a.processes.len().cmp(&b.processes.len()),
             SortBy::Age => a.age_seconds.cmp(&b.age_seconds),
             SortBy::Activity => a.activity.to_lowercase().cmp(&b.activity.to_lowercase()),
-            SortBy::Tty => natural_tty(&a.tty).cmp(&natural_tty(&b.tty)),
+            SortBy::Tab => a
+                .label
+                .to_lowercase()
+                .cmp(&b.label.to_lowercase())
+                .then_with(|| natural_tty(&a.tty).cmp(&natural_tty(&b.tty))),
         };
         if descending {
             order.reverse()
@@ -1908,7 +2284,7 @@ fn render_monitor(app: &App) -> Layout {
         let shown_end = (shown_start + max_rows).min(app.terminals.len());
         layout.shown_start = shown_start;
         layout.shown_count = shown_end - shown_start;
-        let activity_width = width.saturating_sub(64).max(10);
+        let (tab_width, activity_width) = monitor_flex_widths(width);
         for (index, terminal) in app
             .terminals
             .iter()
@@ -1928,8 +2304,8 @@ fn render_monitor(app: &App) -> Layout {
             line.push_str(row_style);
             let marker = if selected { "›" } else { " " };
             line.push_str(&format!(
-                "{marker}  {:<8} {YELLOW}{:>6.1}%{RESET}{row_style} {CYAN}{:>9}{RESET}{row_style} {}{row_style} {:>7} {:>11} {}",
-                terminal.tty,
+                "{marker}  {:<tab_width$} {YELLOW}{:>6.1}%{RESET}{row_style} {CYAN}{:>9}{RESET}{row_style} {}{row_style} {:>7} {:>11} {}",
+                truncate(&terminal.label, tab_width),
                 terminal.cpu,
                 human_bytes(terminal.rss_kib),
                 trend_cell(terminal),
@@ -2038,9 +2414,11 @@ fn render_usage(app: &App) -> Layout {
     ));
     if let Some(error) = tracker.and_then(|value| value.last_error.as_ref()) {
         lines.push(format!("{RED}Tracking paused: {error}{RESET}"));
+    } else if let Some(away) = tracker.and_then(|value| value.away) {
+        lines.push(format!("{DIM}Paused while {}.{RESET}", away.reason()));
     } else {
         lines.push(format!(
-            "{DIM}Tracking only while Ghostty is frontmost; samples every 5 seconds.{RESET}"
+            "{DIM}Counting only while Ghostty is frontmost and you are at the machine.{RESET}"
         ));
     }
     lines.push(String::new());
@@ -2253,6 +2631,16 @@ fn month_header(start: i64, weeks: usize) -> String {
             header.push_str(label);
         }
     }
+    // A short range can span no month boundary at all; name the month on show
+    // rather than leaving an empty band above the grid.
+    if header.trim().is_empty() {
+        let (_, month, _) = civil_from_day_number(start);
+        header = format!(
+            "{}{}",
+            " ".repeat(CALENDAR_GUTTER),
+            MONTHS[month as usize - 1]
+        );
+    }
     header
 }
 
@@ -2321,28 +2709,40 @@ fn hint_line(row: usize, segments: &[(&str, Option<ClickAction>)]) -> (String, V
 }
 
 /// Renders the sortable column headings and the columns each one occupies.
+/// Columns other than the two flexible ones, plus the spaces between all seven.
+const MONITOR_FIXED_WIDTH: usize = 3 + 7 + 9 + 12 + 7 + 11 + 6;
+
+/// Splits the space left over after the fixed columns, favouring tab names
+/// because they are longer and more distinguishing than activity names.
+fn monitor_flex_widths(width: usize) -> (usize, usize) {
+    let spare = width.saturating_sub(MONITOR_FIXED_WIDTH);
+    let tab = (spare * 3 / 5).clamp(10, 36);
+    (tab, spare.saturating_sub(tab).max(8))
+}
+
 fn monitor_header(row: usize, width: usize, app: &App) -> (String, Vec<ClickZone>) {
+    let (tab_width, activity_width) = monitor_flex_widths(width);
     // Headings are aligned like the values beneath them: text left, numbers right.
-    const COLUMNS: [(&str, usize, SortBy, bool); 7] = [
-        ("TERMINAL", 8, SortBy::Tty, false),
+    let columns: [(&str, usize, SortBy, bool); 7] = [
+        ("TAB", tab_width, SortBy::Tab, false),
         ("CPU", 7, SortBy::Cpu, true),
         ("RAM", 9, SortBy::Memory, true),
         ("TREND", 12, SortBy::Trend, true),
         ("PROCS", 7, SortBy::Processes, true),
         ("AGE", 11, SortBy::Age, true),
-        ("ACTIVITY", 8, SortBy::Activity, false),
+        ("ACTIVITY", activity_width, SortBy::Activity, false),
     ];
     const INDENT: usize = 3;
     let mut line = " ".repeat(INDENT);
     let mut column = INDENT + 1;
-    let mut zones = Vec::with_capacity(COLUMNS.len());
-    for (index, (label, cell_width, sort, right_aligned)) in COLUMNS.iter().enumerate() {
+    let mut zones = Vec::with_capacity(columns.len());
+    for (index, (label, cell_width, sort, right_aligned)) in columns.iter().enumerate() {
         if index > 0 {
             line.push(' ');
             column += 1;
         }
         line.push_str(&header_cell(label, *cell_width, *sort, *right_aligned, app));
-        let last = index + 1 == COLUMNS.len();
+        let last = index + 1 == columns.len();
         zones.push(ClickZone {
             start_column: column,
             // The final column owns the rest of the row so its wide values stay clickable.
@@ -2511,7 +2911,7 @@ fn sort_name(sort: SortBy) -> &'static str {
         SortBy::Processes => "processes",
         SortBy::Age => "age",
         SortBy::Activity => "activity",
-        SortBy::Tty => "terminal",
+        SortBy::Tab => "tab",
     }
 }
 
@@ -2529,11 +2929,14 @@ fn print_snapshot(app: &App) {
         ghostty.cpu,
         human_bytes(ghostty.rss_kib)
     );
-    println!("TERMINAL     CPU       RAM        TREND  PROCS          AGE  ACTIVITY");
+    println!(
+        "{:<24} {:>7}  {:>9}  {:>11}  {:>5}  {:>11}  ACTIVITY",
+        "TAB", "CPU", "RAM", "TREND", "PROCS", "AGE"
+    );
     for terminal in &app.terminals {
         println!(
-            "{:<10} {:>6.1}%  {:>8}  {:>11}  {:>5}  {:>11}  {}{}",
-            terminal.tty,
+            "{:<24} {:>6.1}%  {:>9}  {:>11}  {:>5}  {:>11}  {}{}",
+            truncate(&terminal.label, 24),
             terminal.cpu,
             human_bytes(terminal.rss_kib),
             if terminal.memory_samples < 2 {
@@ -2905,14 +3308,87 @@ mod tests {
     fn monitor_headings_line_up_with_their_click_targets() {
         let app = App::new(Duration::from_secs(1));
         let (line, zones) = monitor_header(4, 100, &app);
-        let labels = [
-            "TERMINAL", "CPU", "RAM", "TREND", "PROCS", "AGE", "ACTIVITY",
-        ];
+        let labels = ["TAB", "CPU", "RAM", "TREND", "PROCS", "AGE", "ACTIVITY"];
         assert_eq!(zones.len(), labels.len());
         for (zone, label) in zones.iter().zip(labels) {
             assert_eq!(text_at(&line, zone).trim(), label);
             assert_eq!(zone.row, 4);
         }
+    }
+
+    #[test]
+    fn headings_keep_step_with_the_rows_beneath_them() {
+        // The heading row and the data rows derive their widths from the same
+        // split, so the columns cannot drift apart as the terminal resizes.
+        for width in [80, 100, 140, 220] {
+            let (tab, activity) = monitor_flex_widths(width);
+            let app = App::new(Duration::from_secs(1));
+            let (line, _) = monitor_header(4, width, &app);
+            let plain = strip_ansi(&line);
+            let expected = MONITOR_FIXED_WIDTH + tab + activity;
+            assert_eq!(plain.chars().count(), expected, "width {width}");
+            assert!(plain.trim_start().starts_with("TAB"));
+        }
+    }
+
+    #[test]
+    fn a_tab_name_is_used_only_when_one_surface_owns_the_directory() {
+        let mut surfaces: HashMap<&str, Vec<&str>> = HashMap::new();
+        surfaces.insert("/work/api", vec!["api server"]);
+        surfaces.insert("/work/web", vec!["Recruting", "user@host:~/work/web"]);
+        let pick = |directory: &str| match surfaces.get(directory).map(Vec::as_slice) {
+            Some([only]) if !only.is_empty() => clean_tab_name(only),
+            _ => shorten_path(directory),
+        };
+        assert_eq!(pick("/work/api"), "api server");
+        // Two surfaces share this directory, so neither may claim the name.
+        assert_eq!(pick("/work/web"), "/work/web");
+    }
+
+    #[test]
+    fn generated_shell_titles_are_reduced_to_their_path() {
+        assert_eq!(clean_tab_name("me@host:~/src/app"), "~/src/app");
+        assert_eq!(clean_tab_name("2nd brain"), "2nd brain");
+        // A colon in a hand-written title is not a host prefix.
+        assert_eq!(clean_tab_name("build: release"), "build: release");
+    }
+
+    #[test]
+    fn ghostty_is_recognised_by_path_not_by_pgrep_name() {
+        assert!(is_ghostty_app(
+            "/Applications/Ghostty.app/Contents/MacOS/ghostty"
+        ));
+        assert!(is_ghostty_app("ghostty"));
+        assert!(!is_ghostty_app("/Users/me/.cargo/bin/ghostty-top"));
+        assert!(!is_ghostty_app("ghostty-top"));
+    }
+
+    #[test]
+    fn sleep_and_stalls_are_not_counted_as_focused_time() {
+        let start = Instant::now();
+        let wall = SystemTime::now();
+        let step = Duration::from_secs(5);
+        assert_eq!(
+            credited_time((start, wall), (start + step, wall + step)),
+            Some(step)
+        );
+
+        // Both clocks stalled together: a suspended process, not real use.
+        let gap = Duration::from_secs(3_600);
+        assert_eq!(
+            credited_time((start, wall), (start + gap, wall + gap)),
+            None
+        );
+        // Monotonic clock froze through a sleep but the wall clock kept going.
+        assert_eq!(
+            credited_time((start, wall), (start + step, wall + gap)),
+            None
+        );
+        // Wall clock jumped backwards.
+        assert_eq!(
+            credited_time((start, wall + gap), (start + step, wall)),
+            None
+        );
     }
 
     #[test]
@@ -2971,6 +3447,10 @@ mod tests {
         let mid_month = date_to_day_number("2026-01-25").unwrap();
         let header = month_header(mid_month, 12);
         assert!(header.trim_start().starts_with("Feb"));
+
+        // A range spanning no boundary still names the month it covers.
+        let within = date_to_day_number("2026-03-08").unwrap();
+        assert_eq!(month_header(within, 3).trim(), "Mar");
     }
 
     #[test]
