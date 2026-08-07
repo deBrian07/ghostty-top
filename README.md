@@ -87,6 +87,12 @@ Ghostty. That permission is only needed once.
 
 Run `ghostty-top --help` to see every option.
 
+## Contributing
+
+Bug reports and pull requests are welcome. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to get set up and what to check
+before opening one.
+
 ## License
 
 [MIT](LICENSE)
