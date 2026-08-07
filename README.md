@@ -12,9 +12,11 @@ display intentionally separates:
 - **Ghostty shared**: the app/renderer's CPU and RAM.
 - **Terminals**: each terminal's login shell and every descendant process.
 
-The terminal identifier (`ttys002`, for example) is stable for that surface's
-lifetime. Process data cannot distinguish a Ghostty tab from a split pane, so
-both appear as terminals.
+Each row is named after its Ghostty tab. Ghostty's scripting dictionary exposes
+no tty, so a tab is matched to a terminal by working directory; when two tabs
+sit in the same directory nothing tells them apart, and the row falls back to
+that directory and then to the tty (`ttys002`). Process data cannot distinguish
+a tab from a split pane, so both appear as terminals.
 
 ## Build and run
 
@@ -36,8 +38,8 @@ No runtime dependencies or elevated permissions are required.
 
 Mouse controls work directly in Ghostty: click a terminal to select it, click
 the selected terminal again to expand its processes, use the scroll wheel to
-move through the list, or click the column headings and footer actions.
-The active sort column is highlighted and shows its direction.
+move through the list, or click a column heading to sort by it. The active sort
+column is highlighted, and the hint line along the bottom is clickable too.
 
 | Key | Action |
 | --- | --- |
@@ -50,9 +52,10 @@ The active sort column is highlighted and shows its direction.
 | `p` | Sort by process count |
 | `a` | Sort by terminal age |
 | `n` | Sort by activity name |
-| `t` | Sort by terminal ID |
+| `t` | Sort by tab name |
 | `r` | Reverse current sort |
 | `u` | Toggle the usage calendar |
+| `d` / `w` / `c` | Calendar shading: daily, weekly, or cumulative |
 | `q` or Ctrl-C | Quit |
 
 Use `ghostty-top --once` for script-friendly output, or change the one-second
@@ -60,10 +63,13 @@ refresh with `ghostty-top --interval 0.5`.
 
 ## Focused tab usage tracking
 
-The interactive monitor automatically records time only when Ghostty is the
-frontmost app and a tab remains selected across consecutive five-second
-samples. Ghostty 1.3 or newer and the one-time macOS Automation permission are
-required. History is stored outside the application and repository at:
+The interactive monitor records time only when Ghostty is the frontmost app and
+a tab remains selected across consecutive five-second samples. Time is not
+counted while the lid is shut, while the screen has been idle for five minutes,
+or across a sleep: a gap is credited only when both the monotonic and wall
+clocks agree it was continuous, so whichever clock the system froze, the gap is
+discarded. Ghostty 1.3 or newer and the one-time macOS Automation permission
+are required. History is stored outside the application and repository at:
 
 ```text
 ~/Library/Application Support/ghostty-top/
@@ -121,10 +127,12 @@ variables, or full command arguments, which may contain secrets. It retains the
 executable name and path so workloads remain classifiable without storing
 tokens or passwords. It does not send usage data anywhere.
 
-Press `u` or click `[USAGE]` to open the eight-week calendar. Every dot is one
-day, and brighter dots represent more focused Ghostty time. Hover over a dot to
-see its date and total; click it to show that day's per-tab time and percentage
-breakdown. Click `[MONITOR]` or press `u` to return to live process usage.
+Press `u` to open the usage calendar. Every square is one day, and brighter
+squares represent more focused Ghostty time; the grid fits as many weeks as the
+window allows, up to a full year. Hover a square for its total, or click it for
+that day's per-tab breakdown. `d`, `w`, and `c` switch shading between the day's
+own total, its week's total, and a running total across the range. Press `u` to
+return to live process usage.
 
 To populate most of the previous 55 days with deterministic, varied calendar
 test data, run `ghostty-top --seed-demo-history`. Demo rows use reserved
