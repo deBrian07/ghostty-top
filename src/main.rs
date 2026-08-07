@@ -34,8 +34,10 @@ const CALENDAR_CELL_WIDTH: usize = 2;
 const CALENDAR_MIN_WEEKS: usize = 4;
 const CALENDAR_MAX_WEEKS: usize = 53;
 const CALENDAR_BLOCK: &str = "■";
-const CALENDAR_HOVER: &str = "\x1b[48;5;238m";
-const CALENDAR_SELECTED: &str = "\x1b[48;5;24m";
+// Highlights recolour the square rather than filling its cell: a background
+// covers the gap beside the glyph too, which reads as a box sitting off-centre.
+const CALENDAR_HOVER: &str = "\x1b[1;38;5;159m";
+const CALENDAR_SELECTED: &str = "\x1b[1;38;5;231m";
 const CALENDAR_RAMP: [&str; 5] = [
     "\x1b[38;5;237m",
     "\x1b[38;5;25m",
@@ -2244,8 +2246,20 @@ fn render_monitor(app: &App) -> Layout {
     } else {
         format!("  {BOLD}{RED}⚠ {alert_count} potential leak alert(s){RESET}")
     };
+    // Naming today's figure is what makes the calendar discoverable: "usage"
+    // alone never told anyone what was behind it.
+    let tracker = app.usage_tracker.as_ref();
+    let today_total = tracker.map_or(0, |value| usage_total_for_day(tracker, &value.current_day));
+    let calendar_teaser = if today_total > 0 {
+        format!(
+            "{DIM}·{RESET}  {BOLD}{}{RESET} {DIM}in Ghostty today · press{RESET} u {DIM}for the calendar{RESET}",
+            human_duration(today_total)
+        )
+    } else {
+        format!("{DIM}·  press{RESET} u {DIM}for the usage calendar{RESET}")
+    };
     lines.push(format!(
-        "{BOLD}{GREEN}ghostty-top{RESET}  {DIM}per-terminal process usage{RESET}{alert_status}",
+        "{BOLD}{GREEN}ghostty-top{RESET}  {calendar_teaser}{alert_status}",
     ));
     lines.push(format!(
         "Ghostty  {YELLOW}{shared_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}    {} terminals  {YELLOW}{terminal_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}    {DIM}sort: {} {}{RESET}",
@@ -2373,7 +2387,7 @@ fn render_monitor(app: &App) -> Layout {
             ("↑↓ select", None),
             ("enter expand", Some(ClickAction::ToggleExpand)),
             ("r reverse", Some(ClickAction::ReverseSort)),
-            ("u usage", Some(ClickAction::ShowUsage)),
+            ("u calendar", Some(ClickAction::ShowUsage)),
             ("q quit", Some(ClickAction::Quit)),
         ],
     );
@@ -2389,7 +2403,7 @@ fn render_usage(app: &App) -> Layout {
     let (height, width) = terminal_size();
     let weeks = visible_weeks(width);
     let mut lines = vec![format!(
-        "{BOLD}{GREEN}ghostty-top{RESET}  {BOLD}focused tab usage{RESET}"
+        "{BOLD}{GREEN}ghostty-top{RESET}  {BOLD}usage calendar{RESET}  {DIM}time spent with each Ghostty tab focused{RESET}"
     )];
     let mut layout = Layout::default();
     let tracker = app.usage_tracker.as_ref();
@@ -2435,17 +2449,14 @@ fn render_usage(app: &App) -> Layout {
                 continue;
             }
             let day = day_number_to_date(number);
-            let highlight = if app.selected_day.as_deref() == Some(day.as_str()) {
+            let style = if app.selected_day.as_deref() == Some(day.as_str()) {
                 CALENDAR_SELECTED
             } else if app.hovered_day.as_deref() == Some(day.as_str()) {
                 CALENDAR_HOVER
             } else {
-                ""
-            };
-            line.push_str(&format!(
-                "{highlight}{}{CALENDAR_BLOCK} {RESET}",
                 CALENDAR_RAMP[usage_level(values[index], peak)]
-            ));
+            };
+            line.push_str(&format!("{style}{CALENDAR_BLOCK} {RESET}"));
             layout.calendar_cells.push(CalendarCell {
                 start_column: CALENDAR_GUTTER + 1 + week * CALENDAR_CELL_WIDTH,
                 end_column: CALENDAR_GUTTER + week * CALENDAR_CELL_WIDTH + CALENDAR_CELL_WIDTH,
@@ -2522,7 +2533,7 @@ fn render_usage(app: &App) -> Layout {
         &[
             ("click a square for details", None),
             ("d/w/c shading", None),
-            ("u monitor", Some(ClickAction::ShowMonitor)),
+            ("u back to monitor", Some(ClickAction::ShowMonitor)),
             ("q quit", Some(ClickAction::Quit)),
         ],
     );
@@ -3393,16 +3404,21 @@ mod tests {
 
     #[test]
     fn hint_segments_are_clickable_where_they_are_drawn() {
-        let (line, zones) = hint_line(
-            20,
-            &[
-                ("↑↓ select", None),
-                ("u usage", Some(ClickAction::ShowUsage)),
-                ("q quit", Some(ClickAction::Quit)),
-            ],
-        );
-        assert_eq!(zones.len(), 2);
-        for (zone, label) in zones.iter().zip(["u usage", "q quit"]) {
+        // A leading multi-byte segment: columns must be counted in characters,
+        // not bytes, or every zone after it lands short of its own text.
+        let segments = [
+            ("↑↓ select", None),
+            ("u calendar", Some(ClickAction::ShowUsage)),
+            ("q quit", Some(ClickAction::Quit)),
+        ];
+        let (line, zones) = hint_line(20, &segments);
+        let clickable: Vec<&str> = segments
+            .iter()
+            .filter(|(_, action)| action.is_some())
+            .map(|(label, _)| *label)
+            .collect();
+        assert_eq!(zones.len(), clickable.len());
+        for (zone, label) in zones.iter().zip(clickable) {
             assert_eq!(text_at(&line, zone), label);
         }
 
