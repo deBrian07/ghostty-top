@@ -2390,7 +2390,7 @@ fn render_monitor(app: &App) -> Layout {
             ("↑ up", Some(ClickAction::SelectPrevious)),
             ("↓ down", Some(ClickAction::SelectNext)),
             ("enter expand", Some(ClickAction::ToggleExpand)),
-            ("u calendar", Some(ClickAction::ShowUsage)),
+            ("u usage", Some(ClickAction::ShowUsage)),
             ("q quit", Some(ClickAction::Quit)),
         ],
     );
@@ -3563,7 +3563,7 @@ mod tests {
         // not bytes, or every zone after it lands short of its own text.
         let segments = [
             ("↑↓ select", None),
-            ("u calendar", Some(ClickAction::ShowUsage)),
+            ("u usage", Some(ClickAction::ShowUsage)),
             ("q quit", Some(ClickAction::Quit)),
         ];
         let (line, zones) = hint_line(20, &segments);
