@@ -114,7 +114,8 @@ struct CalendarCell {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ClickAction {
     Sort(SortBy),
-    ReverseSort,
+    SelectPrevious,
+    SelectNext,
     ToggleExpand,
     ShowUsage,
     ShowMonitor,
@@ -498,10 +499,8 @@ impl App {
     fn apply(&mut self, action: ClickAction) -> bool {
         match action {
             ClickAction::Sort(sort) => self.set_sort(sort),
-            ClickAction::ReverseSort => {
-                self.descending = !self.descending;
-                sort_terminals(&mut self.terminals, self.sort, self.descending);
-            }
+            ClickAction::SelectPrevious => self.move_selection(-1),
+            ClickAction::SelectNext => self.move_selection(1),
             ClickAction::ToggleExpand => self.expanded = !self.expanded,
             ClickAction::ShowUsage => self.view = View::Usage,
             ClickAction::ShowMonitor => self.view = View::Monitor,
@@ -1826,6 +1825,10 @@ fn main() {
         std::process::exit(1);
     };
 
+    // Started before the first frame so names replace tty devices promptly
+    // rather than after the first refresh tick.
+    app.poll_labels(Instant::now());
+
     let mut stdin = io::stdin();
     let mut decoder = InputDecoder::default();
     let mut next_sample = Instant::now() + app.interval;
@@ -2262,12 +2265,10 @@ fn render_monitor(app: &App) -> Layout {
         "{BOLD}{GREEN}ghostty-top{RESET}  {calendar_teaser}{alert_status}",
     ));
     lines.push(format!(
-        "Ghostty  {YELLOW}{shared_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}    {} terminals  {YELLOW}{terminal_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}    {DIM}sort: {} {}{RESET}",
+        "Ghostty  {YELLOW}{shared_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}    {} terminals  {YELLOW}{terminal_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}",
         human_bytes(shared_ram),
         app.terminals.len(),
         human_bytes(terminal_ram),
-        sort_name(app.sort),
-        if app.descending { "↓" } else { "↑" }
     ));
     lines.push(String::new());
 
@@ -2383,10 +2384,9 @@ fn render_monitor(app: &App) -> Layout {
     let (hint, hint_zones) = hint_line(
         lines.len() + 1,
         &[
-            ("click a column to sort", None),
-            ("↑↓ select", None),
+            ("↑ up", Some(ClickAction::SelectPrevious)),
+            ("↓ down", Some(ClickAction::SelectNext)),
             ("enter expand", Some(ClickAction::ToggleExpand)),
-            ("r reverse", Some(ClickAction::ReverseSort)),
             ("u calendar", Some(ClickAction::ShowUsage)),
             ("q quit", Some(ClickAction::Quit)),
         ],
@@ -2531,8 +2531,6 @@ fn render_usage(app: &App) -> Layout {
     let (hint, hint_zones) = hint_line(
         lines.len() + 1,
         &[
-            ("click a square for details", None),
-            ("d/w/c shading", None),
             ("u back to monitor", Some(ClickAction::ShowMonitor)),
             ("q quit", Some(ClickAction::Quit)),
         ],
@@ -2862,12 +2860,18 @@ fn header_cell(
     right_aligned: bool,
     app: &App,
 ) -> String {
-    // No sort arrow here: it would overflow the narrow headings and push the
-    // whole row out of step with the data. The summary line carries direction.
-    let padded = if right_aligned {
-        format!("{label:>width$}")
+    let text = if app.sort == column {
+        format!("{label} {}", if app.descending { "↓" } else { "↑" })
     } else {
-        format!("{label:<width$}")
+        label.to_string()
+    };
+    // Clamped to the column width so the arrow can never widen a heading and
+    // push the whole row out of step with the data beneath it.
+    let text = truncate(&text, width);
+    let padded = if right_aligned {
+        format!("{text:>width$}")
+    } else {
+        format!("{text:<width$}")
     };
     if app.sort == column {
         format!("{ACTIVE_HEADER}{padded}{RESET}")
@@ -2912,18 +2916,6 @@ fn signed_human_kib(kib: i64) -> String {
     let absolute = kib.unsigned_abs();
     let sign = if kib >= 0 { "+" } else { "-" };
     format!("{sign}{}", human_bytes(absolute))
-}
-
-fn sort_name(sort: SortBy) -> &'static str {
-    match sort {
-        SortBy::Cpu => "CPU",
-        SortBy::Memory => "memory",
-        SortBy::Trend => "memory trend",
-        SortBy::Processes => "processes",
-        SortBy::Age => "age",
-        SortBy::Activity => "activity",
-        SortBy::Tab => "tab",
-    }
 }
 
 fn print_snapshot(app: &App) {
@@ -3322,9 +3314,31 @@ mod tests {
         let labels = ["TAB", "CPU", "RAM", "TREND", "PROCS", "AGE", "ACTIVITY"];
         assert_eq!(zones.len(), labels.len());
         for (zone, label) in zones.iter().zip(labels) {
-            assert_eq!(text_at(&line, zone).trim(), label);
+            // The sorted column carries a direction arrow inside its own width.
+            assert!(text_at(&line, zone).trim().starts_with(label));
             assert_eq!(zone.row, 4);
         }
+    }
+
+    #[test]
+    fn the_sort_arrow_marks_the_active_column_without_widening_it() {
+        let mut app = App::new(Duration::from_secs(1));
+        let plain = |app: &App| strip_ansi(&monitor_header(4, 100, app).0);
+        let unsorted_width = plain(&app).chars().count();
+
+        app.sort = SortBy::Cpu;
+        app.descending = true;
+        assert!(plain(&app).contains("CPU ↓"));
+        app.descending = false;
+        assert!(plain(&app).contains("CPU ↑"));
+        assert!(!plain(&app).contains("RAM ↑"));
+        assert_eq!(plain(&app).chars().count(), unsorted_width);
+
+        // The widest heading plus an arrow must still not shift the layout.
+        app.sort = SortBy::Activity;
+        assert_eq!(plain(&app).chars().count(), unsorted_width);
+        app.sort = SortBy::Tab;
+        assert_eq!(plain(&app).chars().count(), unsorted_width);
     }
 
     #[test]
