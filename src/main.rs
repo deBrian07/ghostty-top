@@ -34,6 +34,9 @@ const CALENDAR_CELL_WIDTH: usize = 2;
 const CALENDAR_MIN_WEEKS: usize = 4;
 const CALENDAR_MAX_WEEKS: usize = 53;
 const CALENDAR_BLOCK: &str = "■";
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 // Highlights recolour the square rather than filling its cell: a background
 // covers the gap beside the glyph too, which reads as a box sitting off-centre.
 const CALENDAR_HOVER: &str = "\x1b[1;38;5;159m";
@@ -2415,16 +2418,13 @@ fn render_usage(app: &App) -> Layout {
     let start = today_number - sunday_index(today_number) - (weeks as i64 - 1) * 7;
 
     let daily = daily_totals(tracker, start, weeks, today_number);
-    let values = scaled_usage(&daily, app.usage_scale);
-    let peak = usage_peak(&values, app.usage_scale);
     let range_total: u64 = daily.iter().sum();
     let busiest = daily.iter().copied().max().unwrap_or(0);
 
     lines.push(format!(
-        "Last {weeks} weeks  •  {} total  •  busiest day {}  •  {BOLD}{}{RESET} shading",
+        "Last {weeks} weeks  •  {} total  •  busiest day {}",
         human_duration(range_total),
         human_duration(busiest),
-        app.usage_scale.label(),
     ));
     if let Some(error) = tracker.and_then(|value| value.last_error.as_ref()) {
         lines.push(format!("{RED}Tracking paused: {error}{RESET}"));
@@ -2438,48 +2438,98 @@ fn render_usage(app: &App) -> Layout {
     lines.push(String::new());
     lines.push(format!("{DIM}{}{RESET}", month_header(start, weeks)));
 
-    for (weekday, label) in WEEKDAYS.iter().enumerate() {
-        let row = lines.len() + 1;
-        let mut line = format!(" {label} ");
-        for week in 0..weeks {
-            let index = week * 7 + weekday;
-            let number = start + index as i64;
-            if number > today_number {
-                line.push_str(&" ".repeat(CALENDAR_CELL_WIDTH));
-                continue;
+    let cell = |layout: &mut Layout, week: usize, row: usize, day: String| {
+        layout.calendar_cells.push(CalendarCell {
+            start_column: CALENDAR_GUTTER + 1 + week * CALENDAR_CELL_WIDTH,
+            end_column: CALENDAR_GUTTER + week * CALENDAR_CELL_WIDTH + CALENDAR_CELL_WIDTH,
+            row,
+            day,
+        });
+    };
+
+    let caption = if app.usage_scale == UsageScale::Daily {
+        let peak = usage_peak(&daily, UsageScale::Daily);
+        for (weekday, label) in WEEKDAYS.iter().enumerate() {
+            let row = lines.len() + 1;
+            let mut line = format!(" {label} ");
+            for week in 0..weeks {
+                let index = week * 7 + weekday;
+                let number = start + index as i64;
+                if number > today_number {
+                    line.push_str(&" ".repeat(CALENDAR_CELL_WIDTH));
+                    continue;
+                }
+                let day = day_number_to_date(number);
+                let style = if app.selected_day.as_deref() == Some(day.as_str()) {
+                    CALENDAR_SELECTED
+                } else if app.hovered_day.as_deref() == Some(day.as_str()) {
+                    CALENDAR_HOVER
+                } else {
+                    CALENDAR_RAMP[usage_level(daily[index], peak)]
+                };
+                line.push_str(&format!("{style}{CALENDAR_BLOCK} {RESET}"));
+                cell(&mut layout, week, row, day);
             }
-            let day = day_number_to_date(number);
-            let style = if app.selected_day.as_deref() == Some(day.as_str()) {
-                CALENDAR_SELECTED
-            } else if app.hovered_day.as_deref() == Some(day.as_str()) {
-                CALENDAR_HOVER
-            } else {
-                CALENDAR_RAMP[usage_level(values[index], peak)]
-            };
-            line.push_str(&format!("{style}{CALENDAR_BLOCK} {RESET}"));
-            layout.calendar_cells.push(CalendarCell {
-                start_column: CALENDAR_GUTTER + 1 + week * CALENDAR_CELL_WIDTH,
-                end_column: CALENDAR_GUTTER + week * CALENDAR_CELL_WIDTH + CALENDAR_CELL_WIDTH,
-                row,
-                day,
-            });
+            lines.push(line);
         }
-        lines.push(line);
-    }
+        legend_line()
+    } else {
+        let values = weekly_usage(&daily, app.usage_scale);
+        let peak = values.iter().copied().max().unwrap_or(0);
+        let rows = height.saturating_sub(16).clamp(4, 12);
+        for row_index in 0..rows {
+            let row = lines.len() + 1;
+            let rows_below = rows - 1 - row_index;
+            let gutter = match row_index {
+                0 => format!("{:<CALENDAR_GUTTER$}", "max"),
+                index if index + 1 == rows => format!("{:>3} ", "0"),
+                _ => " ".repeat(CALENDAR_GUTTER),
+            };
+            let mut line = format!("{DIM}{gutter}{RESET}");
+            for (week, value) in values.iter().enumerate() {
+                let day = day_number_to_date(start + week as i64 * 7);
+                let style = if app.selected_day.as_deref() == Some(day.as_str()) {
+                    CALENDAR_SELECTED
+                } else if app.hovered_day.as_deref() == Some(day.as_str()) {
+                    CALENDAR_HOVER
+                } else {
+                    CALENDAR_RAMP[3]
+                };
+                let glyph = bar_glyph(bar_eighths(*value, peak, rows), rows_below);
+                line.push_str(&format!("{style}{glyph}{RESET} "));
+                cell(&mut layout, week, row, day);
+            }
+            lines.push(line);
+        }
+        if app.usage_scale == UsageScale::Cumulative {
+            format!(
+                "{}{DIM}Running total  ·  top{RESET} {}",
+                " ".repeat(CALENDAR_GUTTER),
+                human_duration(peak)
+            )
+        } else {
+            format!(
+                "{}{DIM}Each column = 1 week  ·  tallest{RESET} {}",
+                " ".repeat(CALENDAR_GUTTER),
+                human_duration(peak)
+            )
+        }
+    };
 
     lines.push(String::new());
-    lines.push(legend_line());
+    lines.push(caption);
     let (scale_line, scale_zones) = scale_selector(lines.len() + 1, app.usage_scale);
     layout.zones.extend(scale_zones);
     lines.push(scale_line);
 
+    let by_week = app.usage_scale != UsageScale::Daily;
     lines.push(String::new());
     if let Some(day) = &app.hovered_day {
-        let seconds = usage_total_for_day(tracker, day);
+        let days = selection_days(day, by_week);
         lines.push(format!(
             "{BOLD}{}{RESET}  •  {}",
-            friendly_date(day),
-            human_duration(seconds)
+            selection_label(day, by_week),
+            human_duration(usage_total_for_days(tracker, &days))
         ));
     } else if range_total == 0 {
         lines.push(format!(
@@ -2487,40 +2537,41 @@ fn render_usage(app: &App) -> Layout {
         ));
     } else {
         lines.push(format!(
-            "{DIM}Hover a square for its total; click it for the tab breakdown.{RESET}"
+            "{DIM}Hover a {} for its total; click it for the tab breakdown.{RESET}",
+            if by_week { "column" } else { "square" }
         ));
     }
 
     if let Some(day) = &app.selected_day {
+        let days = selection_days(day, by_week);
+        let tabs = usage_breakdown(tracker, &days);
         lines.push(String::new());
         lines.push(format!(
             "{BOLD}{} breakdown{RESET}  •  {}",
-            friendly_date(day),
-            human_duration(usage_total_for_day(tracker, day))
+            selection_label(day, by_week),
+            human_duration(usage_total_for_days(tracker, &days))
         ));
         lines.push(format!(
             "{DIM}{UNDERLINE}  TAB                                      TIME      SHARE{RESET}"
         ));
-        let mut tabs: Vec<(&String, &TabUsage)> = tracker
-            .and_then(|value| value.store.days.get(day))
-            .map(|values| values.iter().collect())
-            .unwrap_or_default();
-        tabs.sort_by(|(_, a), (_, b)| b.seconds.cmp(&a.seconds));
-        let total = tabs.iter().map(|(_, usage)| usage.seconds).sum::<u64>();
+        let total = tabs.iter().map(|(_, seconds)| seconds).sum::<u64>();
         let available = height.saturating_sub(lines.len() + 4);
         if tabs.is_empty() {
-            lines.push("  No focused Ghostty usage recorded for this day.".to_string());
+            lines.push(format!(
+                "  No focused Ghostty usage recorded for this {}.",
+                if by_week { "week" } else { "day" }
+            ));
         } else {
-            for (_, usage) in tabs.into_iter().take(available) {
+            for (name, seconds) in tabs.into_iter().take(available) {
                 let share = if total == 0 {
                     0.0
                 } else {
-                    usage.seconds as f64 / total as f64 * 100.0
+                    seconds as f64 / total as f64 * 100.0
                 };
                 lines.push(format!(
                     "  {:<40} {:>8}   {:>5.1}%",
-                    truncate(&usage.name, 40),
-                    human_duration(usage.seconds),
+                    truncate(&name, 40),
+                    human_duration(seconds),
                     share
                 ));
             }
@@ -2540,6 +2591,58 @@ fn render_usage(app: &App) -> Layout {
     print!("\x1b[H\x1b[2J{}", lines.join("\n"));
     let _ = io::stdout().flush();
     layout
+}
+
+/// Days a selected column covers: one day in the grid, a whole week in a chart.
+fn selection_days(anchor: &str, by_week: bool) -> Vec<String> {
+    let Some(number) = date_to_day_number(anchor) else {
+        return Vec::new();
+    };
+    if !by_week {
+        return vec![anchor.to_string()];
+    }
+    (0..7).map(|day| day_number_to_date(number + day)).collect()
+}
+
+fn selection_label(anchor: &str, by_week: bool) -> String {
+    if !by_week {
+        return friendly_date(anchor);
+    }
+    let Some(number) = date_to_day_number(anchor) else {
+        return anchor.to_string();
+    };
+    let (_, first_month, first_day) = civil_from_day_number(number);
+    let (year, last_month, last_day) = civil_from_day_number(number + 6);
+    format!(
+        "{} {first_day} – {} {last_day}, {year}",
+        MONTH_NAMES[first_month as usize - 1],
+        MONTH_NAMES[last_month as usize - 1],
+    )
+}
+
+fn usage_total_for_days(tracker: Option<&UsageTracker>, days: &[String]) -> u64 {
+    days.iter()
+        .map(|day| usage_total_for_day(tracker, day))
+        .sum()
+}
+
+/// Focused time per tab across the selected days, busiest first. Totals merge
+/// on tab name so a week's worth of the same tab reads as one row.
+fn usage_breakdown(tracker: Option<&UsageTracker>, days: &[String]) -> Vec<(String, u64)> {
+    let mut totals: BTreeMap<String, u64> = BTreeMap::new();
+    for day in days {
+        let Some(tabs) = tracker.and_then(|value| value.store.days.get(day)) else {
+            continue;
+        };
+        for usage in tabs.values() {
+            *totals.entry(usage.name.clone()).or_default() += usage.seconds;
+        }
+    }
+    let mut rows: Vec<(String, u64)> = totals.into_iter().collect();
+    rows.sort_by(|(left_name, left), (right_name, right)| {
+        right.cmp(left).then_with(|| left_name.cmp(right_name))
+    });
+    rows
 }
 
 fn usage_total_for_day(tracker: Option<&UsageTracker>, day: &str) -> u64 {
@@ -2578,25 +2681,38 @@ fn daily_totals(
         .collect()
 }
 
-/// Restates daily totals as the quantity the chosen shading mode colors by.
-fn scaled_usage(daily: &[u64], scale: UsageScale) -> Vec<u64> {
+/// One value per week column: that week's total, or the running total across
+/// the range. A week is the unit here because a bar has a single height, unlike
+/// the daily grid where every day gets its own square.
+fn weekly_usage(daily: &[u64], scale: UsageScale) -> Vec<u64> {
+    let totals = daily.chunks(7).map(|week| week.iter().sum());
     match scale {
-        UsageScale::Daily => daily.to_vec(),
-        UsageScale::Weekly => daily
-            .chunks(7)
-            .flat_map(|week| {
-                let total: u64 = week.iter().sum();
-                std::iter::repeat_n(total, week.len())
-            })
-            .collect(),
-        UsageScale::Cumulative => daily
-            .iter()
-            .scan(0, |running, seconds| {
+        UsageScale::Cumulative => totals
+            .scan(0, |running, seconds: u64| {
                 *running += seconds;
                 Some(*running)
             })
             .collect(),
+        _ => totals.collect(),
     }
+}
+
+/// Height of one bar in eighths of a row, the resolution the block glyphs give.
+/// Any non-zero total keeps at least one eighth so a quiet week stays visible
+/// instead of vanishing into the baseline.
+fn bar_eighths(value: u64, peak: u64, rows: usize) -> usize {
+    if value == 0 || peak == 0 {
+        return 0;
+    }
+    let full = (rows * 8) as u64;
+    let scaled = (value.saturating_mul(full) + peak / 2) / peak;
+    (scaled.max(1) as usize).min(rows * 8)
+}
+
+/// The slice of a bar that falls in one row, counting up from the baseline.
+fn bar_glyph(eighths: usize, rows_below: usize) -> &'static str {
+    const LEVELS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    LEVELS[eighths.saturating_sub(rows_below * 8).min(8)]
 }
 
 fn usage_peak(values: &[u64], scale: UsageScale) -> u64 {
@@ -2618,9 +2734,6 @@ fn usage_level(value: u64, peak: u64) -> usize {
 
 /// Month names above the week columns they start in, GitHub-calendar style.
 fn month_header(start: i64, weeks: usize) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
     let grid_width = CALENDAR_GUTTER + weeks * CALENDAR_CELL_WIDTH;
     let mut header = " ".repeat(CALENDAR_GUTTER);
     let mut previous_month = None;
@@ -2634,7 +2747,7 @@ fn month_header(start: i64, weeks: usize) -> String {
         };
         previous_month = Some(month);
         let column = CALENDAR_GUTTER + week * CALENDAR_CELL_WIDTH;
-        let label = MONTHS[month as usize - 1];
+        let label = MONTH_NAMES[month as usize - 1];
         if starts_here && column >= header.len() && column + label.len() <= grid_width {
             header.push_str(&" ".repeat(column - header.len()));
             header.push_str(label);
@@ -2647,7 +2760,7 @@ fn month_header(start: i64, weeks: usize) -> String {
         header = format!(
             "{}{}",
             " ".repeat(CALENDAR_GUTTER),
-            MONTHS[month as usize - 1]
+            MONTH_NAMES[month as usize - 1]
         );
     }
     header
@@ -2784,15 +2897,15 @@ fn human_duration(seconds: u64) -> String {
 
 fn friendly_date(day: &str) -> String {
     const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
     let Some(number) = date_to_day_number(day) else {
         return day.to_string();
     };
     let (year, month, date) = civil_from_day_number(number);
     let weekday = WEEKDAYS[(number + 3).rem_euclid(7) as usize];
-    format!("{weekday}, {} {date}, {year}", MONTHS[month as usize - 1])
+    format!(
+        "{weekday}, {} {date}, {year}",
+        MONTH_NAMES[month as usize - 1]
+    )
 }
 
 fn date_to_day_number(day: &str) -> Option<i64> {
@@ -3279,6 +3392,34 @@ mod tests {
         assert_eq!(app.selected_day.as_deref(), Some("2026-08-06"));
     }
 
+    pub(super) fn tracker_with(
+        days: BTreeMap<String, BTreeMap<String, TabUsage>>,
+        today: &str,
+    ) -> UsageTracker {
+        let now = Instant::now();
+        UsageTracker {
+            store: UsageStore {
+                path: None,
+                days,
+                dirty: false,
+            },
+            current_day: today.to_string(),
+            last_focus: None,
+            last_seen: None,
+            away: None,
+            next_poll: now,
+            next_date_check: now,
+            next_flush: now,
+            next_inventory: now,
+            next_inventory_heartbeat: now,
+            next_resource_history: now,
+            last_inventory: Vec::new(),
+            pending_focus: None,
+            pending_inventory: None,
+            last_error: None,
+        }
+    }
+
     /// Drops SGR sequences so a rendered line can be measured in visible columns.
     fn strip_ansi(value: &str) -> String {
         let mut plain = String::new();
@@ -3497,17 +3638,101 @@ mod tests {
     }
 
     #[test]
-    fn shading_modes_restate_the_same_daily_totals() {
-        let daily: Vec<u64> = (1..=14).collect();
-        assert_eq!(scaled_usage(&daily, UsageScale::Daily), daily);
-        assert_eq!(
-            scaled_usage(&daily, UsageScale::Weekly),
-            [vec![28_u64; 7], vec![77_u64; 7]].concat()
+    fn charts_total_each_week_and_run_them_up() {
+        let daily: Vec<u64> = (1..=21).collect();
+        // 1..7, 8..14, 15..21
+        assert_eq!(weekly_usage(&daily, UsageScale::Weekly), [28, 77, 126]);
+        assert_eq!(weekly_usage(&daily, UsageScale::Cumulative), [28, 105, 231]);
+    }
+
+    #[test]
+    fn bars_scale_to_the_peak_and_keep_quiet_weeks_visible() {
+        let rows = 4;
+        let full = rows * 8;
+        assert_eq!(bar_eighths(0, 100, rows), 0);
+        assert_eq!(bar_eighths(100, 100, rows), full);
+        assert_eq!(bar_eighths(50, 100, rows), full / 2);
+        // Rounds to nothing on its own, but never disappears entirely.
+        assert_eq!(bar_eighths(1, 100_000, rows), 1);
+
+        // A bar fills whole rows from the baseline up, then a partial glyph.
+        assert_eq!(bar_glyph(full, rows - 1), "█");
+        assert_eq!(bar_glyph(8 + 4, 0), "█");
+        assert_eq!(bar_glyph(8 + 4, 1), "▄");
+        assert_eq!(bar_glyph(8 + 4, 2), " ");
+    }
+
+    #[test]
+    fn chart_columns_cover_whole_weeks_and_grid_cells_single_days() {
+        let today = "2026-08-06";
+        let today_number = date_to_day_number(today).unwrap();
+        let mut days = BTreeMap::new();
+        for offset in 0..30_i64 {
+            let mut tabs = BTreeMap::new();
+            tabs.insert(
+                "tab".to_string(),
+                TabUsage {
+                    name: "editor".into(),
+                    seconds: 600 + offset as u64 * 60,
+                },
+            );
+            days.insert(day_number_to_date(today_number - offset), tabs);
+        }
+
+        let mut app = App::new(Duration::from_secs(1));
+        app.view = View::Usage;
+        app.usage_tracker = Some(tracker_with(days, today));
+
+        app.usage_scale = UsageScale::Weekly;
+        let chart = render_usage(&app);
+        assert!(!chart.calendar_cells.is_empty());
+        for cell in &chart.calendar_cells {
+            let number = date_to_day_number(&cell.day).unwrap();
+            assert_eq!(sunday_index(number), 0, "columns anchor on a week start");
+        }
+
+        // Clicking a column selects the week it stands for.
+        let column = chart.calendar_cells[0].clone();
+        let click = MouseEvent {
+            button: 0,
+            column: column.start_column,
+            row: column.row,
+            pressed: true,
+        };
+        assert!(app.handle_mouse(click, &chart));
+        assert_eq!(app.selected_day.as_deref(), Some(column.day.as_str()));
+
+        app.usage_scale = UsageScale::Daily;
+        let grid = render_usage(&app);
+        let anchors: Vec<i64> = grid
+            .calendar_cells
+            .iter()
+            .filter_map(|cell| date_to_day_number(&cell.day))
+            .map(sunday_index)
+            .collect();
+        assert!(
+            anchors.iter().any(|index| *index != 0),
+            "grid cells are days"
         );
+    }
+
+    #[test]
+    fn a_chart_column_selects_its_whole_week() {
+        assert_eq!(selection_days("2026-08-02", false), ["2026-08-02"]);
         assert_eq!(
-            &scaled_usage(&daily, UsageScale::Cumulative)[..5],
-            &[1, 3, 6, 10, 15]
+            selection_days("2026-08-02", true),
+            [
+                "2026-08-02",
+                "2026-08-03",
+                "2026-08-04",
+                "2026-08-05",
+                "2026-08-06",
+                "2026-08-07",
+                "2026-08-08",
+            ]
         );
+        assert_eq!(selection_label("2026-08-02", false), "Sun, Aug 2, 2026");
+        assert_eq!(selection_label("2026-08-02", true), "Aug 2 – Aug 8, 2026");
     }
 
     #[test]
