@@ -4266,6 +4266,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn escapes_launch_agent_paths() {
         assert_eq!(
             xml_escape("A & B <tracker> \"path\""),
@@ -4274,6 +4275,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn parses_versioned_tab_inventory_records() {
         let record = [
             "true",
