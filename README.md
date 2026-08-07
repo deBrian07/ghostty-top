@@ -1,7 +1,7 @@
 # ghostty-top
 
 Shows how much CPU and memory each Ghostty tab is using, and how much time you
-spend in each one. macOS only.
+spend in each one.
 
 <img width="990" height="531" alt="image" src="https://github.com/user-attachments/assets/891eb8db-dd48-4bf3-8df8-13ce1d583e77" />
 
@@ -15,6 +15,12 @@ Or `npm install -g ghostty-top`. Or build it yourself with
 `cargo install --path .`.
 
 Nothing else to install and nothing to configure.
+
+**Linux:** build from source with `cargo install --path .`. The monitor works
+the same, but the usage calendar doesn't: Ghostty only reports which tab you're
+looking at on macOS, so there's no way to measure per-tab time elsewhere. Rows
+are named by folder instead of tab name for the same reason. The npm package
+ships a Mac binary only.
 
 ## Run it
 
@@ -51,8 +57,8 @@ Press `u`. There are three ways to look at it, with `d`, `w`, and `c`:
 Point at any square or bar to see its total. Click it to see which tabs the
 time went to.
 
-Time only counts when Ghostty is the app you're using and you're actually at
-your Mac. Nothing is counted when the lid is closed, when the screen has been
+This part is macOS only. Time only counts when Ghostty is the app you're using
+and you're actually at your Mac. Nothing is counted when the lid is closed, when the screen has been
 idle, or while the Mac is asleep.
 
 To keep counting when the monitor isn't open:

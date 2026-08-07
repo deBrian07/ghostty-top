@@ -18,8 +18,12 @@ concurrency:
 
 jobs:
   check:
-    name: Format, lint, test
-    runs-on: macos-latest
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -28,19 +32,39 @@ jobs:
           rustup update stable
           rustup default stable
           rustup component add rustfmt clippy
-          rustup target add x86_64-apple-darwin
 
       - name: Formatting
         run: cargo fmt --check
 
-      # Warnings fail the build: the tree is expected to be clippy-clean.
+      # Warnings fail the build: the tree is expected to be clippy-clean on
+      # both platforms, which is what keeps the cfg-gated code honest.
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
 
+      # Includes a test that parses the real `ps` output, so a wrong flag or
+      # column name for this platform fails here.
       - name: Tests
         run: cargo test
 
-      # Proves the release artefact still builds for both architectures.
+      - name: Smoke test
+        run: |
+          cargo build --release
+          ./target/release/ghostty-top --version
+          ./target/release/ghostty-top --once
+
+  package:
+    name: Release artefact
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add x86_64-apple-darwin
+
+      # Proves the published binary still builds for both Mac architectures.
       - name: Universal binary
         run: |
           ./scripts/build-binaries.sh

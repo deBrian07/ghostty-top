@@ -49,21 +49,70 @@ const CALENDAR_RAMP: [&str; 5] = [
     "\x1b[38;5;81m",
 ];
 /// How long the user may sit untouched before their focused time stops counting.
+#[cfg(target_os = "macos")]
 const MAX_IDLE: Duration = Duration::from_secs(5 * 60);
 /// A tab cannot be focused for longer than the day it is recorded against, so
 /// any larger value is corrupt. Bounding it here keeps every later total well
 /// inside u64 instead of overflowing on a hand-edited or truncated file.
 const MAX_DAILY_SECONDS: u64 = 24 * 60 * 60;
 const TAB_LABEL_REFRESH: Duration = Duration::from_secs(15);
+#[cfg(target_os = "macos")]
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(8);
 const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
 const USAGE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "macos")]
 const LAUNCH_AGENT_LABEL: &str = "com.debrian07.ghostty-top.tracker";
 const INVENTORY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const INVENTORY_HEARTBEAT: Duration = Duration::from_secs(15 * 60);
 const RESOURCE_HISTORY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const HISTORY_SCHEMA_VERSION: &str = "1";
+
+// Platform differences live here so the rest of the file stays one
+// implementation. macOS behaviour is unchanged: every macOS branch is the code
+// that was already here.
+
+/// `stty` names the device differently on each platform.
+#[cfg(target_os = "macos")]
+const STTY_FILE: &str = "-f";
+#[cfg(not(target_os = "macos"))]
+const STTY_FILE: &str = "-F";
+
+/// BSD `ps` takes `-axo`; procps wants `-eo` and spells the column `args`.
+#[cfg(target_os = "macos")]
+const PS_PROCESSES: [&str; 2] = ["-axo", "pid=,ppid=,tty=,%cpu=,rss=,etime=,command="];
+#[cfg(not(target_os = "macos"))]
+const PS_PROCESSES: [&str; 2] = ["-eo", "pid=,ppid=,tty=,%cpu=,rss=,etime=,args="];
+
+#[cfg(target_os = "macos")]
+const PS_COMMANDS: [&str; 2] = ["-axo", "command="];
+/// Ghostty only reports which tab is focused through its AppleScript
+/// dictionary, which exists on macOS alone. Without it there is no way to tell
+/// tabs apart, so focused-time tracking is a macOS feature.
+const TRACKS_FOCUS: bool = cfg!(target_os = "macos");
+
+/// Said once, wherever focused-time tracking is asked for and cannot be given.
+const FOCUS_UNAVAILABLE: &str =
+    "tracking which tab is focused needs macOS; Ghostty exposes no way to ask on this platform";
+
+/// A process attached to a terminal. `ps` writes no tty as `??` on macOS and
+/// `?` on Linux.
+fn has_tty(tty: &str) -> bool {
+    !tty.is_empty() && tty != "??" && tty != "?"
+}
+
+/// The process that owns a terminal surface. macOS Ghostty starts each surface
+/// through `/usr/bin/login`; on Linux it execs the shell straight away, so any
+/// child of Ghostty holding a tty is a surface.
+#[cfg(target_os = "macos")]
+fn is_terminal_root(process: &Process) -> bool {
+    is_login_process(&process.command)
+}
+#[cfg(not(target_os = "macos"))]
+fn is_terminal_root(_process: &Process) -> bool {
+    true
+}
 
 #[derive(Clone, Copy)]
 enum ServiceAction {
@@ -704,6 +753,9 @@ impl UsageTracker {
     }
 
     fn tick(&mut self, now: Instant) -> bool {
+        if !TRACKS_FOCUS {
+            return false;
+        }
         if now >= self.next_date_check {
             if let Some(day) = local_date() {
                 self.current_day = day;
@@ -872,6 +924,13 @@ fn resolve_tab_labels(shells: &[(String, i32)]) -> HashMap<String, String> {
 
 /// Tab names paired with each surface's working directory. Deliberately leaner
 /// than the telemetry inventory because it runs every few seconds.
+#[cfg(not(target_os = "macos"))]
+fn query_tab_names() -> Result<Vec<(String, String)>, String> {
+    // No scripting interface outside macOS, so rows fall back to directories.
+    Ok(Vec::new())
+}
+
+#[cfg(target_os = "macos")]
 fn query_tab_names() -> Result<Vec<(String, String)>, String> {
     if !ghostty_is_running() {
         return Ok(Vec::new());
@@ -902,6 +961,18 @@ end tell"#;
         .collect())
 }
 
+#[cfg(not(target_os = "macos"))]
+fn shell_working_directories(pids: &[i32]) -> HashMap<i32, String> {
+    // /proc answers this directly, with no process to spawn.
+    pids.iter()
+        .filter_map(|pid| {
+            let target = fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+            Some((*pid, target.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
 fn shell_working_directories(pids: &[i32]) -> HashMap<i32, String> {
     if pids.is_empty() {
         return HashMap::new();
@@ -996,6 +1067,7 @@ enum FocusUpdate {
 }
 
 /// Why focused time is not being counted right now.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Away {
     Idle,
@@ -1014,6 +1086,12 @@ impl Away {
 /// Detects the states where the user is not actually at the machine. System
 /// sleep needs no check here: the elapsed-time guard in `tick` discards the
 /// gap, because a sleeping Mac cannot poll in the first place.
+#[cfg(not(target_os = "macos"))]
+fn away_reason() -> Option<Away> {
+    None
+}
+
+#[cfg(target_os = "macos")]
 fn away_reason() -> Option<Away> {
     if lid_is_closed() {
         return Some(Away::LidClosed);
@@ -1025,6 +1103,7 @@ fn away_reason() -> Option<Away> {
     None
 }
 
+#[cfg(target_os = "macos")]
 fn lid_is_closed() -> bool {
     // Desktop Macs have no clamshell key at all, so a missing value means open.
     ioreg_value(
@@ -1034,6 +1113,7 @@ fn lid_is_closed() -> bool {
     .is_some_and(|state| state.trim() == "Yes")
 }
 
+#[cfg(target_os = "macos")]
 fn hid_idle_time() -> Option<Duration> {
     let nanoseconds: u64 = ioreg_value(&["-c", "IOHIDSystem", "-d", "4"], "HIDIdleTime")?
         .trim()
@@ -1043,6 +1123,7 @@ fn hid_idle_time() -> Option<Duration> {
 }
 
 /// Reads `"<key>" = <value>` out of an ioreg dump.
+#[cfg(target_os = "macos")]
 fn ioreg_value(arguments: &[&str], key: &str) -> Option<String> {
     let output = Command::new("ioreg")
         .args(arguments)
@@ -1122,6 +1203,7 @@ fn clear_demo_history_at(path: Option<PathBuf>) -> io::Result<usize> {
     Ok(changed_days)
 }
 
+#[cfg(target_os = "macos")]
 fn default_data_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| {
         PathBuf::from(home)
@@ -1131,6 +1213,18 @@ fn default_data_dir() -> Option<PathBuf> {
     })
 }
 
+#[cfg(not(target_os = "macos"))]
+fn default_data_dir() -> Option<PathBuf> {
+    let base = env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+        })?;
+    Some(base.join("ghostty-top"))
+}
+
+#[cfg(target_os = "macos")]
 fn launch_agent_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| {
         PathBuf::from(home)
@@ -1143,6 +1237,7 @@ fn launch_agent_path() -> Option<PathBuf> {
 /// True when a login tracker is installed but is a different build than this
 /// one. `--install-tracker` copies the binary to a fixed path, so upgrading
 /// leaves that copy behind and the background tracker silently runs old code.
+#[cfg(target_os = "macos")]
 fn tracker_is_outdated() -> bool {
     let Some(installed) = default_data_dir().map(|dir| dir.join("bin").join("ghostty-top")) else {
         return false;
@@ -1157,6 +1252,27 @@ fn tracker_is_outdated() -> bool {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+fn install_login_tracker() -> Result<(), String> {
+    Err(FOCUS_UNAVAILABLE.to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn uninstall_login_tracker() -> Result<(), String> {
+    Err(FOCUS_UNAVAILABLE.to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tracker_status() -> Result<(), String> {
+    Err(FOCUS_UNAVAILABLE.to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tracker_is_outdated() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
 fn install_login_tracker() -> Result<(), String> {
     let data_dir = default_data_dir().ok_or("could not find the home directory")?;
     let agent_path = launch_agent_path().ok_or("could not find the LaunchAgents directory")?;
@@ -1236,6 +1352,7 @@ fn install_login_tracker() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn uninstall_login_tracker() -> Result<(), String> {
     let data_dir = default_data_dir().ok_or("could not find the home directory")?;
     let agent_path = launch_agent_path().ok_or("could not find the LaunchAgents directory")?;
@@ -1253,6 +1370,7 @@ fn uninstall_login_tracker() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn tracker_status() -> Result<(), String> {
     let service = format!("{}/{LAUNCH_AGENT_LABEL}", launchd_domain());
     let status = Command::new("launchctl")
@@ -1266,10 +1384,12 @@ fn tracker_status() -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn launchd_domain() -> String {
     format!("gui/{}", unsafe { getuid() })
 }
 
+#[cfg(target_os = "macos")]
 fn run_launchctl<const N: usize>(arguments: [&str; N]) -> Result<(), String> {
     let status = Command::new("launchctl")
         .args(arguments)
@@ -1281,6 +1401,7 @@ fn run_launchctl<const N: usize>(arguments: [&str; N]) -> Result<(), String> {
         .ok_or_else(|| format!("launchctl exited with {status}"))
 }
 
+#[cfg(target_os = "macos")]
 fn remove_if_present(path: &PathBuf) -> Result<(), String> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1289,6 +1410,7 @@ fn remove_if_present(path: &PathBuf) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1320,6 +1442,12 @@ fn local_date() -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+#[cfg(not(target_os = "macos"))]
+fn query_focused_tab() -> Result<Option<FocusedTab>, String> {
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
 fn query_focused_tab() -> Result<Option<FocusedTab>, String> {
     if !ghostty_is_running() {
         return Ok(None);
@@ -1349,6 +1477,12 @@ end tell"#;
     }))
 }
 
+#[cfg(not(target_os = "macos"))]
+fn query_tab_inventory() -> Result<Vec<TabObservation>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(target_os = "macos")]
 fn query_tab_inventory() -> Result<Vec<TabObservation>, String> {
     if !ghostty_is_running() {
         return Ok(Vec::new());
@@ -1385,6 +1519,7 @@ end tell"#;
     parse_tab_inventory(&output)
 }
 
+#[cfg(target_os = "macos")]
 fn parse_tab_inventory(output: &str) -> Result<Vec<TabObservation>, String> {
     let mut observations = Vec::new();
     for record in output.trim_end().split('\x1e') {
@@ -1416,6 +1551,7 @@ fn parse_tab_inventory(output: &str) -> Result<Vec<TabObservation>, String> {
     Ok(observations)
 }
 
+#[cfg(target_os = "macos")]
 fn run_osascript(script: &str, timeout: Duration) -> Result<String, String> {
     let mut child = Command::new("osascript")
         .args(["-e", script])
@@ -1639,9 +1775,10 @@ fn unix_timestamp() -> u64 {
 /// `pgrep -x` compares against the full executable path on macOS, so it never
 /// matched the bundled binary and silently disabled every Ghostty query. The
 /// process list is matched the same way `aggregate` does it instead.
+#[cfg(target_os = "macos")]
 fn ghostty_is_running() -> bool {
     let Ok(output) = Command::new("ps")
-        .args(["-axo", "command="])
+        .args(PS_COMMANDS)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -1759,8 +1896,8 @@ fn main() {
         index += 1;
     }
 
-    if !cfg!(target_os = "macos") {
-        eprintln!("ghostty-top currently supports macOS only.");
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        eprintln!("ghostty-top supports macOS and Linux.");
         std::process::exit(1);
     }
 
@@ -1819,6 +1956,10 @@ fn main() {
     app.tracker_outdated = tracker_is_outdated();
 
     if track_only {
+        if !TRACKS_FOCUS {
+            eprintln!("Error: {FOCUS_UNAVAILABLE}");
+            std::process::exit(1);
+        }
         println!("Tracking focused Ghostty tab usage. Press Ctrl-C to stop.");
         let mut next_resource_refresh = Instant::now();
         let mut reported_tracking_error: Option<String> = None;
@@ -1916,6 +2057,7 @@ impl IsTerminal for io::Stdout {
 
 extern "C" {
     fn isatty(fd: i32) -> i32;
+    #[cfg(target_os = "macos")]
     fn getuid() -> u32;
 }
 
@@ -1927,7 +2069,7 @@ impl TerminalGuard {
     fn enter() -> Option<Self> {
         let original = String::from_utf8(
             Command::new("stty")
-                .args(["-f", "/dev/tty", "-g"])
+                .args([STTY_FILE, "/dev/tty", "-g"])
                 .output()
                 .ok()?
                 .stdout,
@@ -1937,7 +2079,7 @@ impl TerminalGuard {
         .to_string();
         let ok = Command::new("stty")
             .args([
-                "-f", "/dev/tty", "-echo", "-icanon", "-isig", "min", "0", "time", "0",
+                STTY_FILE, "/dev/tty", "-echo", "-icanon", "-isig", "min", "0", "time", "0",
             ])
             .status()
             .ok()?
@@ -1954,7 +2096,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = Command::new("stty")
-            .args(["-f", "/dev/tty", &self.original])
+            .args([STTY_FILE, "/dev/tty", &self.original])
             .status();
         print!("\x1b[?1003l\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l{RESET}");
         let _ = io::stdout().flush();
@@ -1968,7 +2110,7 @@ fn usage_and_exit(code: i32) -> ! {
 
 fn sample_processes() -> Result<Vec<Process>, String> {
     let output = Command::new("ps")
-        .args(["-axo", "pid=,ppid=,tty=,%cpu=,rss=,etime=,command="])
+        .args(PS_PROCESSES)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("could not run ps: {e}"))?;
@@ -2012,7 +2154,7 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
 
     let roots: Vec<&Process> = processes
         .iter()
-        .filter(|p| p.ppid == app.pid && p.tty != "??" && is_login_process(&p.command))
+        .filter(|p| p.ppid == app.pid && has_tty(&p.tty) && is_terminal_root(p))
         .collect();
     let mut owner: HashMap<i32, i32> = roots.iter().map(|p| (p.pid, p.pid)).collect();
     let by_parent = child_map(processes);
@@ -2466,7 +2608,9 @@ fn render_usage(app: &App, height: usize, width: usize) -> (Vec<String>, Layout)
         human_duration(range_total),
         human_duration(busiest),
     ));
-    if let Some(error) = tracker.and_then(|value| value.last_error.as_ref()) {
+    if !TRACKS_FOCUS {
+        lines.push(format!("{DIM}Not recording: {FOCUS_UNAVAILABLE}.{RESET}"));
+    } else if let Some(error) = tracker.and_then(|value| value.last_error.as_ref()) {
         lines.push(format!("{RED}Tracking paused: {error}{RESET}"));
     } else if let Some(away) = tracker.and_then(|value| value.away) {
         lines.push(format!("{DIM}Paused while {}.{RESET}", away.reason()));
@@ -3002,7 +3146,7 @@ fn civil_from_day_number(number: i64) -> (i64, i64, i64) {
 
 fn terminal_size() -> (usize, usize) {
     let output = Command::new("stty")
-        .args(["-f", "/dev/tty", "size"])
+        .args([STTY_FILE, "/dev/tty", "size"])
         .output();
     let Some(output) = output.ok().filter(|value| value.status.success()) else {
         return (24, 100);
@@ -4089,6 +4233,36 @@ mod tests {
         assert_eq!(again.days["2026-08-06"]["tab-ok"].seconds, 60);
         assert_eq!(again.days["2026-08-04"]["emoji"].name, "🐈‍⬛ 日本語 tab");
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Runs the real `ps` with this platform's arguments and parses the result,
+    /// which is what catches a wrong flag or column name on a new platform.
+    #[test]
+    fn reads_the_real_process_table() {
+        let processes = sample_processes().expect("ps should run");
+        assert!(
+            processes.len() > 5,
+            "expected a populated process table, got {}",
+            processes.len()
+        );
+        let own_pid = std::process::id() as i32;
+        let own = processes
+            .iter()
+            .find(|process| process.pid == own_pid)
+            .expect("this test process should appear in the table");
+        assert!(own.ppid > 0, "parsed a nonsense parent pid");
+        assert!(!own.command.is_empty(), "parsed an empty command");
+        assert!(own.rss_kib > 0, "parsed no resident memory");
+    }
+
+    #[test]
+    fn a_process_without_a_terminal_is_recognised_on_either_platform() {
+        assert!(has_tty("ttys001"));
+        assert!(has_tty("pts/3"));
+        // macOS writes no tty as `??`, Linux as `?`.
+        assert!(!has_tty("??"));
+        assert!(!has_tty("?"));
+        assert!(!has_tty(""));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {
   "name": "ghostty-top",
   "version": "0.1.0",
-  "description": "A per-terminal CPU and memory monitor for Ghostty on macOS",
+  "description": "A per-terminal CPU and memory monitor for Ghostty (macOS; Linux from source)",
   "license": "MIT",
   "author": "Brian Chen",
   "homepage": "https://github.com/deBrian07/ghostty-top",
