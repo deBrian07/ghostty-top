@@ -2033,7 +2033,7 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
             .collect();
         let cpu = members.iter().map(|p| p.cpu).sum();
         let rss_kib = members.iter().map(|p| p.rss_kib).sum();
-        members.sort_by(|a, b| b.rss_kib.cmp(&a.rss_kib));
+        members.sort_by_key(|process| std::cmp::Reverse(process.rss_kib));
         let activity = members
             .iter()
             .filter(|p| !is_login_process(&p.command) && !is_shell(&p.command))
