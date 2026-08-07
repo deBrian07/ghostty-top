@@ -56,6 +56,33 @@ under `script` when you need to see a real frame:
 (printf 'u'; sleep 3; printf 'q') | script -q /dev/null ./target/debug/ghostty-top
 ```
 
+## Two platforms
+
+macOS is the primary target; Linux runs the monitor. Every difference is
+`#[cfg]`-gated and collected near the top of the file — put new ones there
+rather than branching at the call site.
+
+- Data lives under `Application Support` on macOS and `XDG_DATA_HOME` on Linux.
+- `ps` is `-axo …command=` (BSD) versus `-eo …args=` (procps); `stty` takes
+  `-f` versus `-F`; no tty prints as `??` versus `?` (use `has_tty`).
+- A terminal's root process is `/usr/bin/login` on macOS. Linux Ghostty execs
+  the shell directly, so any child of Ghostty holding a tty is a surface.
+- Working directories come from `lsof` on macOS and `/proc/PID/cwd` on Linux.
+- **Focused-tab tracking is macOS only.** Ghostty reports the focused tab
+  through AppleScript and offers nothing equivalent elsewhere, so `TRACKS_FOCUS`
+  is false on Linux and the calendar says so. Do not fake it by watching window
+  focus: that measures the app, not the tab, and would quietly record wrong
+  numbers.
+
+CI runs the full suite on both platforms with `-D warnings`, so a `#[cfg]` that
+leaves dead code or an ungated test fails the build. Check both locally before
+pushing, and read the **exit code** rather than grepping the output:
+
+```sh
+cargo clippy --all-targets -- -D warnings
+cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
+```
+
 ## Releasing
 
 The npm package ships one **universal** binary and `bin` points straight at it.
