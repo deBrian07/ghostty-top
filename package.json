@@ -1,0 +1,41 @@
+{
+  "name": "ghostty-top",
+  "version": "0.1.0",
+  "description": "A per-terminal CPU and memory monitor for Ghostty on macOS",
+  "license": "MIT",
+  "author": "Brian Chen",
+  "homepage": "https://github.com/deBrian07/ghostty-top",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deBrian07/ghostty-top.git"
+  },
+  "bugs": {
+    "url": "https://github.com/deBrian07/ghostty-top/issues"
+  },
+  "keywords": [
+    "ghostty",
+    "terminal",
+    "monitor",
+    "htop",
+    "macos",
+    "cli"
+  ],
+  "bin": {
+    "ghostty-top": "binaries/ghostty-top"
+  },
+  "files": [
+    "binaries/ghostty-top",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "scripts": {
+    "build": "./scripts/build-binaries.sh"
+  }
+}

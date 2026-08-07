@@ -56,6 +56,24 @@ under `script` when you need to see a real frame:
 (printf 'u'; sleep 3; printf 'q') | script -q /dev/null ./target/debug/ghostty-top
 ```
 
+## Releasing
+
+The npm package ships one **universal** binary and `bin` points straight at it.
+There is deliberately no launcher script: Bun does not run install scripts by
+default, and a Bun-only user may have no Node to run a JS shim with. Keep it
+that way — a shim would break `bun install -g` for exactly the audience this
+tool is for.
+
+```sh
+rustup target add x86_64-apple-darwin   # once, for Intel support
+./scripts/build-binaries.sh             # lipo both slices into binaries/
+npm publish                             # version comes from package.json
+```
+
+`scripts/build-binaries.sh` warns and keeps going when a target is missing, so
+check its `lipo -info` output says `arm64 x86_64` before publishing. Keep
+`version` in `package.json` and `Cargo.toml` in step.
+
 ## Layout of `src/main.rs`
 
 Roughly in file order: constants and types, `App` (state and input handling),
