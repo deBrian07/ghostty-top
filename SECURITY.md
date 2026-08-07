@@ -6,7 +6,7 @@ Please don't open a public issue for a security problem.
 
 Report it at
 [Security → Report a vulnerability](https://github.com/deBrian07/ghostty-top/security/advisories/new),
-which is private. Expect a reply within a week.
+which is private. Expect a reply within a day.
 
 ## What this tool can see
 
