@@ -36,10 +36,12 @@ No runtime dependencies or elevated permissions are required.
 
 ## Controls
 
-Mouse controls work directly in Ghostty: click a terminal to select it, click
-the selected terminal again to expand its processes, use the scroll wheel to
-move through the list, or click a column heading to sort by it. The active sort
-column is highlighted, and the hint line along the bottom is clickable too.
+The interface can be driven entirely by mouse. Click a terminal to select it,
+click the selected terminal again to expand its processes, scroll to move
+through the list, and click a column heading to sort by it — clicking the same
+heading again reverses the order. The sorted heading is highlighted and shows a
+direction arrow. Every control along the bottom is clickable, as are the
+calendar's squares and its shading modes.
 
 | Key | Action |
 | --- | --- |
@@ -53,7 +55,7 @@ column is highlighted, and the hint line along the bottom is clickable too.
 | `a` | Sort by terminal age |
 | `n` | Sort by activity name |
 | `t` | Sort by tab name |
-| `r` | Reverse current sort |
+| `r` | Reverse current sort (or click the heading again) |
 | `u` | Toggle the usage calendar |
 | `d` / `w` / `c` | Calendar shading: daily, weekly, or cumulative |
 | `q` or Ctrl-C | Quit |
