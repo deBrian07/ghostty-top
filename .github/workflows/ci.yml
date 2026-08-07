@@ -1,0 +1,50 @@
+name: CI
+
+# `pull_request` (never `pull_request_target`) means a fork's code runs with no
+# access to repository secrets, so an untrusted pull request cannot exfiltrate
+# anything or write to the repository.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to the same branch supersedes the previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Format, lint, test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustup target add x86_64-apple-darwin
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      # Warnings fail the build: the tree is expected to be clippy-clean.
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+      # Proves the release artefact still builds for both architectures.
+      - name: Universal binary
+        run: |
+          ./scripts/build-binaries.sh
+          lipo -info binaries/ghostty-top | grep -q 'x86_64 arm64'
+
+      - name: Package
+        run: npm pack --dry-run

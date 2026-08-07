@@ -1,0 +1,66 @@
+name: Bug report
+description: Something isn't working
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce it
+      placeholder: |
+        1. Run ghostty-top
+        2. Press u
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `ghostty-top --version`
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "15.5"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: chip
+    attributes:
+      label: Mac type
+      options:
+        - Apple Silicon (M1 or newer)
+        - Intel
+    validations:
+      required: true
+
+  - type: input
+    id: ghostty
+    attributes:
+      label: Ghostty version
+      description: Ghostty → About Ghostty
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: |
+        A screenshot helps for anything visual. If the tab names or usage
+        calendar are wrong, `ghostty-top --once` output is useful too.
+    validations:
+      required: false

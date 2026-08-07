@@ -1,0 +1,30 @@
+name: Idea
+description: Suggest something
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's the problem
+      description: What are you trying to do that's hard or impossible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help
+      description: If you have something specific in mind, describe it.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Please confirm
+      description: >
+        ghostty-top has no dependencies and nothing to configure, and both are
+        deliberate. Ideas that need either are unlikely to be accepted.
+      options:
+        - label: This wouldn't need a new dependency
+        - label: This wouldn't need setup or configuration from the user
