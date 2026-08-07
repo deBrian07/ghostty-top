@@ -129,12 +129,17 @@ variables, or full command arguments, which may contain secrets. It retains the
 executable name and path so workloads remain classifiable without storing
 tokens or passwords. It does not send usage data anywhere.
 
-Press `u` to open the usage calendar. Every square is one day, and brighter
-squares represent more focused Ghostty time; the grid fits as many weeks as the
-window allows, up to a full year. Hover a square for its total, or click it for
-that day's per-tab breakdown. `d`, `w`, and `c` switch shading between the day's
-own total, its week's total, and a running total across the range. Press `u` to
-return to live process usage.
+Press `u` to open the usage calendar. It has three views, switched with `d`,
+`w`, and `c` or by clicking their names:
+
+- **daily** — one square per day, brighter for more focused time, fitting as
+  many weeks as the window allows up to a full year.
+- **weekly** — a bar per week, scaled against the busiest one.
+- **cumulative** — the same bars running the total up across the range.
+
+All three share the same week columns, so the month labels line up between
+them. Hover a square or column for its total, or click it for the per-tab
+breakdown of that day or week. Press `u` to return to live process usage.
 
 To populate most of the previous 55 days with deterministic, varied calendar
 test data, run `ghostty-top --seed-demo-history`. Demo rows use reserved
