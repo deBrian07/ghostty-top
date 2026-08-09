@@ -1789,20 +1789,24 @@ fn append_resource_history(
     terminals: &[Terminal],
     ghostty: Option<&Process>,
 ) -> io::Result<()> {
-    let Some(path) = default_data_dir().map(|directory| directory.join("resources-v1.tsv")) else {
+    // v2 adds footprint and the leaking process's name. The header is written
+    // once, when the file is created, so a new column means a new file rather
+    // than rows that no longer match the heading above them.
+    let Some(path) = default_data_dir().map(|directory| directory.join("resources-v2.tsv")) else {
         return Ok(());
     };
     let mut file = open_history_file(
         &path,
-        "timestamp\tday\tkind\tid\tcpu_percent\trss_kib\tprocesses\tage_seconds\tactivity\tmemory_growth_kib\tleak_suspected",
+        "timestamp\tday\tkind\tid\tcpu_percent\tfootprint_kib\trss_kib\tprocesses\tage_seconds\tactivity\tmemory_growth_kib\tleak_suspected\tleak_process",
     )?;
     let timestamp = unix_timestamp();
     if let Some(process) = ghostty {
         writeln!(
             file,
-            "{timestamp}\t{}\tapp\tghostty\t{:.1}\t{}\t1\t{}\tghostty\t0\tfalse",
+            "{timestamp}\t{}\tapp\tghostty\t{:.1}\t{}\t{}\t1\t{}\tghostty\t0\tfalse\t",
             clean_field(day),
             process.cpu,
+            process.footprint_kib,
             process.rss_kib,
             process.age_seconds,
         )?;
@@ -1810,16 +1814,18 @@ fn append_resource_history(
     for terminal in terminals {
         writeln!(
             file,
-            "{timestamp}\t{}\tterminal\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{timestamp}\t{}\tterminal\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             clean_field(day),
             clean_field(&terminal.tty),
             terminal.cpu,
+            terminal.footprint_kib,
             terminal.rss_kib,
             terminal.processes.len(),
             terminal.age_seconds,
             clean_field(&terminal.activity),
             terminal.memory_growth_kib,
             terminal.leak_suspected,
+            clean_field(&terminal.leak_process),
         )?;
     }
     append_process_history(timestamp, day, terminals, ghostty)?;
@@ -1832,12 +1838,12 @@ fn append_process_history(
     terminals: &[Terminal],
     ghostty: Option<&Process>,
 ) -> io::Result<()> {
-    let Some(path) = default_data_dir().map(|directory| directory.join("processes-v1.tsv")) else {
+    let Some(path) = default_data_dir().map(|directory| directory.join("processes-v2.tsv")) else {
         return Ok(());
     };
     let mut file = open_history_file(
         &path,
-        "timestamp\tday\tkind\tterminal_tty\tterminal_root_pid\tpid\tppid\tcpu_percent\trss_kib\tage_seconds\tstarted_at\texecutable_name\texecutable_path",
+        "timestamp\tday\tkind\tterminal_tty\tterminal_root_pid\tpid\tppid\tcpu_percent\tfootprint_kib\trss_kib\tage_seconds\tstarted_at\texecutable_name\texecutable_path",
     )?;
     if let Some(process) = ghostty {
         writeln!(
@@ -1875,13 +1881,14 @@ fn process_history_row(
 ) -> String {
     let executable_path = process.command.split_whitespace().next().unwrap_or("?");
     format!(
-        "{timestamp}\t{}\t{}\t{}\t{terminal_root_pid}\t{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}",
+        "{timestamp}\t{}\t{}\t{}\t{terminal_root_pid}\t{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}",
         clean_field(day),
         clean_field(kind),
         clean_field(terminal_tty),
         process.pid,
         process.ppid,
         process.cpu,
+        process.footprint_kib,
         process.rss_kib,
         process.age_seconds,
         timestamp.saturating_sub(process.age_seconds),
@@ -4800,8 +4807,11 @@ mod tests {
             4096,
             "/usr/bin/python3 server.py --token secret",
         );
+        let mut process = process;
+        process.footprint_kib = 8192;
         let row = process_history_row(1_000, "2026-08-06", "terminal", "ttys001", 7, &process);
-        assert!(row.contains("\t42\t7\t12.5\t4096\t"));
+        // pid, ppid, cpu, footprint, resident.
+        assert!(row.contains("\t42\t7\t12.5\t8192\t4096\t"));
         assert!(row.ends_with("\tpython3\t/usr/bin/python3"));
         assert!(!row.contains("server.py"));
         assert!(!row.contains("secret"));
