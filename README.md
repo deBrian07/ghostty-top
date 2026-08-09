@@ -86,10 +86,15 @@ Ghostty. That permission is only needed once.
 
 - CPU adds up every process in a tab, so it can go over 100% on a Mac with
   several cores.
+- RAM is the same number Activity Monitor shows. It counts memory the Mac has
+  compressed or moved to disk, not just what is in RAM right now, so it is often
+  much bigger than the "resident" number `ps` and `top` print. Press `enter` on
+  a tab to see both side by side.
 - Memory adds up each process, and programs often share memory, so treat the
   number as a rough guide.
-- A **leak warning** means a tab's memory has been climbing steadily for a few
-  minutes. It's worth a look, but it isn't proof of a problem.
+- A **leak warning** points at one process whose memory has been climbing
+  steadily for a few minutes. It's worth a look, but it isn't proof of a
+  problem.
 
 Run `ghostty-top --help` to see every option.
 

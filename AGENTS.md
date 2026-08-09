@@ -14,11 +14,11 @@ These are the rules that shape most decisions here. Check a change against them
 before writing code.
 
 - **Zero dependencies.** `Cargo.lock` contains exactly one package: this one.
-  Everything is the standard library plus command-line tools that ship with
-  macOS (`ps`, `lsof`, `ioreg`, `osascript`, `stty`, `launchctl`, `pgrep`).
-  Do not add a crate. If something seems to need one, it almost certainly does
-  not — the TUI, the ANSI handling, the mouse decoding, and the civil-date maths
-  are all hand-rolled here already.
+  Everything is the standard library, command-line tools that ship with macOS
+  (`ps`, `lsof`, `ioreg`, `osascript`, `stty`, `launchctl`, `pgrep`), and one
+  libSystem call. Do not add a crate. If something seems to need one, it almost
+  certainly does not — the TUI, the ANSI handling, the mouse decoding, and the
+  civil-date maths are all hand-rolled here already.
 - **Setup stays trivial.** Build and run; no config file, no flags required, no
   setup steps. The intent is for this to be installable with a single command
   (a Bun-installable package is the eventual goal), so anything that adds an
@@ -35,7 +35,7 @@ before writing code.
 
 ```sh
 cargo build              # or --release
-cargo test               # 32 unit tests, all in the tests module in main.rs
+cargo test               # 51 unit tests, all in the tests module in main.rs
 cargo clippy --all-targets   # expected to be silent
 cargo fmt
 ```
@@ -68,6 +68,20 @@ rather than branching at the call site.
 - A terminal's root process is `/usr/bin/login` on macOS. Linux Ghostty execs
   the shell directly, so any child of Ghostty holding a tty is a surface.
 - Working directories come from `lsof` on macOS and `/proc/PID/cwd` on Linux.
+- **Memory comes from `phys_footprint_kib`, not `ps`.** The RAM column has to
+  agree with Activity Monitor, which reports physical footprint: dirty pages
+  plus everything compressed or swapped out, plus IOKit mappings. Resident size
+  misses all of that and had Ghostty at 109 MB against a real 1763 MB. `ps` has
+  no keyword for it, `footprint -a` needs root, and `footprint -p` costs 50–110
+  ms per pid, so macOS calls `proc_pid_rusage` directly and Linux reads
+  `Pss` + `Swap` from `/proc/PID/smaps_rollup`.
+- **That FFI is the only `unsafe` in the tree.** Keep it that way, and keep it
+  in `phys_footprint_kib` rather than at a call site. `RUSAGE_INFO_V2` has been
+  frozen since macOS 10.9 and the flavor argument is the ABI's own versioning,
+  so the struct must match it field for field;
+  `reads_a_real_physical_footprint` is the test that catches it if it ever
+  stops matching. A failed reading must return `None` so the caller falls back
+  to resident size — never report a live process as using no memory.
 - **Focused-tab tracking is macOS only.** Ghostty reports the focused tab
   through AppleScript and offers nothing equivalent elsewhere, so `TRACKS_FOCUS`
   is false on Linux and the calendar says so. Do not fake it by watching window
@@ -146,6 +160,22 @@ The join is therefore ambiguous whenever two tabs share a directory, and
 `resolve_tab_labels` deliberately refuses to name a row unless exactly one
 surface owns that directory. Showing the directory is correct; guessing a name
 puts the wrong label on a row. Do not "improve" this into a heuristic.
+
+**Leaks are judged per process, trends per tab.** `App.memory_history` is
+keyed by pid and `App.tab_memory_history` by root pid, and they are not
+interchangeable. A tab's total jumps every time a subprocess starts or exits, so
+judging a leak from it meant an actively used tab — the one most worth watching
+— never held still long enough to accumulate the 8 samples over 3 minutes that a
+warning needs. A pid keeps its identity across that churn. `MemoryHistory` is
+reset only when a pid reports itself younger than last time, which is a recycled
+pid rather than the same process. `a_transient_child_does_not_erase_leak_evidence`
+is the regression test; do not reintroduce a reset keyed on the member list.
+
+**The tab's activity comes from the tty's foreground process group.** A process
+that is its own group's leader and whose group is the tty's `tpgid` is what the
+tab is running. This used to be a guess at the highest-CPU process, which named
+a background `ffmpeg` over the program in front of the user. The busiest-process
+rule survives only as the fallback for when `ps` reports no foreground group.
 
 **Tracking correctness beats tracking coverage.** Time is credited only when
 Ghostty is frontmost, the user is present (`away_reason`), and both the
