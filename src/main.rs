@@ -2263,6 +2263,22 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
     for root in &roots {
         assign_descendants(root.pid, root.pid, &by_parent, &mut owner);
     }
+    // A process that was disowned, `nohup`ed, or orphaned when its parent died
+    // gets reparented to pid 1, which puts it out of reach of the walk above.
+    // It still holds the tab's terminal though, so claim it back by tty rather
+    // than let its memory quietly leave the tab's total.
+    let root_by_tty: HashMap<&str, i32> = roots
+        .iter()
+        .map(|root| (root.tty.as_str(), root.pid))
+        .collect();
+    for process in processes {
+        if owner.contains_key(&process.pid) {
+            continue;
+        }
+        if let Some(root_pid) = root_by_tty.get(process.tty.as_str()) {
+            owner.insert(process.pid, *root_pid);
+        }
+    }
 
     let self_pid = std::process::id() as i32;
     let mut terminals = Vec::with_capacity(roots.len());
@@ -3657,6 +3673,40 @@ mod tests {
         assert_eq!(terminals[0].rss_kib, 60);
         assert_eq!(terminals[0].activity, "node");
         assert_eq!(terminals[1].cpu, 1.0);
+    }
+
+    #[test]
+    fn a_reparented_process_is_still_counted_in_its_tab() {
+        let processes = vec![
+            p(
+                10,
+                1,
+                "??",
+                0.0,
+                100,
+                "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+            ),
+            p(
+                20,
+                10,
+                "ttys001",
+                0.0,
+                10,
+                "/usr/bin/login -flp me /bin/zsh",
+            ),
+            p(21, 20, "ttys001", 0.0, 20, "-/bin/zsh"),
+            // Disowned: adopted by pid 1, so no ppid chain leads back to the
+            // login root, but it still holds ttys001.
+            p(22, 1, "ttys001", 3.0, 500, "node server.js"),
+        ];
+        let (_, terminals) = aggregate(&processes);
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(
+            terminals[0].rss_kib, 530,
+            "the orphan's memory went missing"
+        );
+        assert_eq!(terminals[0].cpu, 3.0);
+        assert!(terminals[0].processes.iter().any(|p| p.pid == 22));
     }
 
     #[test]
