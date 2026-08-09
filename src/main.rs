@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -29,6 +29,9 @@ const MIN_LEAK_R_SQUARED: f64 = 0.70;
 const MIN_UPWARD_SAMPLE_RATIO: f64 = 0.70;
 const LEAK_CONFIRMATION_WINDOWS: u8 = 3;
 const LEAK_CLEAR_WINDOWS: u8 = 10;
+/// Leak history is kept per process, so a floor keeps the bookkeeping to the
+/// handful of processes big enough to matter. A 3 MiB shim is not the leak.
+const MIN_TRACKED_FOOTPRINT_KIB: u64 = 32 * 1024;
 const CALENDAR_GUTTER: usize = 4;
 const CALENDAR_CELL_WIDTH: usize = 2;
 const CALENDAR_MIN_WEEKS: usize = 4;
@@ -372,6 +375,9 @@ struct Terminal {
     memory_slope_kib_per_min: f64,
     memory_samples: usize,
     leak_suspected: bool,
+    /// The process a leak warning is about, and how much it has grown.
+    leak_process: String,
+    leak_growth_kib: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -423,10 +429,31 @@ impl UsageScale {
 #[derive(Default)]
 struct MemoryHistory {
     samples: VecDeque<(Instant, u64)>,
-    process_ids: Vec<i32>,
+    /// How old the subject was when last sampled. Something that suddenly
+    /// reports itself younger is a different process wearing a recycled pid,
+    /// and its predecessor's samples have to go.
+    age_seconds: u64,
     suspicious_windows: u8,
     clear_windows: u8,
     alert_active: bool,
+}
+
+impl MemoryHistory {
+    fn record(&mut self, now: Instant, footprint_kib: u64, age_seconds: u64) -> MemoryTrend {
+        if age_seconds < self.age_seconds {
+            *self = MemoryHistory::default();
+        }
+        self.age_seconds = age_seconds;
+        self.samples.push_back((now, footprint_kib));
+        while self
+            .samples
+            .front()
+            .is_some_and(|(time, _)| now.duration_since(*time) > HISTORY_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+        analyze_memory_history(&self.samples)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -502,7 +529,10 @@ struct App {
     expanded: bool,
     interval: Duration,
     last_error: Option<String>,
+    /// Keyed by pid: the evidence a leak warning rests on.
     memory_history: HashMap<i32, MemoryHistory>,
+    /// Keyed by root pid: the tab total behind the TREND column.
+    tab_memory_history: HashMap<i32, MemoryHistory>,
     labels: LabelCache,
     usage_tracker: Option<UsageTracker>,
     view: View,
@@ -524,6 +554,7 @@ impl App {
             interval,
             last_error: None,
             memory_history: HashMap::new(),
+            tab_memory_history: HashMap::new(),
             labels: LabelCache::default(),
             usage_tracker: None,
             view: View::Monitor,
@@ -687,40 +718,67 @@ impl App {
         sort_terminals(&mut self.terminals, self.sort, self.descending);
     }
 
+    /// Two series are kept. The tab's total drives the TREND column, which is
+    /// only ever a description of what memory did. A leak is a much stronger
+    /// claim, so it is judged per process: a pid keeps its identity across the
+    /// subprocesses a tab spawns, whereas the total jumps every time one starts
+    /// or exits. Judging the total meant an actively used tab — the one most
+    /// likely to be leaking — never held still long enough to be measured.
     fn update_memory_trends(&mut self, terminals: &mut [Terminal], now: Instant) {
-        self.memory_history.retain(|root_pid, _| {
+        let live: HashSet<i32> = terminals
+            .iter()
+            .flat_map(|terminal| terminal.processes.iter().map(|process| process.pid))
+            .collect();
+        self.memory_history.retain(|pid, _| live.contains(pid));
+        self.tab_memory_history.retain(|root_pid, _| {
             terminals
                 .iter()
                 .any(|terminal| terminal.root_pid == *root_pid)
         });
+
         for terminal in terminals {
-            let history = self.memory_history.entry(terminal.root_pid).or_default();
-            let mut process_ids: Vec<i32> = terminal
-                .processes
-                .iter()
-                .map(|process| process.pid)
-                .collect();
-            process_ids.sort_unstable();
-            if history.process_ids != process_ids {
-                history.samples.clear();
-                history.suspicious_windows = 0;
-                history.clear_windows = 0;
-                history.alert_active = false;
-                history.process_ids = process_ids;
-            }
-            history.samples.push_back((now, terminal.footprint_kib));
-            while history
-                .samples
-                .front()
-                .is_some_and(|(time, _)| now.duration_since(*time) > HISTORY_WINDOW)
-            {
-                history.samples.pop_front();
-            }
-            let trend = analyze_memory_history(&history.samples);
+            let tab = self
+                .tab_memory_history
+                .entry(terminal.root_pid)
+                .or_default();
+            let trend = tab.record(now, terminal.footprint_kib, terminal.age_seconds);
             terminal.memory_growth_kib = trend.growth_kib;
             terminal.memory_slope_kib_per_min = trend.slope_kib_per_min;
-            terminal.memory_samples = history.samples.len();
-            terminal.leak_suspected = update_leak_state(history, trend.suspected);
+            terminal.memory_samples = tab.samples.len();
+
+            // Whichever process has grown most among those that look like they
+            // are leaking gets named; a tab is only as suspect as its worst one.
+            let mut worst: Option<(String, i64)> = None;
+            for process in &terminal.processes {
+                // Small processes are ignored until they grow into the floor,
+                // but one already being watched keeps its history.
+                if process.footprint_kib < MIN_TRACKED_FOOTPRINT_KIB
+                    && !self.memory_history.contains_key(&process.pid)
+                {
+                    continue;
+                }
+                let history = self.memory_history.entry(process.pid).or_default();
+                let trend = history.record(now, process.footprint_kib, process.age_seconds);
+                if update_leak_state(history, trend.suspected)
+                    && worst
+                        .as_ref()
+                        .is_none_or(|(_, growth)| trend.growth_kib > *growth)
+                {
+                    worst = Some((command_name(&process.command), trend.growth_kib));
+                }
+            }
+            match worst {
+                Some((name, growth)) => {
+                    terminal.leak_suspected = true;
+                    terminal.leak_process = name;
+                    terminal.leak_growth_kib = growth;
+                }
+                None => {
+                    terminal.leak_suspected = false;
+                    terminal.leak_process.clear();
+                    terminal.leak_growth_kib = 0;
+                }
+            }
         }
     }
 
@@ -2346,6 +2404,8 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
             memory_slope_kib_per_min: 0.0,
             memory_samples: 0,
             leak_suspected: false,
+            leak_process: String::new(),
+            leak_growth_kib: 0,
         });
     }
     (ghostty, terminals)
@@ -2688,9 +2748,9 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
             ));
             if terminal.leak_suspected {
                 lines.push(format!(
-                    "{BOLD}{RED}⚠ Potential memory leak: {} since tracking began ({}/min){RESET}",
-                    signed_human_kib(terminal.memory_growth_kib),
-                    signed_human_kib(terminal.memory_slope_kib_per_min.round() as i64),
+                    "{BOLD}{RED}⚠ Potential memory leak in {}: {} since tracking began{RESET}",
+                    terminal.leak_process,
+                    signed_human_kib(terminal.leak_growth_kib),
                 ));
             }
             lines.push(format!(
@@ -3584,32 +3644,67 @@ mod tests {
         assert!(!update_leak_state(&mut history, false));
     }
 
+    /// The regression test for the reason leak detection never used to fire on
+    /// a busy tab: a subprocess starting or exiting wiped the evidence, and the
+    /// tabs that spawn subprocesses are exactly the ones worth watching.
     #[test]
-    fn process_tree_changes_reset_leak_evidence() {
+    fn a_transient_child_does_not_erase_leak_evidence() {
         let start = Instant::now();
         let mut app = App::new(Duration::from_secs(1));
+        let leaker = |megabytes: u64, age: u64| {
+            let mut process = p(11, 10, "ttys001", 0.0, megabytes * 1024, "node server.js");
+            process.age_seconds = age;
+            process
+        };
         let mut terminals = vec![Terminal {
             root_pid: 10,
             tty: "ttys001".into(),
-            rss_kib: 100 * 1024,
-            processes: vec![p(10, 1, "ttys001", 0.0, 100 * 1024, "zsh")],
+            processes: vec![leaker(100, 60)],
             ..Terminal::default()
         }];
-        app.update_memory_trends(&mut terminals, start);
-        let history = app.memory_history.get_mut(&10).unwrap();
+
+        for step in 0..12 {
+            terminals[0].processes = vec![leaker(100 + step * 12, 60 + step * 20)];
+            // Every other tick a short-lived `ps` or `sh` appears, the way a
+            // tab running a coding agent behaves.
+            if step % 2 == 0 {
+                terminals[0].processes.push(p(
+                    900 + step as i32,
+                    11,
+                    "ttys001",
+                    0.0,
+                    2 * 1024,
+                    "ps",
+                ));
+            }
+            terminals[0].footprint_kib =
+                terminals[0].processes.iter().map(|p| p.footprint_kib).sum();
+            app.update_memory_trends(&mut terminals, start + Duration::from_secs(step * 20));
+        }
+
+        let history = &app.memory_history[&11];
+        assert!(
+            history.samples.len() >= MIN_LEAK_SAMPLES,
+            "evidence was thrown away: only {} samples survived",
+            history.samples.len()
+        );
+        assert!(terminals[0].leak_suspected, "steady growth went unnoticed");
+        assert_eq!(terminals[0].leak_process, "node");
+    }
+
+    #[test]
+    fn a_reused_pid_resets_its_own_history() {
+        let start = Instant::now();
+        let mut history = MemoryHistory::default();
+        history.record(start, 100 * 1024, 600);
+        history.record(start + Duration::from_secs(1), 110 * 1024, 601);
+        assert_eq!(history.samples.len(), 2);
         history.alert_active = true;
-        history.suspicious_windows = LEAK_CONFIRMATION_WINDOWS;
 
-        terminals[0]
-            .processes
-            .push(p(11, 10, "ttys001", 0.0, 80 * 1024, "node server.js"));
-        terminals[0].rss_kib = 180 * 1024;
-        app.update_memory_trends(&mut terminals, start + Duration::from_secs(1));
-
-        let history = &app.memory_history[&10];
+        // A pid that reports itself younger than before is a new process.
+        history.record(start + Duration::from_secs(2), 4 * 1024, 1);
         assert_eq!(history.samples.len(), 1);
-        assert!(!history.alert_active);
-        assert!(!terminals[0].leak_suspected);
+        assert!(!history.alert_active, "kept a dead process's leak alert");
     }
 
     #[test]
@@ -4367,6 +4462,8 @@ mod tests {
                 memory_slope_kib_per_min: 12.0,
                 memory_samples: 20,
                 leak_suspected: index % 4 == 0,
+                leak_process: "node".into(),
+                leak_growth_kib: 96 * 1024,
             });
         }
         app
