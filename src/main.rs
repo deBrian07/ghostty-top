@@ -81,9 +81,15 @@ const STTY_FILE: &str = "-F";
 
 /// BSD `ps` takes `-axo`; procps wants `-eo` and spells the column `args`.
 #[cfg(target_os = "macos")]
-const PS_PROCESSES: [&str; 2] = ["-axo", "pid=,ppid=,tty=,%cpu=,rss=,etime=,command="];
+const PS_PROCESSES: [&str; 2] = [
+    "-axo",
+    "pid=,ppid=,pgid=,tpgid=,tty=,%cpu=,rss=,etime=,command=",
+];
 #[cfg(not(target_os = "macos"))]
-const PS_PROCESSES: [&str; 2] = ["-eo", "pid=,ppid=,tty=,%cpu=,rss=,etime=,args="];
+const PS_PROCESSES: [&str; 2] = [
+    "-eo",
+    "pid=,ppid=,pgid=,tpgid=,tty=,%cpu=,rss=,etime=,args=",
+];
 
 #[cfg(target_os = "macos")]
 const PS_COMMANDS: [&str; 2] = ["-axo", "command="];
@@ -290,6 +296,12 @@ struct InputDecoder {
 struct Process {
     pid: i32,
     ppid: i32,
+    /// The process group this belongs to, and the group the tty is currently
+    /// giving the keyboard to. When a process is its own group's leader and
+    /// that group is the tty's foreground group, it is the program the tab is
+    /// running. `ps` reports no foreground group as `-1`.
+    pgid: i32,
+    tpgid: i32,
     tty: String,
     cpu: f64,
     rss_kib: u64,
@@ -2224,6 +2236,8 @@ fn parse_process(line: &str) -> Option<Process> {
     let mut fields = line.split_whitespace();
     let pid = fields.next()?.parse().ok()?;
     let ppid = fields.next()?.parse().ok()?;
+    let pgid = fields.next()?.parse().ok()?;
+    let tpgid = fields.next()?.parse().ok()?;
     let tty = fields.next()?.to_string();
     let cpu = fields.next()?.replace(',', ".").parse().ok()?;
     let rss_kib = fields.next()?.parse().ok()?;
@@ -2233,6 +2247,8 @@ fn parse_process(line: &str) -> Option<Process> {
     Some(Process {
         pid,
         ppid,
+        pgid,
+        tpgid,
         tty,
         cpu,
         rss_kib,
@@ -2295,12 +2311,26 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
         let rss_kib = members.iter().map(|p| p.rss_kib).sum();
         let footprint_kib = members.iter().map(|p| p.footprint_kib).sum();
         members.sort_by_key(|process| std::cmp::Reverse(process.footprint_kib));
-        let activity = members
-            .iter()
-            .filter(|p| !is_login_process(&p.command) && !is_shell(&p.command))
-            .max_by(|a, b| a.cpu.total_cmp(&b.cpu).then(a.rss_kib.cmp(&b.rss_kib)))
-            .map(|p| command_name(&p.command))
-            .unwrap_or_else(|| "shell".to_string());
+        // The kernel already knows what the tab is running: the tty hands the
+        // keyboard to one process group, and that group's leader is the
+        // program. Guessing from CPU used to name a busy background job.
+        let foreground = members.iter().find(|p| {
+            p.tpgid > 0 && p.pid == p.pgid && p.pgid == p.tpgid && !is_login_process(&p.command)
+        });
+        let activity = match foreground {
+            // A tab sitting at its prompt is running its shell, which is worth
+            // saying plainly rather than by name.
+            Some(process) if is_shell(&process.command) => "shell".to_string(),
+            Some(process) => command_name(&process.command),
+            // No foreground group is reported while a tab is between commands,
+            // so fall back to whatever is working hardest.
+            None => members
+                .iter()
+                .filter(|p| !is_login_process(&p.command) && !is_shell(&p.command))
+                .max_by(|a, b| a.cpu.total_cmp(&b.cpu).then(a.rss_kib.cmp(&b.rss_kib)))
+                .map(|p| command_name(&p.command))
+                .unwrap_or_else(|| "shell".to_string()),
+        };
         terminals.push(Terminal {
             root_pid: root.pid,
             label: root.tty.clone(),
@@ -3471,6 +3501,10 @@ mod tests {
         Process {
             pid,
             ppid,
+            pgid: pid,
+            // No foreground group unless a test says otherwise, so rows fall
+            // back to the busiest-process rule.
+            tpgid: -1,
             tty: tty.into(),
             cpu,
             rss_kib: rss,
@@ -3484,8 +3518,10 @@ mod tests {
     #[test]
     fn parses_ps_rows_with_spaced_commands() {
         let process =
-            parse_process("  42  1 ttys002  3.5  1024  01:20 node app.js --flag").unwrap();
+            parse_process("  42  1  42  42 ttys002  3.5  1024  01:20 node app.js --flag").unwrap();
         assert_eq!(process.pid, 42);
+        assert_eq!(process.pgid, 42);
+        assert_eq!(process.tpgid, 42);
         assert_eq!(process.tty, "ttys002");
         assert_eq!(process.command, "node app.js --flag");
         assert_eq!(process.age_seconds, 80);
@@ -3673,6 +3709,104 @@ mod tests {
         assert_eq!(terminals[0].rss_kib, 60);
         assert_eq!(terminals[0].activity, "node");
         assert_eq!(terminals[1].cpu, 1.0);
+    }
+
+    /// Puts a process in its own group and points its tty's foreground group
+    /// at `foreground`, the way `ps` reports it.
+    fn grouped(mut process: Process, foreground: i32) -> Process {
+        process.pgid = process.pid;
+        process.tpgid = foreground;
+        process
+    }
+
+    #[test]
+    fn the_foreground_process_group_names_the_tab_activity() {
+        let processes = vec![
+            p(
+                10,
+                1,
+                "??",
+                0.0,
+                100,
+                "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+            ),
+            grouped(
+                p(
+                    20,
+                    10,
+                    "ttys001",
+                    0.0,
+                    10,
+                    "/usr/bin/login -flp me /bin/zsh",
+                ),
+                40,
+            ),
+            grouped(p(21, 20, "ttys001", 0.0, 20, "-/bin/zsh"), 40),
+            // The program the user is actually running, and idle at this moment.
+            grouped(p(40, 21, "ttys001", 0.1, 900, "claude"), 40),
+            // A background job burning CPU. The old rule named this one.
+            grouped(
+                p(41, 21, "ttys001", 95.0, 50, "ffmpeg -i in.mov out.mp4"),
+                40,
+            ),
+        ];
+        let (_, terminals) = aggregate(&processes);
+        assert_eq!(terminals[0].activity, "claude");
+    }
+
+    #[test]
+    fn a_tab_between_commands_falls_back_to_its_busiest_process() {
+        let processes = vec![
+            p(
+                10,
+                1,
+                "??",
+                0.0,
+                100,
+                "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+            ),
+            // tpgid of -1: no foreground group to read.
+            p(
+                20,
+                10,
+                "ttys001",
+                0.0,
+                10,
+                "/usr/bin/login -flp me /bin/zsh",
+            ),
+            p(21, 20, "ttys001", 0.0, 20, "-/bin/zsh"),
+            p(22, 21, "ttys001", 12.0, 40, "python worker.py"),
+        ];
+        let (_, terminals) = aggregate(&processes);
+        assert_eq!(terminals[0].activity, "python");
+    }
+
+    #[test]
+    fn a_tab_sitting_at_its_prompt_reports_a_shell() {
+        let processes = vec![
+            p(
+                10,
+                1,
+                "??",
+                0.0,
+                100,
+                "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+            ),
+            grouped(
+                p(
+                    20,
+                    10,
+                    "ttys001",
+                    0.0,
+                    10,
+                    "/usr/bin/login -flp me /bin/zsh",
+                ),
+                21,
+            ),
+            grouped(p(21, 20, "ttys001", 0.0, 20, "-/bin/zsh"), 21),
+        ];
+        let (_, terminals) = aggregate(&processes);
+        assert_eq!(terminals[0].activity, "shell");
     }
 
     #[test]
