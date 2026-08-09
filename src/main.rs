@@ -2753,17 +2753,24 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
                     signed_human_kib(terminal.leak_growth_kib),
                 ));
             }
+            // RESIDENT is here so the gap between the two is legible rather
+            // than mysterious: RAM counts memory that has been compressed or
+            // swapped out, and resident size does not.
+            // Nine columns per figure, because `human_bytes` can render nine
+            // ("432.4 MiB") and a value wider than its field shunts every
+            // column after it out of line.
             lines.push(format!(
-                "{DIM}{UNDERLINE}     PID     CPU       RAM   COMMAND{RESET}"
+                "{DIM}{UNDERLINE}     PID      CPU        RAM   RESIDENT   COMMAND{RESET}"
             ));
             let process_rows = height.saturating_sub(lines.len() + 2);
-            let command_width = width.saturating_sub(29).max(12);
+            let command_width = width.saturating_sub(EXPANDED_FIXED_WIDTH).max(12);
             for process in terminal.processes.iter().take(process_rows) {
                 lines.push(format!(
-                    "  {:>6}  {YELLOW}{:>6.1}%{RESET}  {CYAN}{:>8}{RESET}   {}",
+                    "  {:>6}  {YELLOW}{:>6.1}%{RESET}  {CYAN}{:>9}{RESET}  {DIM}{:>9}{RESET}   {}",
                     process.pid,
                     process.cpu,
                     human_bytes(process.footprint_kib),
+                    human_bytes(process.rss_kib),
                     truncate(&process.command, command_width),
                 ));
             }
@@ -3234,6 +3241,10 @@ fn hint_line(row: usize, segments: &[(&str, Option<ClickAction>)]) -> (String, V
 
 /// Renders the sortable column headings and the columns each one occupies.
 /// Columns other than the two flexible ones, plus the spaces between all seven.
+/// Everything the expanded process list draws before COMMAND: two leading
+/// spaces, PID(6), CPU(7), RAM(9), RESIDENT(9), and the four gaps between them.
+const EXPANDED_FIXED_WIDTH: usize = 2 + 6 + 7 + 9 + 9 + 2 + 2 + 2 + 3;
+
 const MONITOR_FIXED_WIDTH: usize = 3 + 7 + 9 + 12 + 7 + 11 + 6;
 
 /// Splits the space left over after the fixed columns, favouring tab names
@@ -4126,6 +4137,40 @@ mod tests {
             let expected = MONITOR_FIXED_WIDTH + tab + activity;
             assert_eq!(plain.chars().count(), expected, "width {width}");
             assert!(plain.trim_start().starts_with("TAB"));
+        }
+    }
+
+    #[test]
+    fn the_expanded_process_list_lines_up_with_its_headings() {
+        let mut app = populated_app(UsageScale::Daily);
+        app.expanded = true;
+        app.selected = 0;
+        let (frame, _) = render_monitor(&app, 40, 120);
+        let plain: Vec<String> = frame.iter().map(|line| strip_ansi(line)).collect();
+        let heading_row = plain
+            .iter()
+            .position(|line| line.contains("RESIDENT"))
+            .expect("the expanded process list should be drawn");
+        let heading = &plain[heading_row];
+        let row = &plain[heading_row + 1];
+
+        // The command begins where its heading does.
+        assert_eq!(heading.find("COMMAND"), Some(EXPANDED_FIXED_WIDTH));
+        assert_eq!(row.find("node"), Some(EXPANDED_FIXED_WIDTH));
+
+        // Each figure is right-aligned to the last column of its heading, so a
+        // value that outgrows its field is caught here rather than on screen.
+        for name in ["CPU", "RAM", "RESIDENT"] {
+            let end = heading.find(name).expect("heading") + name.len();
+            let cells: Vec<char> = row.chars().collect();
+            assert!(
+                !cells[end - 1].is_whitespace(),
+                "{name} value stops short of its heading"
+            );
+            assert!(
+                cells[end].is_whitespace(),
+                "{name} value runs past its heading"
+            );
         }
     }
 
