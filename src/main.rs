@@ -102,6 +102,92 @@ fn has_tty(tty: &str) -> bool {
     !tty.is_empty() && tty != "??" && tty != "?"
 }
 
+/// Activity Monitor's "Memory" column is a process's *physical footprint*, not
+/// its resident set. Footprint also counts pages the kernel has compressed or
+/// swapped out, plus IOKit mappings, so the two can differ by more than an
+/// order of magnitude: Ghostty measured 109 MB resident against 1763 MB of
+/// footprint, most of it swapped out. Reporting resident size made this tool
+/// disagree with every other memory reading on the machine.
+///
+/// `ps` has no keyword for it and `footprint -a` needs root, so the number comes
+/// straight from libproc. `None` means "could not read" — never zero, so the
+/// caller can fall back to resident size rather than claim a process uses no
+/// memory.
+#[cfg(target_os = "macos")]
+fn phys_footprint_kib(pid: i32) -> Option<u64> {
+    // `rusage_info_v2` has been frozen since macOS 10.9. The flavor argument is
+    // the ABI's own version negotiation: the kernel writes exactly the struct
+    // that flavor names, so this layout must match it field for field.
+    #[repr(C)]
+    #[derive(Default)]
+    // Only `phys_footprint` is read; the rest exist so the struct is the size
+    // the kernel expects to fill.
+    #[allow(dead_code)]
+    struct RusageInfoV2 {
+        uuid: [u8; 16],
+        user_time: u64,
+        system_time: u64,
+        pkg_idle_wkups: u64,
+        interrupt_wkups: u64,
+        pageins: u64,
+        wired_size: u64,
+        resident_size: u64,
+        phys_footprint: u64,
+        /// Ten further counters: process start/exit, child totals, disk i/o.
+        rest: [u64; 10],
+    }
+
+    const RUSAGE_INFO_V2: i32 = 2;
+
+    // libproc is part of libSystem, which every Rust macOS build already links.
+    extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut RusageInfoV2) -> i32;
+    }
+
+    let mut info = RusageInfoV2::default();
+    // SAFETY: `info` is a live, correctly aligned RusageInfoV2, and the flavor
+    // passed alongside it is the one that names this exact layout, so the
+    // kernel cannot write past the end of it.
+    let status = unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V2, &mut info) };
+    if status != 0 {
+        // Denied for another user's process, or the pid exited mid-sample.
+        return None;
+    }
+    Some(info.phys_footprint / 1024)
+}
+
+/// Linux has no single footprint counter. Proportional set size plus what has
+/// been swapped out is the closest honest answer, and unlike resident size it
+/// does not charge this process for another's share of a shared page.
+#[cfg(not(target_os = "macos"))]
+fn phys_footprint_kib(pid: i32) -> Option<u64> {
+    // Needs Linux 4.14; older kernels and other users' processes fail here and
+    // fall back to resident size.
+    let text = fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+    let mut total: u64 = 0;
+    let mut seen = false;
+    for line in text.lines() {
+        // `Pss:` and `Swap:` only, never `Pss_Dirty:` or `SwapPss:`, both of
+        // which would double-count.
+        let Some(value) = line
+            .strip_prefix("Pss:")
+            .or_else(|| line.strip_prefix("Swap:"))
+        else {
+            continue;
+        };
+        let Some(kib) = value
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        total = total.saturating_add(kib);
+        seen = true;
+    }
+    seen.then_some(total)
+}
+
 /// The process that owns a terminal surface. macOS Ghostty starts each surface
 /// through `/usr/bin/login`; on Linux it execs the shell straight away, so any
 /// child of Ghostty holding a tty is a surface.
@@ -207,6 +293,9 @@ struct Process {
     tty: String,
     cpu: f64,
     rss_kib: u64,
+    /// What Activity Monitor calls Memory. Falls back to `rss_kib` when the
+    /// process cannot be read. See `phys_footprint_kib`.
+    footprint_kib: u64,
     elapsed: String,
     age_seconds: u64,
     command: String,
@@ -260,6 +349,9 @@ struct Terminal {
     label: String,
     cpu: f64,
     rss_kib: u64,
+    /// The tab's memory as Activity Monitor would count it, and the number the
+    /// RAM column shows.
+    footprint_kib: u64,
     processes: Vec<Process>,
     activity: String,
     elapsed: String,
@@ -604,7 +696,7 @@ impl App {
                 history.alert_active = false;
                 history.process_ids = process_ids;
             }
-            history.samples.push_back((now, terminal.rss_kib));
+            history.samples.push_back((now, terminal.footprint_kib));
             while history
                 .samples
                 .front()
@@ -2118,7 +2210,14 @@ fn sample_processes() -> Result<Vec<Process>, String> {
         return Err(format!("ps exited with {}", output.status));
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    Ok(text.lines().filter_map(parse_process).collect())
+    let mut processes: Vec<Process> = text.lines().filter_map(parse_process).collect();
+    // `ps` cannot report footprint, so it is read per process afterwards. On
+    // macOS that is a syscall costing microseconds; on Linux the processes we
+    // are not allowed to read fail immediately, which is most of them.
+    for process in &mut processes {
+        process.footprint_kib = phys_footprint_kib(process.pid).unwrap_or(process.rss_kib);
+    }
+    Ok(processes)
 }
 
 fn parse_process(line: &str) -> Option<Process> {
@@ -2137,6 +2236,9 @@ fn parse_process(line: &str) -> Option<Process> {
         tty,
         cpu,
         rss_kib,
+        // Filled in by `sample_processes`; resident size is the honest stand-in
+        // until then.
+        footprint_kib: rss_kib,
         elapsed,
         age_seconds,
         command,
@@ -2175,7 +2277,8 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
             .collect();
         let cpu = members.iter().map(|p| p.cpu).sum();
         let rss_kib = members.iter().map(|p| p.rss_kib).sum();
-        members.sort_by_key(|process| std::cmp::Reverse(process.rss_kib));
+        let footprint_kib = members.iter().map(|p| p.footprint_kib).sum();
+        members.sort_by_key(|process| std::cmp::Reverse(process.footprint_kib));
         let activity = members
             .iter()
             .filter(|p| !is_login_process(&p.command) && !is_shell(&p.command))
@@ -2188,6 +2291,7 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
             tty: root.tty.clone(),
             cpu,
             rss_kib,
+            footprint_kib,
             processes: members,
             activity,
             elapsed: root.elapsed.clone(),
@@ -2375,7 +2479,7 @@ fn sort_terminals(terminals: &mut [Terminal], sort: SortBy, descending: bool) {
     terminals.sort_by(|a, b| {
         let order = match sort {
             SortBy::Cpu => a.cpu.total_cmp(&b.cpu),
-            SortBy::Memory => a.rss_kib.cmp(&b.rss_kib),
+            SortBy::Memory => a.footprint_kib.cmp(&b.footprint_kib),
             SortBy::Trend => a.memory_growth_kib.cmp(&b.memory_growth_kib),
             SortBy::Processes => a.processes.len().cmp(&b.processes.len()),
             SortBy::Age => a.age_seconds.cmp(&b.age_seconds),
@@ -2414,9 +2518,9 @@ fn render(app: &App) -> Layout {
 fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layout) {
     let mut lines = Vec::new();
     let shared_cpu = app.ghostty.as_ref().map_or(0.0, |p| p.cpu);
-    let shared_ram = app.ghostty.as_ref().map_or(0, |p| p.rss_kib);
+    let shared_ram = app.ghostty.as_ref().map_or(0, |p| p.footprint_kib);
     let terminal_cpu: f64 = app.terminals.iter().map(|t| t.cpu).sum();
-    let terminal_ram: u64 = app.terminals.iter().map(|t| t.rss_kib).sum();
+    let terminal_ram: u64 = app.terminals.iter().map(|t| t.footprint_kib).sum();
     let alert_count = app
         .terminals
         .iter()
@@ -2505,7 +2609,7 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
                 "{marker}  {:<tab_width$} {YELLOW}{:>6.1}%{RESET}{row_style} {CYAN}{:>9}{RESET}{row_style} {}{row_style} {:>7} {:>11} {}",
                 truncate(&terminal.label, tab_width),
                 terminal.cpu,
-                human_bytes(terminal.rss_kib),
+                human_bytes(terminal.footprint_kib),
                 trend_cell(terminal),
                 terminal.processes.len(),
                 terminal.elapsed,
@@ -2553,7 +2657,7 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
                     "  {:>6}  {YELLOW}{:>6.1}%{RESET}  {CYAN}{:>8}{RESET}   {}",
                     process.pid,
                     process.cpu,
-                    human_bytes(process.rss_kib),
+                    human_bytes(process.footprint_kib),
                     truncate(&process.command, command_width),
                 ));
             }
@@ -3244,7 +3348,7 @@ fn print_snapshot(app: &App) {
     println!(
         "Ghostty shared: {:>6.1}% CPU  {:>8} RAM",
         ghostty.cpu,
-        human_bytes(ghostty.rss_kib)
+        human_bytes(ghostty.footprint_kib)
     );
     println!(
         "{:<24} {:>7}  {:>9}  {:>11}  {:>5}  {:>11}  ACTIVITY",
@@ -3255,7 +3359,7 @@ fn print_snapshot(app: &App) {
             "{:<24} {:>6.1}%  {:>9}  {:>11}  {:>5}  {:>11}  {}{}",
             truncate(&terminal.label, 24),
             terminal.cpu,
-            human_bytes(terminal.rss_kib),
+            human_bytes(terminal.footprint_kib),
             if terminal.memory_samples < 2 {
                 "sampling".to_string()
             } else {
@@ -3354,6 +3458,7 @@ mod tests {
             tty: tty.into(),
             cpu,
             rss_kib: rss,
+            footprint_kib: rss,
             elapsed: "01:00".into(),
             age_seconds: 60,
             command: command.into(),
@@ -4062,6 +4167,7 @@ mod tests {
                 label: format!("a tab name that is quite long {index}"),
                 cpu: index as f64 * 7.5,
                 rss_kib: 4096 * (index as u64 + 1),
+                footprint_kib: 5120 * (index as u64 + 1),
                 processes: vec![p(
                     200 + index,
                     100 + index,
@@ -4275,6 +4381,40 @@ mod tests {
         assert!(own.ppid > 0, "parsed a nonsense parent pid");
         assert!(!own.command.is_empty(), "parsed an empty command");
         assert!(own.rss_kib > 0, "parsed no resident memory");
+    }
+
+    /// Guards the libproc struct layout. If a future macOS changes what
+    /// `RUSAGE_INFO_V2` means, the field would be read from the wrong offset and
+    /// this is where it shows up rather than in a wrong number on screen.
+    #[test]
+    fn reads_a_real_physical_footprint() {
+        let own_pid = std::process::id() as i32;
+        let footprint =
+            phys_footprint_kib(own_pid).expect("should read our own process's footprint");
+        assert!(footprint > 0, "read a zero footprint for a live process");
+        // A test binary is a few MiB, never a terabyte. Reading the wrong
+        // offset lands far outside this range.
+        assert!(
+            (256..64 * 1024 * 1024).contains(&footprint),
+            "implausible footprint of {footprint} KiB suggests a wrong struct offset"
+        );
+    }
+
+    #[test]
+    fn a_failed_footprint_reading_falls_back_to_resident_memory() {
+        // Nothing owns pid 0, and plenty of the process table belongs to other
+        // users, so an unreadable process is the common case rather than the
+        // exception.
+        assert_eq!(phys_footprint_kib(0), None);
+        let processes = sample_processes().expect("ps should run");
+        // Zombies really do hold no memory; every process that holds some must
+        // still report some, whether or not its footprint could be read.
+        assert!(
+            processes
+                .iter()
+                .all(|process| process.rss_kib == 0 || process.footprint_kib > 0),
+            "a process holding memory was reported as using none"
+        );
     }
 
     #[test]
