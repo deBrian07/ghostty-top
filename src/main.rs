@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -29,6 +29,9 @@ const MIN_LEAK_R_SQUARED: f64 = 0.70;
 const MIN_UPWARD_SAMPLE_RATIO: f64 = 0.70;
 const LEAK_CONFIRMATION_WINDOWS: u8 = 3;
 const LEAK_CLEAR_WINDOWS: u8 = 10;
+/// Leak history is kept per process, so a floor keeps the bookkeeping to the
+/// handful of processes big enough to matter. A 3 MiB shim is not the leak.
+const MIN_TRACKED_FOOTPRINT_KIB: u64 = 32 * 1024;
 const CALENDAR_GUTTER: usize = 4;
 const CALENDAR_CELL_WIDTH: usize = 2;
 const CALENDAR_MIN_WEEKS: usize = 4;
@@ -81,9 +84,15 @@ const STTY_FILE: &str = "-F";
 
 /// BSD `ps` takes `-axo`; procps wants `-eo` and spells the column `args`.
 #[cfg(target_os = "macos")]
-const PS_PROCESSES: [&str; 2] = ["-axo", "pid=,ppid=,tty=,%cpu=,rss=,etime=,command="];
+const PS_PROCESSES: [&str; 2] = [
+    "-axo",
+    "pid=,ppid=,pgid=,tpgid=,tty=,%cpu=,rss=,etime=,command=",
+];
 #[cfg(not(target_os = "macos"))]
-const PS_PROCESSES: [&str; 2] = ["-eo", "pid=,ppid=,tty=,%cpu=,rss=,etime=,args="];
+const PS_PROCESSES: [&str; 2] = [
+    "-eo",
+    "pid=,ppid=,pgid=,tpgid=,tty=,%cpu=,rss=,etime=,args=",
+];
 
 #[cfg(target_os = "macos")]
 const PS_COMMANDS: [&str; 2] = ["-axo", "command="];
@@ -100,6 +109,92 @@ const FOCUS_UNAVAILABLE: &str =
 /// `?` on Linux.
 fn has_tty(tty: &str) -> bool {
     !tty.is_empty() && tty != "??" && tty != "?"
+}
+
+/// Activity Monitor's "Memory" column is a process's *physical footprint*, not
+/// its resident set. Footprint also counts pages the kernel has compressed or
+/// swapped out, plus IOKit mappings, so the two can differ by more than an
+/// order of magnitude: Ghostty measured 109 MB resident against 1763 MB of
+/// footprint, most of it swapped out. Reporting resident size made this tool
+/// disagree with every other memory reading on the machine.
+///
+/// `ps` has no keyword for it and `footprint -a` needs root, so the number comes
+/// straight from libproc. `None` means "could not read" — never zero, so the
+/// caller can fall back to resident size rather than claim a process uses no
+/// memory.
+#[cfg(target_os = "macos")]
+fn phys_footprint_kib(pid: i32) -> Option<u64> {
+    // `rusage_info_v2` has been frozen since macOS 10.9. The flavor argument is
+    // the ABI's own version negotiation: the kernel writes exactly the struct
+    // that flavor names, so this layout must match it field for field.
+    #[repr(C)]
+    #[derive(Default)]
+    // Only `phys_footprint` is read; the rest exist so the struct is the size
+    // the kernel expects to fill.
+    #[allow(dead_code)]
+    struct RusageInfoV2 {
+        uuid: [u8; 16],
+        user_time: u64,
+        system_time: u64,
+        pkg_idle_wkups: u64,
+        interrupt_wkups: u64,
+        pageins: u64,
+        wired_size: u64,
+        resident_size: u64,
+        phys_footprint: u64,
+        /// Ten further counters: process start/exit, child totals, disk i/o.
+        rest: [u64; 10],
+    }
+
+    const RUSAGE_INFO_V2: i32 = 2;
+
+    // libproc is part of libSystem, which every Rust macOS build already links.
+    extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut RusageInfoV2) -> i32;
+    }
+
+    let mut info = RusageInfoV2::default();
+    // SAFETY: `info` is a live, correctly aligned RusageInfoV2, and the flavor
+    // passed alongside it is the one that names this exact layout, so the
+    // kernel cannot write past the end of it.
+    let status = unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V2, &mut info) };
+    if status != 0 {
+        // Denied for another user's process, or the pid exited mid-sample.
+        return None;
+    }
+    Some(info.phys_footprint / 1024)
+}
+
+/// Linux has no single footprint counter. Proportional set size plus what has
+/// been swapped out is the closest honest answer, and unlike resident size it
+/// does not charge this process for another's share of a shared page.
+#[cfg(not(target_os = "macos"))]
+fn phys_footprint_kib(pid: i32) -> Option<u64> {
+    // Needs Linux 4.14; older kernels and other users' processes fail here and
+    // fall back to resident size.
+    let text = fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+    let mut total: u64 = 0;
+    let mut seen = false;
+    for line in text.lines() {
+        // `Pss:` and `Swap:` only, never `Pss_Dirty:` or `SwapPss:`, both of
+        // which would double-count.
+        let Some(value) = line
+            .strip_prefix("Pss:")
+            .or_else(|| line.strip_prefix("Swap:"))
+        else {
+            continue;
+        };
+        let Some(kib) = value
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        total = total.saturating_add(kib);
+        seen = true;
+    }
+    seen.then_some(total)
 }
 
 /// The process that owns a terminal surface. macOS Ghostty starts each surface
@@ -204,9 +299,18 @@ struct InputDecoder {
 struct Process {
     pid: i32,
     ppid: i32,
+    /// The process group this belongs to, and the group the tty is currently
+    /// giving the keyboard to. When a process is its own group's leader and
+    /// that group is the tty's foreground group, it is the program the tab is
+    /// running. `ps` reports no foreground group as `-1`.
+    pgid: i32,
+    tpgid: i32,
     tty: String,
     cpu: f64,
     rss_kib: u64,
+    /// What Activity Monitor calls Memory. Falls back to `rss_kib` when the
+    /// process cannot be read. See `phys_footprint_kib`.
+    footprint_kib: u64,
     elapsed: String,
     age_seconds: u64,
     command: String,
@@ -260,6 +364,9 @@ struct Terminal {
     label: String,
     cpu: f64,
     rss_kib: u64,
+    /// The tab's memory as Activity Monitor would count it, and the number the
+    /// RAM column shows.
+    footprint_kib: u64,
     processes: Vec<Process>,
     activity: String,
     elapsed: String,
@@ -268,6 +375,9 @@ struct Terminal {
     memory_slope_kib_per_min: f64,
     memory_samples: usize,
     leak_suspected: bool,
+    /// The process a leak warning is about, and how much it has grown.
+    leak_process: String,
+    leak_growth_kib: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -319,10 +429,31 @@ impl UsageScale {
 #[derive(Default)]
 struct MemoryHistory {
     samples: VecDeque<(Instant, u64)>,
-    process_ids: Vec<i32>,
+    /// How old the subject was when last sampled. Something that suddenly
+    /// reports itself younger is a different process wearing a recycled pid,
+    /// and its predecessor's samples have to go.
+    age_seconds: u64,
     suspicious_windows: u8,
     clear_windows: u8,
     alert_active: bool,
+}
+
+impl MemoryHistory {
+    fn record(&mut self, now: Instant, footprint_kib: u64, age_seconds: u64) -> MemoryTrend {
+        if age_seconds < self.age_seconds {
+            *self = MemoryHistory::default();
+        }
+        self.age_seconds = age_seconds;
+        self.samples.push_back((now, footprint_kib));
+        while self
+            .samples
+            .front()
+            .is_some_and(|(time, _)| now.duration_since(*time) > HISTORY_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+        analyze_memory_history(&self.samples)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -398,7 +529,10 @@ struct App {
     expanded: bool,
     interval: Duration,
     last_error: Option<String>,
+    /// Keyed by pid: the evidence a leak warning rests on.
     memory_history: HashMap<i32, MemoryHistory>,
+    /// Keyed by root pid: the tab total behind the TREND column.
+    tab_memory_history: HashMap<i32, MemoryHistory>,
     labels: LabelCache,
     usage_tracker: Option<UsageTracker>,
     view: View,
@@ -420,6 +554,7 @@ impl App {
             interval,
             last_error: None,
             memory_history: HashMap::new(),
+            tab_memory_history: HashMap::new(),
             labels: LabelCache::default(),
             usage_tracker: None,
             view: View::Monitor,
@@ -583,40 +718,67 @@ impl App {
         sort_terminals(&mut self.terminals, self.sort, self.descending);
     }
 
+    /// Two series are kept. The tab's total drives the TREND column, which is
+    /// only ever a description of what memory did. A leak is a much stronger
+    /// claim, so it is judged per process: a pid keeps its identity across the
+    /// subprocesses a tab spawns, whereas the total jumps every time one starts
+    /// or exits. Judging the total meant an actively used tab — the one most
+    /// likely to be leaking — never held still long enough to be measured.
     fn update_memory_trends(&mut self, terminals: &mut [Terminal], now: Instant) {
-        self.memory_history.retain(|root_pid, _| {
+        let live: HashSet<i32> = terminals
+            .iter()
+            .flat_map(|terminal| terminal.processes.iter().map(|process| process.pid))
+            .collect();
+        self.memory_history.retain(|pid, _| live.contains(pid));
+        self.tab_memory_history.retain(|root_pid, _| {
             terminals
                 .iter()
                 .any(|terminal| terminal.root_pid == *root_pid)
         });
+
         for terminal in terminals {
-            let history = self.memory_history.entry(terminal.root_pid).or_default();
-            let mut process_ids: Vec<i32> = terminal
-                .processes
-                .iter()
-                .map(|process| process.pid)
-                .collect();
-            process_ids.sort_unstable();
-            if history.process_ids != process_ids {
-                history.samples.clear();
-                history.suspicious_windows = 0;
-                history.clear_windows = 0;
-                history.alert_active = false;
-                history.process_ids = process_ids;
-            }
-            history.samples.push_back((now, terminal.rss_kib));
-            while history
-                .samples
-                .front()
-                .is_some_and(|(time, _)| now.duration_since(*time) > HISTORY_WINDOW)
-            {
-                history.samples.pop_front();
-            }
-            let trend = analyze_memory_history(&history.samples);
+            let tab = self
+                .tab_memory_history
+                .entry(terminal.root_pid)
+                .or_default();
+            let trend = tab.record(now, terminal.footprint_kib, terminal.age_seconds);
             terminal.memory_growth_kib = trend.growth_kib;
             terminal.memory_slope_kib_per_min = trend.slope_kib_per_min;
-            terminal.memory_samples = history.samples.len();
-            terminal.leak_suspected = update_leak_state(history, trend.suspected);
+            terminal.memory_samples = tab.samples.len();
+
+            // Whichever process has grown most among those that look like they
+            // are leaking gets named; a tab is only as suspect as its worst one.
+            let mut worst: Option<(String, i64)> = None;
+            for process in &terminal.processes {
+                // Small processes are ignored until they grow into the floor,
+                // but one already being watched keeps its history.
+                if process.footprint_kib < MIN_TRACKED_FOOTPRINT_KIB
+                    && !self.memory_history.contains_key(&process.pid)
+                {
+                    continue;
+                }
+                let history = self.memory_history.entry(process.pid).or_default();
+                let trend = history.record(now, process.footprint_kib, process.age_seconds);
+                if update_leak_state(history, trend.suspected)
+                    && worst
+                        .as_ref()
+                        .is_none_or(|(_, growth)| trend.growth_kib > *growth)
+                {
+                    worst = Some((command_name(&process.command), trend.growth_kib));
+                }
+            }
+            match worst {
+                Some((name, growth)) => {
+                    terminal.leak_suspected = true;
+                    terminal.leak_process = name;
+                    terminal.leak_growth_kib = growth;
+                }
+                None => {
+                    terminal.leak_suspected = false;
+                    terminal.leak_process.clear();
+                    terminal.leak_growth_kib = 0;
+                }
+            }
         }
     }
 
@@ -1627,20 +1789,24 @@ fn append_resource_history(
     terminals: &[Terminal],
     ghostty: Option<&Process>,
 ) -> io::Result<()> {
-    let Some(path) = default_data_dir().map(|directory| directory.join("resources-v1.tsv")) else {
+    // v2 adds footprint and the leaking process's name. The header is written
+    // once, when the file is created, so a new column means a new file rather
+    // than rows that no longer match the heading above them.
+    let Some(path) = default_data_dir().map(|directory| directory.join("resources-v2.tsv")) else {
         return Ok(());
     };
     let mut file = open_history_file(
         &path,
-        "timestamp\tday\tkind\tid\tcpu_percent\trss_kib\tprocesses\tage_seconds\tactivity\tmemory_growth_kib\tleak_suspected",
+        "timestamp\tday\tkind\tid\tcpu_percent\tfootprint_kib\trss_kib\tprocesses\tage_seconds\tactivity\tmemory_growth_kib\tleak_suspected\tleak_process",
     )?;
     let timestamp = unix_timestamp();
     if let Some(process) = ghostty {
         writeln!(
             file,
-            "{timestamp}\t{}\tapp\tghostty\t{:.1}\t{}\t1\t{}\tghostty\t0\tfalse",
+            "{timestamp}\t{}\tapp\tghostty\t{:.1}\t{}\t{}\t1\t{}\tghostty\t0\tfalse\t",
             clean_field(day),
             process.cpu,
+            process.footprint_kib,
             process.rss_kib,
             process.age_seconds,
         )?;
@@ -1648,16 +1814,18 @@ fn append_resource_history(
     for terminal in terminals {
         writeln!(
             file,
-            "{timestamp}\t{}\tterminal\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{timestamp}\t{}\tterminal\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             clean_field(day),
             clean_field(&terminal.tty),
             terminal.cpu,
+            terminal.footprint_kib,
             terminal.rss_kib,
             terminal.processes.len(),
             terminal.age_seconds,
             clean_field(&terminal.activity),
             terminal.memory_growth_kib,
             terminal.leak_suspected,
+            clean_field(&terminal.leak_process),
         )?;
     }
     append_process_history(timestamp, day, terminals, ghostty)?;
@@ -1670,12 +1838,12 @@ fn append_process_history(
     terminals: &[Terminal],
     ghostty: Option<&Process>,
 ) -> io::Result<()> {
-    let Some(path) = default_data_dir().map(|directory| directory.join("processes-v1.tsv")) else {
+    let Some(path) = default_data_dir().map(|directory| directory.join("processes-v2.tsv")) else {
         return Ok(());
     };
     let mut file = open_history_file(
         &path,
-        "timestamp\tday\tkind\tterminal_tty\tterminal_root_pid\tpid\tppid\tcpu_percent\trss_kib\tage_seconds\tstarted_at\texecutable_name\texecutable_path",
+        "timestamp\tday\tkind\tterminal_tty\tterminal_root_pid\tpid\tppid\tcpu_percent\tfootprint_kib\trss_kib\tage_seconds\tstarted_at\texecutable_name\texecutable_path",
     )?;
     if let Some(process) = ghostty {
         writeln!(
@@ -1713,13 +1881,14 @@ fn process_history_row(
 ) -> String {
     let executable_path = process.command.split_whitespace().next().unwrap_or("?");
     format!(
-        "{timestamp}\t{}\t{}\t{}\t{terminal_root_pid}\t{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}",
+        "{timestamp}\t{}\t{}\t{}\t{terminal_root_pid}\t{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}",
         clean_field(day),
         clean_field(kind),
         clean_field(terminal_tty),
         process.pid,
         process.ppid,
         process.cpu,
+        process.footprint_kib,
         process.rss_kib,
         process.age_seconds,
         timestamp.saturating_sub(process.age_seconds),
@@ -2118,13 +2287,22 @@ fn sample_processes() -> Result<Vec<Process>, String> {
         return Err(format!("ps exited with {}", output.status));
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    Ok(text.lines().filter_map(parse_process).collect())
+    let mut processes: Vec<Process> = text.lines().filter_map(parse_process).collect();
+    // `ps` cannot report footprint, so it is read per process afterwards. On
+    // macOS that is a syscall costing microseconds; on Linux the processes we
+    // are not allowed to read fail immediately, which is most of them.
+    for process in &mut processes {
+        process.footprint_kib = phys_footprint_kib(process.pid).unwrap_or(process.rss_kib);
+    }
+    Ok(processes)
 }
 
 fn parse_process(line: &str) -> Option<Process> {
     let mut fields = line.split_whitespace();
     let pid = fields.next()?.parse().ok()?;
     let ppid = fields.next()?.parse().ok()?;
+    let pgid = fields.next()?.parse().ok()?;
+    let tpgid = fields.next()?.parse().ok()?;
     let tty = fields.next()?.to_string();
     let cpu = fields.next()?.replace(',', ".").parse().ok()?;
     let rss_kib = fields.next()?.parse().ok()?;
@@ -2134,9 +2312,14 @@ fn parse_process(line: &str) -> Option<Process> {
     Some(Process {
         pid,
         ppid,
+        pgid,
+        tpgid,
         tty,
         cpu,
         rss_kib,
+        // Filled in by `sample_processes`; resident size is the honest stand-in
+        // until then.
+        footprint_kib: rss_kib,
         elapsed,
         age_seconds,
         command,
@@ -2161,6 +2344,22 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
     for root in &roots {
         assign_descendants(root.pid, root.pid, &by_parent, &mut owner);
     }
+    // A process that was disowned, `nohup`ed, or orphaned when its parent died
+    // gets reparented to pid 1, which puts it out of reach of the walk above.
+    // It still holds the tab's terminal though, so claim it back by tty rather
+    // than let its memory quietly leave the tab's total.
+    let root_by_tty: HashMap<&str, i32> = roots
+        .iter()
+        .map(|root| (root.tty.as_str(), root.pid))
+        .collect();
+    for process in processes {
+        if owner.contains_key(&process.pid) {
+            continue;
+        }
+        if let Some(root_pid) = root_by_tty.get(process.tty.as_str()) {
+            owner.insert(process.pid, *root_pid);
+        }
+    }
 
     let self_pid = std::process::id() as i32;
     let mut terminals = Vec::with_capacity(roots.len());
@@ -2175,19 +2374,35 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
             .collect();
         let cpu = members.iter().map(|p| p.cpu).sum();
         let rss_kib = members.iter().map(|p| p.rss_kib).sum();
-        members.sort_by_key(|process| std::cmp::Reverse(process.rss_kib));
-        let activity = members
-            .iter()
-            .filter(|p| !is_login_process(&p.command) && !is_shell(&p.command))
-            .max_by(|a, b| a.cpu.total_cmp(&b.cpu).then(a.rss_kib.cmp(&b.rss_kib)))
-            .map(|p| command_name(&p.command))
-            .unwrap_or_else(|| "shell".to_string());
+        let footprint_kib = members.iter().map(|p| p.footprint_kib).sum();
+        members.sort_by_key(|process| std::cmp::Reverse(process.footprint_kib));
+        // The kernel already knows what the tab is running: the tty hands the
+        // keyboard to one process group, and that group's leader is the
+        // program. Guessing from CPU used to name a busy background job.
+        let foreground = members.iter().find(|p| {
+            p.tpgid > 0 && p.pid == p.pgid && p.pgid == p.tpgid && !is_login_process(&p.command)
+        });
+        let activity = match foreground {
+            // A tab sitting at its prompt is running its shell, which is worth
+            // saying plainly rather than by name.
+            Some(process) if is_shell(&process.command) => "shell".to_string(),
+            Some(process) => command_name(&process.command),
+            // No foreground group is reported while a tab is between commands,
+            // so fall back to whatever is working hardest.
+            None => members
+                .iter()
+                .filter(|p| !is_login_process(&p.command) && !is_shell(&p.command))
+                .max_by(|a, b| a.cpu.total_cmp(&b.cpu).then(a.rss_kib.cmp(&b.rss_kib)))
+                .map(|p| command_name(&p.command))
+                .unwrap_or_else(|| "shell".to_string()),
+        };
         terminals.push(Terminal {
             root_pid: root.pid,
             label: root.tty.clone(),
             tty: root.tty.clone(),
             cpu,
             rss_kib,
+            footprint_kib,
             processes: members,
             activity,
             elapsed: root.elapsed.clone(),
@@ -2196,6 +2411,8 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
             memory_slope_kib_per_min: 0.0,
             memory_samples: 0,
             leak_suspected: false,
+            leak_process: String::new(),
+            leak_growth_kib: 0,
         });
     }
     (ghostty, terminals)
@@ -2375,7 +2592,7 @@ fn sort_terminals(terminals: &mut [Terminal], sort: SortBy, descending: bool) {
     terminals.sort_by(|a, b| {
         let order = match sort {
             SortBy::Cpu => a.cpu.total_cmp(&b.cpu),
-            SortBy::Memory => a.rss_kib.cmp(&b.rss_kib),
+            SortBy::Memory => a.footprint_kib.cmp(&b.footprint_kib),
             SortBy::Trend => a.memory_growth_kib.cmp(&b.memory_growth_kib),
             SortBy::Processes => a.processes.len().cmp(&b.processes.len()),
             SortBy::Age => a.age_seconds.cmp(&b.age_seconds),
@@ -2414,9 +2631,9 @@ fn render(app: &App) -> Layout {
 fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layout) {
     let mut lines = Vec::new();
     let shared_cpu = app.ghostty.as_ref().map_or(0.0, |p| p.cpu);
-    let shared_ram = app.ghostty.as_ref().map_or(0, |p| p.rss_kib);
+    let shared_ram = app.ghostty.as_ref().map_or(0, |p| p.footprint_kib);
     let terminal_cpu: f64 = app.terminals.iter().map(|t| t.cpu).sum();
-    let terminal_ram: u64 = app.terminals.iter().map(|t| t.rss_kib).sum();
+    let terminal_ram: u64 = app.terminals.iter().map(|t| t.footprint_kib).sum();
     let alert_count = app
         .terminals
         .iter()
@@ -2505,7 +2722,7 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
                 "{marker}  {:<tab_width$} {YELLOW}{:>6.1}%{RESET}{row_style} {CYAN}{:>9}{RESET}{row_style} {}{row_style} {:>7} {:>11} {}",
                 truncate(&terminal.label, tab_width),
                 terminal.cpu,
-                human_bytes(terminal.rss_kib),
+                human_bytes(terminal.footprint_kib),
                 trend_cell(terminal),
                 terminal.processes.len(),
                 terminal.elapsed,
@@ -2538,21 +2755,28 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
             ));
             if terminal.leak_suspected {
                 lines.push(format!(
-                    "{BOLD}{RED}⚠ Potential memory leak: {} since tracking began ({}/min){RESET}",
-                    signed_human_kib(terminal.memory_growth_kib),
-                    signed_human_kib(terminal.memory_slope_kib_per_min.round() as i64),
+                    "{BOLD}{RED}⚠ Potential memory leak in {}: {} since tracking began{RESET}",
+                    terminal.leak_process,
+                    signed_human_kib(terminal.leak_growth_kib),
                 ));
             }
+            // RESIDENT is here so the gap between the two is legible rather
+            // than mysterious: RAM counts memory that has been compressed or
+            // swapped out, and resident size does not.
+            // Nine columns per figure, because `human_bytes` can render nine
+            // ("432.4 MiB") and a value wider than its field shunts every
+            // column after it out of line.
             lines.push(format!(
-                "{DIM}{UNDERLINE}     PID     CPU       RAM   COMMAND{RESET}"
+                "{DIM}{UNDERLINE}     PID      CPU        RAM   RESIDENT   COMMAND{RESET}"
             ));
             let process_rows = height.saturating_sub(lines.len() + 2);
-            let command_width = width.saturating_sub(29).max(12);
+            let command_width = width.saturating_sub(EXPANDED_FIXED_WIDTH).max(12);
             for process in terminal.processes.iter().take(process_rows) {
                 lines.push(format!(
-                    "  {:>6}  {YELLOW}{:>6.1}%{RESET}  {CYAN}{:>8}{RESET}   {}",
+                    "  {:>6}  {YELLOW}{:>6.1}%{RESET}  {CYAN}{:>9}{RESET}  {DIM}{:>9}{RESET}   {}",
                     process.pid,
                     process.cpu,
+                    human_bytes(process.footprint_kib),
                     human_bytes(process.rss_kib),
                     truncate(&process.command, command_width),
                 ));
@@ -3024,6 +3248,10 @@ fn hint_line(row: usize, segments: &[(&str, Option<ClickAction>)]) -> (String, V
 
 /// Renders the sortable column headings and the columns each one occupies.
 /// Columns other than the two flexible ones, plus the spaces between all seven.
+/// Everything the expanded process list draws before COMMAND: two leading
+/// spaces, PID(6), CPU(7), RAM(9), RESIDENT(9), and the four gaps between them.
+const EXPANDED_FIXED_WIDTH: usize = 2 + 6 + 7 + 9 + 9 + 2 + 2 + 2 + 3;
+
 const MONITOR_FIXED_WIDTH: usize = 3 + 7 + 9 + 12 + 7 + 11 + 6;
 
 /// Splits the space left over after the fixed columns, favouring tab names
@@ -3244,7 +3472,7 @@ fn print_snapshot(app: &App) {
     println!(
         "Ghostty shared: {:>6.1}% CPU  {:>8} RAM",
         ghostty.cpu,
-        human_bytes(ghostty.rss_kib)
+        human_bytes(ghostty.footprint_kib)
     );
     println!(
         "{:<24} {:>7}  {:>9}  {:>11}  {:>5}  {:>11}  ACTIVITY",
@@ -3255,7 +3483,7 @@ fn print_snapshot(app: &App) {
             "{:<24} {:>6.1}%  {:>9}  {:>11}  {:>5}  {:>11}  {}{}",
             truncate(&terminal.label, 24),
             terminal.cpu,
-            human_bytes(terminal.rss_kib),
+            human_bytes(terminal.footprint_kib),
             if terminal.memory_samples < 2 {
                 "sampling".to_string()
             } else {
@@ -3351,9 +3579,14 @@ mod tests {
         Process {
             pid,
             ppid,
+            pgid: pid,
+            // No foreground group unless a test says otherwise, so rows fall
+            // back to the busiest-process rule.
+            tpgid: -1,
             tty: tty.into(),
             cpu,
             rss_kib: rss,
+            footprint_kib: rss,
             elapsed: "01:00".into(),
             age_seconds: 60,
             command: command.into(),
@@ -3363,8 +3596,10 @@ mod tests {
     #[test]
     fn parses_ps_rows_with_spaced_commands() {
         let process =
-            parse_process("  42  1 ttys002  3.5  1024  01:20 node app.js --flag").unwrap();
+            parse_process("  42  1  42  42 ttys002  3.5  1024  01:20 node app.js --flag").unwrap();
         assert_eq!(process.pid, 42);
+        assert_eq!(process.pgid, 42);
+        assert_eq!(process.tpgid, 42);
         assert_eq!(process.tty, "ttys002");
         assert_eq!(process.command, "node app.js --flag");
         assert_eq!(process.age_seconds, 80);
@@ -3427,32 +3662,67 @@ mod tests {
         assert!(!update_leak_state(&mut history, false));
     }
 
+    /// The regression test for the reason leak detection never used to fire on
+    /// a busy tab: a subprocess starting or exiting wiped the evidence, and the
+    /// tabs that spawn subprocesses are exactly the ones worth watching.
     #[test]
-    fn process_tree_changes_reset_leak_evidence() {
+    fn a_transient_child_does_not_erase_leak_evidence() {
         let start = Instant::now();
         let mut app = App::new(Duration::from_secs(1));
+        let leaker = |megabytes: u64, age: u64| {
+            let mut process = p(11, 10, "ttys001", 0.0, megabytes * 1024, "node server.js");
+            process.age_seconds = age;
+            process
+        };
         let mut terminals = vec![Terminal {
             root_pid: 10,
             tty: "ttys001".into(),
-            rss_kib: 100 * 1024,
-            processes: vec![p(10, 1, "ttys001", 0.0, 100 * 1024, "zsh")],
+            processes: vec![leaker(100, 60)],
             ..Terminal::default()
         }];
-        app.update_memory_trends(&mut terminals, start);
-        let history = app.memory_history.get_mut(&10).unwrap();
+
+        for step in 0..12 {
+            terminals[0].processes = vec![leaker(100 + step * 12, 60 + step * 20)];
+            // Every other tick a short-lived `ps` or `sh` appears, the way a
+            // tab running a coding agent behaves.
+            if step % 2 == 0 {
+                terminals[0].processes.push(p(
+                    900 + step as i32,
+                    11,
+                    "ttys001",
+                    0.0,
+                    2 * 1024,
+                    "ps",
+                ));
+            }
+            terminals[0].footprint_kib =
+                terminals[0].processes.iter().map(|p| p.footprint_kib).sum();
+            app.update_memory_trends(&mut terminals, start + Duration::from_secs(step * 20));
+        }
+
+        let history = &app.memory_history[&11];
+        assert!(
+            history.samples.len() >= MIN_LEAK_SAMPLES,
+            "evidence was thrown away: only {} samples survived",
+            history.samples.len()
+        );
+        assert!(terminals[0].leak_suspected, "steady growth went unnoticed");
+        assert_eq!(terminals[0].leak_process, "node");
+    }
+
+    #[test]
+    fn a_reused_pid_resets_its_own_history() {
+        let start = Instant::now();
+        let mut history = MemoryHistory::default();
+        history.record(start, 100 * 1024, 600);
+        history.record(start + Duration::from_secs(1), 110 * 1024, 601);
+        assert_eq!(history.samples.len(), 2);
         history.alert_active = true;
-        history.suspicious_windows = LEAK_CONFIRMATION_WINDOWS;
 
-        terminals[0]
-            .processes
-            .push(p(11, 10, "ttys001", 0.0, 80 * 1024, "node server.js"));
-        terminals[0].rss_kib = 180 * 1024;
-        app.update_memory_trends(&mut terminals, start + Duration::from_secs(1));
-
-        let history = &app.memory_history[&10];
+        // A pid that reports itself younger than before is a new process.
+        history.record(start + Duration::from_secs(2), 4 * 1024, 1);
         assert_eq!(history.samples.len(), 1);
-        assert!(!history.alert_active);
-        assert!(!terminals[0].leak_suspected);
+        assert!(!history.alert_active, "kept a dead process's leak alert");
     }
 
     #[test]
@@ -3552,6 +3822,138 @@ mod tests {
         assert_eq!(terminals[0].rss_kib, 60);
         assert_eq!(terminals[0].activity, "node");
         assert_eq!(terminals[1].cpu, 1.0);
+    }
+
+    /// Puts a process in its own group and points its tty's foreground group
+    /// at `foreground`, the way `ps` reports it.
+    fn grouped(mut process: Process, foreground: i32) -> Process {
+        process.pgid = process.pid;
+        process.tpgid = foreground;
+        process
+    }
+
+    #[test]
+    fn the_foreground_process_group_names_the_tab_activity() {
+        let processes = vec![
+            p(
+                10,
+                1,
+                "??",
+                0.0,
+                100,
+                "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+            ),
+            grouped(
+                p(
+                    20,
+                    10,
+                    "ttys001",
+                    0.0,
+                    10,
+                    "/usr/bin/login -flp me /bin/zsh",
+                ),
+                40,
+            ),
+            grouped(p(21, 20, "ttys001", 0.0, 20, "-/bin/zsh"), 40),
+            // The program the user is actually running, and idle at this moment.
+            grouped(p(40, 21, "ttys001", 0.1, 900, "claude"), 40),
+            // A background job burning CPU. The old rule named this one.
+            grouped(
+                p(41, 21, "ttys001", 95.0, 50, "ffmpeg -i in.mov out.mp4"),
+                40,
+            ),
+        ];
+        let (_, terminals) = aggregate(&processes);
+        assert_eq!(terminals[0].activity, "claude");
+    }
+
+    #[test]
+    fn a_tab_between_commands_falls_back_to_its_busiest_process() {
+        let processes = vec![
+            p(
+                10,
+                1,
+                "??",
+                0.0,
+                100,
+                "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+            ),
+            // tpgid of -1: no foreground group to read.
+            p(
+                20,
+                10,
+                "ttys001",
+                0.0,
+                10,
+                "/usr/bin/login -flp me /bin/zsh",
+            ),
+            p(21, 20, "ttys001", 0.0, 20, "-/bin/zsh"),
+            p(22, 21, "ttys001", 12.0, 40, "python worker.py"),
+        ];
+        let (_, terminals) = aggregate(&processes);
+        assert_eq!(terminals[0].activity, "python");
+    }
+
+    #[test]
+    fn a_tab_sitting_at_its_prompt_reports_a_shell() {
+        let processes = vec![
+            p(
+                10,
+                1,
+                "??",
+                0.0,
+                100,
+                "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+            ),
+            grouped(
+                p(
+                    20,
+                    10,
+                    "ttys001",
+                    0.0,
+                    10,
+                    "/usr/bin/login -flp me /bin/zsh",
+                ),
+                21,
+            ),
+            grouped(p(21, 20, "ttys001", 0.0, 20, "-/bin/zsh"), 21),
+        ];
+        let (_, terminals) = aggregate(&processes);
+        assert_eq!(terminals[0].activity, "shell");
+    }
+
+    #[test]
+    fn a_reparented_process_is_still_counted_in_its_tab() {
+        let processes = vec![
+            p(
+                10,
+                1,
+                "??",
+                0.0,
+                100,
+                "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+            ),
+            p(
+                20,
+                10,
+                "ttys001",
+                0.0,
+                10,
+                "/usr/bin/login -flp me /bin/zsh",
+            ),
+            p(21, 20, "ttys001", 0.0, 20, "-/bin/zsh"),
+            // Disowned: adopted by pid 1, so no ppid chain leads back to the
+            // login root, but it still holds ttys001.
+            p(22, 1, "ttys001", 3.0, 500, "node server.js"),
+        ];
+        let (_, terminals) = aggregate(&processes);
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(
+            terminals[0].rss_kib, 530,
+            "the orphan's memory went missing"
+        );
+        assert_eq!(terminals[0].cpu, 3.0);
+        assert!(terminals[0].processes.iter().any(|p| p.pid == 22));
     }
 
     #[test]
@@ -3742,6 +4144,40 @@ mod tests {
             let expected = MONITOR_FIXED_WIDTH + tab + activity;
             assert_eq!(plain.chars().count(), expected, "width {width}");
             assert!(plain.trim_start().starts_with("TAB"));
+        }
+    }
+
+    #[test]
+    fn the_expanded_process_list_lines_up_with_its_headings() {
+        let mut app = populated_app(UsageScale::Daily);
+        app.expanded = true;
+        app.selected = 0;
+        let (frame, _) = render_monitor(&app, 40, 120);
+        let plain: Vec<String> = frame.iter().map(|line| strip_ansi(line)).collect();
+        let heading_row = plain
+            .iter()
+            .position(|line| line.contains("RESIDENT"))
+            .expect("the expanded process list should be drawn");
+        let heading = &plain[heading_row];
+        let row = &plain[heading_row + 1];
+
+        // The command begins where its heading does.
+        assert_eq!(heading.find("COMMAND"), Some(EXPANDED_FIXED_WIDTH));
+        assert_eq!(row.find("node"), Some(EXPANDED_FIXED_WIDTH));
+
+        // Each figure is right-aligned to the last column of its heading, so a
+        // value that outgrows its field is caught here rather than on screen.
+        for name in ["CPU", "RAM", "RESIDENT"] {
+            let end = heading.find(name).expect("heading") + name.len();
+            let cells: Vec<char> = row.chars().collect();
+            assert!(
+                !cells[end - 1].is_whitespace(),
+                "{name} value stops short of its heading"
+            );
+            assert!(
+                cells[end].is_whitespace(),
+                "{name} value runs past its heading"
+            );
         }
     }
 
@@ -4062,6 +4498,7 @@ mod tests {
                 label: format!("a tab name that is quite long {index}"),
                 cpu: index as f64 * 7.5,
                 rss_kib: 4096 * (index as u64 + 1),
+                footprint_kib: 5120 * (index as u64 + 1),
                 processes: vec![p(
                     200 + index,
                     100 + index,
@@ -4077,6 +4514,8 @@ mod tests {
                 memory_slope_kib_per_min: 12.0,
                 memory_samples: 20,
                 leak_suspected: index % 4 == 0,
+                leak_process: "node".into(),
+                leak_growth_kib: 96 * 1024,
             });
         }
         app
@@ -4277,6 +4716,40 @@ mod tests {
         assert!(own.rss_kib > 0, "parsed no resident memory");
     }
 
+    /// Guards the libproc struct layout. If a future macOS changes what
+    /// `RUSAGE_INFO_V2` means, the field would be read from the wrong offset and
+    /// this is where it shows up rather than in a wrong number on screen.
+    #[test]
+    fn reads_a_real_physical_footprint() {
+        let own_pid = std::process::id() as i32;
+        let footprint =
+            phys_footprint_kib(own_pid).expect("should read our own process's footprint");
+        assert!(footprint > 0, "read a zero footprint for a live process");
+        // A test binary is a few MiB, never a terabyte. Reading the wrong
+        // offset lands far outside this range.
+        assert!(
+            (256..64 * 1024 * 1024).contains(&footprint),
+            "implausible footprint of {footprint} KiB suggests a wrong struct offset"
+        );
+    }
+
+    #[test]
+    fn a_failed_footprint_reading_falls_back_to_resident_memory() {
+        // Nothing owns pid 0, and plenty of the process table belongs to other
+        // users, so an unreadable process is the common case rather than the
+        // exception.
+        assert_eq!(phys_footprint_kib(0), None);
+        let processes = sample_processes().expect("ps should run");
+        // Zombies really do hold no memory; every process that holds some must
+        // still report some, whether or not its footprint could be read.
+        assert!(
+            processes
+                .iter()
+                .all(|process| process.rss_kib == 0 || process.footprint_kib > 0),
+            "a process holding memory was reported as using none"
+        );
+    }
+
     #[test]
     fn a_process_without_a_terminal_is_recognised_on_either_platform() {
         assert!(has_tty("ttys001"));
@@ -4334,8 +4807,11 @@ mod tests {
             4096,
             "/usr/bin/python3 server.py --token secret",
         );
+        let mut process = process;
+        process.footprint_kib = 8192;
         let row = process_history_row(1_000, "2026-08-06", "terminal", "ttys001", 7, &process);
-        assert!(row.contains("\t42\t7\t12.5\t4096\t"));
+        // pid, ppid, cpu, footprint, resident.
+        assert!(row.contains("\t42\t7\t12.5\t8192\t4096\t"));
         assert!(row.ends_with("\tpython3\t/usr/bin/python3"));
         assert!(!row.contains("server.py"));
         assert!(!row.contains("secret"));
