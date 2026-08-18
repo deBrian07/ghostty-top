@@ -107,12 +107,16 @@ tool is for.
 
 ```sh
 rustup target add x86_64-apple-darwin   # once, for Intel support
-./scripts/build-binaries.sh             # lipo both slices into binaries/
 npm publish                             # version comes from package.json
 ```
 
-`scripts/build-binaries.sh` warns and keeps going when a target is missing, so
-check its `lipo -info` output says `arm64 x86_64` before publishing. Keep
+`binaries/` is gitignored, so `prepack` runs `scripts/build-binaries.sh` for
+both `npm pack` and `npm publish`. Without it a clean checkout published a
+tarball with no binary in it, and nothing objected: npm only warns, the install
+still reports success, and the failure surfaces as `command not found`.
+
+The script still warns and keeps going when one Apple target is missing, so
+check its `lipo -info` output says `x86_64 arm64` before publishing. Keep
 `version` in `package.json` and `Cargo.toml` in step.
 
 ## Layout of `src/main.rs`
@@ -176,6 +180,24 @@ that is its own group's leader and whose group is the tty's `tpgid` is what the
 tab is running. This used to be a guess at the highest-CPU process, which named
 a background `ffmpeg` over the program in front of the user. The busiest-process
 rule survives only as the fallback for when `ps` reports no foreground group.
+
+**The sample budget and the credit window are one rule.** A focus sample is
+timestamped when the AppleScript *answers*, so a slow answer widens the gap to
+the previous sample. `USAGE_POLL_INTERVAL + USAGE_SAMPLE_TIMEOUT` must stay
+inside `MAX_CREDITED_GAP` or a query that succeeds slowly is thrown away
+anyway; `a_slow_focus_query_still_lands_inside_the_credit_window` pins it. The
+same arithmetic is why a failed sample retries on the normal schedule instead
+of backing off — a longer backoff pushed the *next* sample past the window too,
+so one slow query cost two intervals rather than one.
+
+**`save` merges, `save_replacing` does not.** Two processes record by default:
+the login tracker and the TUI, which enables tracking unconditionally. Each
+holds its own snapshot and rewrites the whole file, so the periodic flush
+re-reads and keeps the larger count per tab — they watch the same wall clock,
+so the larger count is the more complete one, not something to add to. Use
+`save_replacing` only for the one-shot commands that deliberately delete rows;
+`--clear-demo-history` is the reason the split exists, because merging
+resurrected everything it had just removed.
 
 **Tracking correctness beats tracking coverage.** Time is credited only when
 Ghostty is frontmost, the user is present (`away_reason`), and both the
