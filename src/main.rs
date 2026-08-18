@@ -63,8 +63,17 @@ const TAB_LABEL_REFRESH: Duration = Duration::from_secs(15);
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(8);
 const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+/// The longest gap `credited_time` will pay out. Anything wider is treated as
+/// a stall or a sleep rather than time the user spent looking at a tab.
+const MAX_CREDITED_GAP: Duration = Duration::from_secs(15);
+/// A sample is timestamped when the query *answers*, so a slow answer widens
+/// the gap to the previous sample. The budget therefore has to leave room for
+/// a whole poll interval on top of itself, or a query that succeeds slowly
+/// still gets thrown away. One second was far too tight: the query answers in
+/// 0.26 s at the median but has a long tail, so the budget sat inside the
+/// distribution and fired on roughly one sample in forty.
 #[cfg(target_os = "macos")]
-const USAGE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(1);
+const USAGE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(target_os = "macos")]
 const LAUNCH_AGENT_LABEL: &str = "com.debrian07.ghostty-top.tracker";
 const INVENTORY_POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -966,9 +975,14 @@ impl UsageTracker {
                     self.next_poll = now + USAGE_POLL_INTERVAL;
                 }
                 Ok(Err(error)) => {
+                    // The focus is unknown after a failure, so the interval it
+                    // covered cannot be credited. Retry on the normal schedule
+                    // anyway: a longer backoff used to push the next sample
+                    // past MAX_CREDITED_GAP, which meant one failed query threw
+                    // away the interval that followed it as well.
                     self.forget_focus();
                     self.last_error = Some(error);
-                    self.next_poll = now + Duration::from_secs(30);
+                    self.next_poll = now + USAGE_POLL_INTERVAL;
                 }
                 Err(mpsc::TryRecvError::Empty) => return false,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -1111,7 +1125,7 @@ end repeat
 end repeat
 return resultText
 end tell"#;
-    let output = run_osascript(SCRIPT, INVENTORY_TIMEOUT)?;
+    let output = run_osascript(SCRIPT, "tab name", INVENTORY_TIMEOUT)?;
     Ok(output
         .trim_end()
         .split('\x1e')
@@ -1211,7 +1225,7 @@ fn shell_pid(terminal: &Terminal) -> i32 {
 /// freezes the monotonic clock across a sleep or keeps counting through it, one
 /// of the two readings exposes the gap and the sample is dropped.
 fn credited_time(previous: (Instant, SystemTime), now: (Instant, SystemTime)) -> Option<Duration> {
-    let limit = USAGE_POLL_INTERVAL * 3;
+    let limit = MAX_CREDITED_GAP;
     let elapsed = now.0.duration_since(previous.0);
     // A backwards wall clock yields an error here, which also fails the check.
     let wall_elapsed = now.1.duration_since(previous.1).ok()?;
@@ -1622,7 +1636,7 @@ set theTerminal to focused terminal of theTab
 set separator to ASCII character 9
 return (id of theTab as text) & separator & (name of theTab as text) & separator & (id of theTerminal as text) & separator & (name of theTerminal as text)
 end tell"#;
-    let output = run_osascript(SCRIPT, USAGE_SAMPLE_TIMEOUT)?;
+    let output = run_osascript(SCRIPT, "focused tab", USAGE_SAMPLE_TIMEOUT)?;
     let output = output.trim();
     if output.is_empty() {
         return Ok(None);
@@ -1677,7 +1691,7 @@ return resultText
 end tell"#;
     // Walking every surface scales with tab count and routinely runs past a
     // second, so this query is given room and is never issued on the UI thread.
-    let output = run_osascript(SCRIPT, INVENTORY_TIMEOUT)?;
+    let output = run_osascript(SCRIPT, "tab inventory", INVENTORY_TIMEOUT)?;
     parse_tab_inventory(&output)
 }
 
@@ -1714,7 +1728,7 @@ fn parse_tab_inventory(output: &str) -> Result<Vec<TabObservation>, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn run_osascript(script: &str, timeout: Duration) -> Result<String, String> {
+fn run_osascript(script: &str, what: &str, timeout: Duration) -> Result<String, String> {
     let mut child = Command::new("osascript")
         .args(["-e", script])
         .stdin(Stdio::null())
@@ -1727,7 +1741,9 @@ fn run_osascript(script: &str, timeout: Duration) -> Result<String, String> {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    return Err("Ghostty Automation permission is unavailable".to_string());
+                    return Err(format!(
+                        "Ghostty refused the {what} query; allow Automation access"
+                    ));
                 }
                 let mut output = String::new();
                 if let Some(mut stdout) = child.stdout.take() {
@@ -1741,7 +1757,13 @@ fn run_osascript(script: &str, timeout: Duration) -> Result<String, String> {
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("Ghostty focus query timed out; allow Automation access".to_string());
+                // Not a permission problem: a refusal exits non-zero above,
+                // and saying otherwise sent people to System Settings to look
+                // at a switch that was already on.
+                return Err(format!(
+                    "Ghostty took longer than {}s to answer the {what} query",
+                    timeout.as_secs()
+                ));
             }
             Err(error) => return Err(format!("could not query focused tab: {error}")),
         }
@@ -4211,6 +4233,21 @@ mod tests {
         assert!(is_ghostty_app("ghostty"));
         assert!(!is_ghostty_app("/Users/me/.cargo/bin/ghostty-top"));
         assert!(!is_ghostty_app("ghostty-top"));
+    }
+
+    /// The budget and the credit window are two halves of one rule: a query
+    /// that answers slowly still has to be payable, or raising the budget just
+    /// moves the loss instead of fixing it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_slow_focus_query_still_lands_inside_the_credit_window() {
+        assert!(
+            USAGE_POLL_INTERVAL + USAGE_SAMPLE_TIMEOUT <= MAX_CREDITED_GAP,
+            "a query that uses its whole budget would be sampled {:?} after the \
+             previous one, past the {:?} that credited_time will pay out",
+            USAGE_POLL_INTERVAL + USAGE_SAMPLE_TIMEOUT,
+            MAX_CREDITED_GAP,
+        );
     }
 
     #[test]
