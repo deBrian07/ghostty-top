@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -818,17 +818,37 @@ impl App {
     }
 }
 
+/// Whether a write folds in what is already on disk.
+#[derive(Clone, Copy, PartialEq)]
+enum Merge {
+    WithFile,
+    No,
+}
+
 impl UsageStore {
     fn load(path: Option<PathBuf>) -> Self {
         let mut store = Self {
             path,
             ..Self::default()
         };
-        let Some(path) = &store.path else {
-            return store;
-        };
+        if let Some(path) = store.path.clone() {
+            store.merge_file(&path);
+        }
+        store
+    }
+
+    /// Folds a usage file into this store, keeping the larger count wherever
+    /// both sides know a tab.
+    ///
+    /// Two processes record at once in the default setup — the login tracker
+    /// and the TUI — and each holds its own view of the day. They are watching
+    /// the same wall clock, so the larger count is the more complete one rather
+    /// than something to add on top. Merging is also self-healing: a process
+    /// keeps its own totals in memory, so a count momentarily lost to a racing
+    /// writer comes back on the next save.
+    fn merge_file(&mut self, path: &Path) {
         let Ok(contents) = fs::read_to_string(path) else {
-            return store;
+            return;
         };
         for line in contents.lines() {
             let mut fields = line.splitn(4, '\t');
@@ -840,16 +860,19 @@ impl UsageStore {
             let Ok(seconds) = seconds.parse::<u64>() else {
                 continue;
             };
-            let seconds = seconds.min(MAX_DAILY_SECONDS);
-            store.days.entry(day.to_string()).or_default().insert(
-                tab_id.to_string(),
-                TabUsage {
-                    name: name.to_string(),
-                    seconds,
-                },
-            );
+            let entry = self
+                .days
+                .entry(day.to_string())
+                .or_default()
+                .entry(tab_id.to_string())
+                .or_default();
+            entry.seconds = entry.seconds.max(seconds.min(MAX_DAILY_SECONDS));
+            // Ours is the fresher name when we have one; the file supplies it
+            // for tabs this process has never seen.
+            if entry.name.is_empty() {
+                entry.name = name.to_string();
+            }
         }
-        store
     }
 
     fn add(&mut self, day: &str, focus: &FocusedTab, seconds: u64) {
@@ -867,16 +890,36 @@ impl UsageStore {
         self.dirty = true;
     }
 
+    /// The periodic flush. Merges first, so a tab another process recorded
+    /// while we held our snapshot survives the rewrite.
     fn save(&mut self) -> io::Result<()> {
+        self.write(Merge::WithFile)
+    }
+
+    /// Writes this store over whatever is on disk. Only for the one-shot
+    /// commands that deliberately remove rows: they own the file for the
+    /// length of one run, and merging would resurrect exactly what they were
+    /// asked to delete.
+    fn save_replacing(&mut self) -> io::Result<()> {
+        self.write(Merge::No)
+    }
+
+    fn write(&mut self, merge: Merge) -> io::Result<()> {
         if !self.dirty {
             return Ok(());
         }
-        let Some(path) = &self.path else {
+        let Some(path) = self.path.clone() else {
             self.dirty = false;
             return Ok(());
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+        }
+        // Re-read before the wholesale rewrite below. Anything another process
+        // has recorded since we loaded is only in the file, and writing our own
+        // view straight over the top would delete it.
+        if merge == Merge::WithFile {
+            self.merge_file(&path);
         }
         let mut contents = String::new();
         for (day, tabs) in &self.days {
@@ -890,9 +933,12 @@ impl UsageStore {
                 ));
             }
         }
-        let temporary = path.with_extension("tmp");
+        // Per-process scratch name: a shared one lets two writers truncate and
+        // fill the same file at once, so a rename can publish half of somebody
+        // else's write. Same directory, so the rename stays atomic.
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         fs::write(&temporary, contents)?;
-        fs::rename(temporary, path)?;
+        fs::rename(&temporary, &path)?;
         self.dirty = false;
         Ok(())
     }
@@ -1374,7 +1420,7 @@ fn clear_demo_history_at(path: Option<PathBuf>) -> io::Result<usize> {
     });
     if changed_days > 0 {
         store.dirty = true;
-        store.save()?;
+        store.save_replacing()?;
     }
     Ok(changed_days)
 }
@@ -3745,6 +3791,52 @@ mod tests {
         history.record(start + Duration::from_secs(2), 4 * 1024, 1);
         assert_eq!(history.samples.len(), 1);
         assert!(!history.alert_active, "kept a dead process's leak alert");
+    }
+
+    /// The login tracker and the TUI both record by default, each holding its
+    /// own view of the file. Before this, whichever saved last replaced the
+    /// file wholesale and the other's rows were gone for good.
+    #[test]
+    fn a_save_keeps_what_another_writer_recorded() {
+        let directory =
+            env::temp_dir().join(format!("ghostty-top-two-writers-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("usage.tsv");
+
+        // What the tracker had written before the TUI started.
+        fs::write(&path, "2026-08-18\ttab-AAA\t3600\tAlpha\n").unwrap();
+        let mut tui = UsageStore::load(Some(path.clone()));
+
+        // The tracker keeps going while the TUI holds its snapshot: it extends
+        // a tab the TUI knows about and starts one it does not.
+        fs::write(
+            &path,
+            "2026-08-18\ttab-AAA\t7200\tAlpha\n2026-08-18\ttab-BBB\t1800\tBravo\n",
+        )
+        .unwrap();
+
+        tui.add(
+            "2026-08-18",
+            &FocusedTab {
+                tab_id: "tab-CCC".into(),
+                tab_name: "Charlie".into(),
+                terminal_id: String::new(),
+                terminal_name: String::new(),
+            },
+            25,
+        );
+        tui.save().unwrap();
+
+        let merged = UsageStore::load(Some(path.clone()));
+        let today = &merged.days["2026-08-18"];
+        assert_eq!(
+            today["tab-AAA"].seconds, 7200,
+            "the tracker's hour was reverted"
+        );
+        assert_eq!(today["tab-BBB"].seconds, 1800, "a whole tab was deleted");
+        assert_eq!(today["tab-CCC"].seconds, 25, "the TUI lost its own row");
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
