@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -79,6 +81,47 @@ const INVENTORY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const INVENTORY_HEARTBEAT: Duration = Duration::from_secs(15 * 60);
 const RESOURCE_HISTORY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const HISTORY_SCHEMA_VERSION: &str = "1";
+const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_MOUSE_SEQUENCE_BYTES: usize = 32;
+const PROCESS_SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const DIRECTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(target_os = "macos")]
+const PRESENCE_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(target_os = "macos")]
+const GHOSTTY_RUNNING_TIMEOUT: Duration = Duration::from_millis(500);
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_shutdown(_: i32) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+struct SignalGuard {
+    original: [(i32, usize); 3],
+}
+
+impl SignalGuard {
+    fn enter() -> Self {
+        SHUTDOWN_REQUESTED.store(false, Ordering::Relaxed);
+        // signal's handlers are pointer-sized values, including SIG_DFL and
+        // SIG_IGN. The handler itself only touches an atomic, never terminal IO.
+        let original = [1, 2, 15].map(|number| {
+            let previous = unsafe { signal(number, request_shutdown as *const () as usize) };
+            (number, previous)
+        });
+        Self { original }
+    }
+}
+
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        for (number, handler) in self.original {
+            if handler != usize::MAX {
+                unsafe { signal(number, handler) };
+            }
+        }
+    }
+}
 const HISTORY_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 const HISTORY_BACKUPS: usize = 3;
 
@@ -92,20 +135,20 @@ const STTY_FILE: &str = "-f";
 #[cfg(not(target_os = "macos"))]
 const STTY_FILE: &str = "-F";
 
-/// BSD `ps` takes `-axo`; procps wants `-eo` and spells the column `args`.
+/// Read executable names only: argument lists can include credentials.
 #[cfg(target_os = "macos")]
 const PS_PROCESSES: [&str; 2] = [
     "-axo",
-    "pid=,ppid=,pgid=,tpgid=,tty=,%cpu=,rss=,etime=,command=",
+    "pid=,ppid=,pgid=,tpgid=,tty=,%cpu=,rss=,etime=,comm=",
 ];
 #[cfg(not(target_os = "macos"))]
 const PS_PROCESSES: [&str; 2] = [
     "-eo",
-    "pid=,ppid=,pgid=,tpgid=,tty=,%cpu=,rss=,etime=,args=",
+    "pid=,ppid=,pgid=,tpgid=,tty=,%cpu=,rss=,etime=,comm=",
 ];
 
 #[cfg(target_os = "macos")]
-const PS_COMMANDS: [&str; 2] = ["-axo", "command="];
+const PS_COMMANDS: [&str; 2] = ["-axo", "comm="];
 /// Ghostty only reports which tab is focused through its AppleScript
 /// dictionary, which exists on macOS alone. Without it there is no way to tell
 /// tabs apart, so focused-time tracking is a macOS feature.
@@ -303,6 +346,7 @@ impl ClickZone {
 #[derive(Default)]
 struct InputDecoder {
     pending: Vec<u8>,
+    incomplete_since: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -595,7 +639,11 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        match sample_processes() {
+        self.apply_process_sample(sample_processes());
+    }
+
+    fn apply_process_sample(&mut self, sample: Result<Vec<Process>, String>) {
+        match sample {
             Ok(processes) => {
                 let selected_tty = self.terminals.get(self.selected).map(|t| t.tty.clone());
                 let (ghostty, mut terminals) = aggregate(&processes);
@@ -1229,12 +1277,10 @@ fn shell_working_directories(pids: &[i32]) -> HashMap<i32, String> {
         .map(i32::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let Ok(output) = Command::new("lsof")
-        .args(["-a", "-d", "cwd", "-p", &list, "-Fpn"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
+    let Ok(output) = run_command_with_timeout(
+        Command::new("lsof").args(["-a", "-d", "cwd", "-p", &list, "-Fpn"]),
+        DIRECTORY_QUERY_TIMEOUT,
+    ) else {
         return HashMap::new();
     };
     let text = String::from_utf8_lossy(&output.stdout);
@@ -1372,12 +1418,11 @@ fn hid_idle_time() -> Option<Duration> {
 /// Reads `"<key>" = <value>` out of an ioreg dump.
 #[cfg(target_os = "macos")]
 fn ioreg_value(arguments: &[&str], key: &str) -> Option<String> {
-    let output = Command::new("ioreg")
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let output = run_command_with_timeout(
+        Command::new("ioreg").args(arguments),
+        PRESENCE_QUERY_TIMEOUT,
+    )
+    .ok()?;
     let needle = format!("\"{key}\" = ");
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -1798,47 +1843,93 @@ fn parse_tab_inventory(output: &str) -> Result<Vec<TabObservation>, String> {
     Ok(observations)
 }
 
-#[cfg(target_os = "macos")]
-fn run_osascript(script: &str, what: &str, timeout: Duration) -> Result<String, String> {
-    let mut child = Command::new("osascript")
-        .args(["-e", script])
+/// Read stdout while the child runs: waiting first deadlocks when a query
+/// produces more than the pipe can hold. The deadline includes draining output.
+fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<std::process::Output> {
+    let deadline = Instant::now() + timeout;
+    let mut child = command
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("could not start Ghostty tracking: {error}"))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Err(format!(
-                        "Ghostty refused the {what} query; allow Automation access"
-                    ));
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = stdout.read_to_end(&mut output).map(|_| output);
+        let _ = sender.send(result);
+    });
+    let result = (|| {
+        let mut output = None;
+        loop {
+            if output.is_none() {
+                match receiver.try_recv() {
+                    Ok(bytes) => output = Some(bytes?),
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(io::Error::other("command output reader stopped"));
+                    }
                 }
-                let mut output = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    stdout
-                        .read_to_string(&mut output)
-                        .map_err(|error| format!("could not read Ghostty state: {error}"))?;
-                }
-                return Ok(output);
             }
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                // Not a permission problem: a refusal exits non-zero above,
-                // and saying otherwise sent people to System Settings to look
-                // at a switch that was already on.
-                return Err(format!(
+            // Keep the child unreaped until stdout closes. Its PID then cannot
+            // be reused while a descendant still owns the pipe or process group.
+            if let Some(stdout) = output.take() {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(std::process::Output {
+                        status,
+                        stdout,
+                        stderr: Vec::new(),
+                    });
+                }
+                output = Some(stdout);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "command timed out"));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    if result.is_err() {
+        terminate_process_group(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        // Group termination also closes inherited stdout in descendants, so
+        // the reader can finish instead of accumulating a thread every retry.
+        let _ = receiver.recv_timeout(Duration::from_millis(100));
+    }
+    result
+}
+
+fn terminate_process_group(pid: u32) {
+    // process_group(0) gives the child a group owned solely by this command.
+    // A negative PID targets that group, including children retaining stdout.
+    unsafe { kill(-(pid as i32), 9) };
+}
+
+#[cfg(target_os = "macos")]
+fn run_osascript(script: &str, what: &str, timeout: Duration) -> Result<String, String> {
+    let output = run_command_with_timeout(Command::new("osascript").args(["-e", script]), timeout)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                format!(
                     "Ghostty took longer than {}s to answer the {what} query",
                     timeout.as_secs()
-                ));
+                )
+            } else {
+                format!("could not query Ghostty state: {error}")
             }
-            Err(error) => return Err(format!("could not query focused tab: {error}")),
-        }
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "Ghostty refused the {what} query; allow Automation access"
+        ));
     }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("could not read Ghostty state: {error}"))
 }
 
 fn append_tab_inventory(day: &str, observations: &[TabObservation]) -> io::Result<()> {
@@ -2148,12 +2239,10 @@ fn unix_timestamp() -> u64 {
 /// process list is matched the same way `aggregate` does it instead.
 #[cfg(target_os = "macos")]
 fn ghostty_is_running() -> bool {
-    let Ok(output) = Command::new("ps")
-        .args(PS_COMMANDS)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
+    let Ok(output) = run_command_with_timeout(
+        Command::new("ps").args(PS_COMMANDS),
+        GHOSTTY_RUNNING_TIMEOUT,
+    ) else {
         return false;
     };
     String::from_utf8_lossy(&output.stdout)
@@ -2168,62 +2257,122 @@ fn is_ghostty_app(command: &str) -> bool {
 
 impl InputDecoder {
     fn push(&mut self, bytes: &[u8]) -> Vec<InputEvent> {
+        self.push_at(bytes, Instant::now())
+    }
+
+    fn push_at(&mut self, bytes: &[u8], now: Instant) -> Vec<InputEvent> {
+        // Expire the old prefix before accepting new input, so a later key
+        // cannot be swallowed by an abandoned escape or mouse report.
+        if self
+            .incomplete_since
+            .is_some_and(|start| now.duration_since(start) >= INPUT_SEQUENCE_TIMEOUT)
+        {
+            self.pending.clear();
+            self.incomplete_since = None;
+        }
         self.pending.extend_from_slice(bytes);
         let mut events = Vec::new();
-        loop {
-            if self.pending.is_empty() {
-                break;
-            }
-            if self.pending[0] != 0x1b {
-                events.push(InputEvent::Key(Key::Char(self.pending.remove(0))));
+        let mut consumed = 0;
+        while consumed < self.pending.len() {
+            let remaining = &self.pending[consumed..];
+            if remaining[0] != 0x1b {
+                events.push(InputEvent::Key(Key::Char(remaining[0])));
+                consumed += 1;
                 continue;
             }
-            if self.pending.len() < 2 {
+            if remaining.len() == 1 || remaining == b"\x1b[" {
                 break;
             }
-            if self.pending.starts_with(b"\x1b[<") {
-                let Some(end) = self
-                    .pending
-                    .iter()
-                    .position(|byte| *byte == b'M' || *byte == b'm')
-                else {
-                    break;
-                };
-                let pressed = self.pending[end] == b'M';
-                let body = String::from_utf8_lossy(&self.pending[3..end]);
-                let values: Vec<u16> = body
-                    .split(';')
-                    .filter_map(|part| part.parse().ok())
-                    .collect();
-                if values.len() == 3 {
-                    events.push(InputEvent::Mouse(MouseEvent {
-                        button: values[0],
-                        column: values[1] as usize,
-                        row: values[2] as usize,
-                        pressed,
-                    }));
+            if remaining.starts_with(b"\x1b[<") {
+                let mut end = 3;
+                while end < remaining.len()
+                    && (remaining[end].is_ascii_digit() || remaining[end] == b';')
+                    && end < MAX_MOUSE_SEQUENCE_BYTES
+                {
+                    end += 1;
                 }
-                self.pending.drain(..=end);
+                if end == remaining.len() && end < MAX_MOUSE_SEQUENCE_BYTES {
+                    break;
+                }
+                if end < remaining.len() && matches!(remaining[end], b'M' | b'm') {
+                    let values: Option<Vec<u16>> = std::str::from_utf8(&remaining[3..end])
+                        .ok()
+                        .and_then(|body| {
+                            body.split(';')
+                                .map(str::parse)
+                                .collect::<Result<Vec<_>, _>>()
+                                .ok()
+                        });
+                    if let Some(values) =
+                        values.filter(|values| values.len() == 3 && values[1] > 0 && values[2] > 0)
+                    {
+                        events.push(InputEvent::Mouse(MouseEvent {
+                            button: values[0],
+                            column: values[1] as usize,
+                            row: values[2] as usize,
+                            pressed: remaining[end] == b'M',
+                        }));
+                    }
+                    consumed += end + 1;
+                } else {
+                    // Keep the first non-mouse byte: it may be the quit key.
+                    consumed += end;
+                }
                 continue;
             }
-            if self.pending.len() < 3 {
-                break;
+            if remaining.len() >= 3 {
+                let key = match &remaining[..3] {
+                    b"\x1b[A" => Some(Key::Up),
+                    b"\x1b[B" => Some(Key::Down),
+                    b"\x1b[H" => Some(Key::Home),
+                    b"\x1b[F" => Some(Key::End),
+                    _ => None,
+                };
+                if let Some(key) = key {
+                    events.push(InputEvent::Key(key));
+                    consumed += 3;
+                    continue;
+                }
             }
-            let key = match &self.pending[..3] {
-                b"\x1b[A" => Some(Key::Up),
-                b"\x1b[B" => Some(Key::Down),
-                b"\x1b[H" => Some(Key::Home),
-                b"\x1b[F" => Some(Key::End),
-                _ => None,
-            };
-            if let Some(key) = key {
-                events.push(InputEvent::Key(key));
-                self.pending.drain(..3);
-            } else {
-                self.pending.remove(0);
-            }
+            consumed += 1;
+        }
+        self.pending.drain(..consumed);
+        if self.pending.is_empty() {
+            self.incomplete_since = None;
+        } else if consumed > 0 || self.incomplete_since.is_none() {
+            self.incomplete_since = Some(now);
         }
         events
+    }
+}
+
+#[derive(Default)]
+struct ProcessSampler {
+    pending: Option<mpsc::Receiver<Result<Vec<Process>, String>>>,
+}
+
+impl ProcessSampler {
+    fn start(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(sample_processes());
+        });
+        self.pending = Some(receiver);
+    }
+
+    fn poll(&mut self) -> Option<Result<Vec<Process>, String>> {
+        let result = match self.pending.as_ref()?.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("process sampling worker stopped".to_string())
+            }
+        };
+        self.pending = None;
+        Some(result)
     }
 }
 
@@ -2323,6 +2472,7 @@ fn main() {
         return;
     }
 
+    let _signal_guard = SignalGuard::enter();
     app.enable_usage_tracking();
     app.tracker_outdated = tracker_is_outdated();
 
@@ -2332,12 +2482,20 @@ fn main() {
             std::process::exit(1);
         }
         println!("Tracking focused Ghostty tab usage. Press Ctrl-C to stop.");
+        let mut sampler = ProcessSampler::default();
         let mut next_resource_refresh = Instant::now();
         let mut reported_tracking_error: Option<String> = None;
         loop {
+            if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                app.flush_usage();
+                return;
+            }
             let now = Instant::now();
-            if now >= next_resource_refresh {
-                app.refresh();
+            if let Some(sample) = sampler.poll() {
+                app.apply_process_sample(sample);
+            }
+            if now >= next_resource_refresh && sampler.pending.is_none() {
+                sampler.start();
                 next_resource_refresh = now + Duration::from_secs(60);
             }
             app.track_usage(now);
@@ -2375,16 +2533,25 @@ fn main() {
 
     let mut stdin = io::stdin();
     let mut decoder = InputDecoder::default();
+    let mut sampler = ProcessSampler::default();
     let mut next_sample = Instant::now() + app.interval;
     let mut dirty = true;
     let mut layout = Layout::default();
     loop {
+        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            app.flush_usage();
+            return;
+        }
         if dirty {
             layout = render(&app);
             dirty = false;
         }
-        let mut input = [0_u8; 64];
-        if let Ok(count) = stdin.read(&mut input) {
+        let mut input = [0_u8; 4096];
+        // Limit each batch so a stream of mouse movement cannot starve samples.
+        for _ in 0..16 {
+            let Ok(count) = stdin.read(&mut input) else {
+                break;
+            };
             for event in decoder.push(&input[..count]) {
                 let keep_running = match event {
                     InputEvent::Key(key) => app.handle_key(key),
@@ -2396,10 +2563,17 @@ fn main() {
                 }
                 dirty = true;
             }
+            if count == 0 {
+                break;
+            }
         }
-        if Instant::now() >= next_sample {
+        if let Some(sample) = sampler.poll() {
+            app.apply_process_sample(sample);
+            dirty = true;
+        }
+        if Instant::now() >= next_sample && sampler.pending.is_none() {
             app.poll_labels(Instant::now());
-            app.refresh();
+            sampler.start();
             next_sample = Instant::now() + app.interval;
             dirty = true;
         }
@@ -2410,30 +2584,31 @@ fn main() {
     }
 }
 
-trait IsTerminal {
-    fn is_terminal(&self) -> bool;
-}
-
-impl IsTerminal for io::Stdin {
-    fn is_terminal(&self) -> bool {
-        unsafe { isatty(0) == 1 }
-    }
-}
-
-impl IsTerminal for io::Stdout {
-    fn is_terminal(&self) -> bool {
-        unsafe { isatty(1) == 1 }
-    }
-}
-
 extern "C" {
-    fn isatty(fd: i32) -> i32;
+    fn signal(number: i32, handler: usize) -> usize;
+    fn kill(pid: i32, signal: i32) -> i32;
     #[cfg(target_os = "macos")]
     fn getuid() -> u32;
 }
 
 struct TerminalGuard {
     original: String,
+    active: Arc<AtomicBool>,
+}
+
+fn restore_terminal(original: &str, active: &AtomicBool) {
+    if !active.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let _ = Command::new("stty")
+        .args([STTY_FILE, "/dev/tty", original])
+        .status();
+    let mut stdout = io::stdout();
+    let _ = write!(
+        stdout,
+        "\x1b[?1003l\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l{RESET}"
+    );
+    let _ = stdout.flush();
 }
 
 impl TerminalGuard {
@@ -2458,19 +2633,26 @@ impl TerminalGuard {
         if !ok {
             return None;
         }
+        let active = Arc::new(AtomicBool::new(true));
+        let hook_active = Arc::clone(&active);
+        let hook_original = original.clone();
+        let previous_hook = std::panic::take_hook();
+        // Release builds abort on panic and skip Drop; restore before the
+        // original hook prints its diagnostic or aborts the process.
+        std::panic::set_hook(Box::new(move |info| {
+            SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+            restore_terminal(&hook_original, &hook_active);
+            previous_hook(info);
+        }));
         print!("\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h");
         let _ = io::stdout().flush();
-        Some(Self { original })
+        Some(Self { original, active })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = Command::new("stty")
-            .args([STTY_FILE, "/dev/tty", &self.original])
-            .status();
-        print!("\x1b[?1003l\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l{RESET}");
-        let _ = io::stdout().flush();
+        restore_terminal(&self.original, &self.active);
     }
 }
 
@@ -2480,11 +2662,11 @@ fn usage_and_exit(code: i32) -> ! {
 }
 
 fn sample_processes() -> Result<Vec<Process>, String> {
-    let output = Command::new("ps")
-        .args(PS_PROCESSES)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("could not run ps: {e}"))?;
+    let output = run_command_with_timeout(
+        Command::new("ps").args(PS_PROCESSES),
+        PROCESS_SAMPLE_TIMEOUT,
+    )
+    .map_err(|e| format!("could not run ps: {e}"))?;
     if !output.status.success() {
         return Err(format!("ps exited with {}", output.status));
     }
@@ -2650,7 +2832,7 @@ fn assign_descendants(
 }
 
 fn is_login_process(command: &str) -> bool {
-    command.starts_with("/usr/bin/login ") || command == "/usr/bin/login"
+    command == "login" || command.starts_with("/usr/bin/login ") || command == "/usr/bin/login"
 }
 
 fn is_shell(command: &str) -> bool {
@@ -6395,5 +6577,168 @@ mod tests {
         assert!(frame
             .iter()
             .any(|line| strip_ansi(line).contains("Tracking paused: focus query timed out")));
+    }
+
+    #[test]
+    fn runtime_escape_expires_on_an_empty_input_poll() {
+        let mut decoder = InputDecoder::default();
+        let now = Instant::now();
+        assert!(decoder.push_at(b"\x1b", now).is_empty());
+        assert!(decoder
+            .push_at(b"", now + INPUT_SEQUENCE_TIMEOUT)
+            .is_empty());
+        assert!(decoder.pending.is_empty());
+        assert_eq!(
+            decoder.push_at(b"q", now + INPUT_SEQUENCE_TIMEOUT),
+            vec![InputEvent::Key(Key::Char(b'q'))]
+        );
+    }
+
+    #[test]
+    fn runtime_abandoned_mouse_report_does_not_swallow_the_next_key() {
+        let mut decoder = InputDecoder::default();
+        let now = Instant::now();
+        assert!(decoder.push_at(b"\x1b[<0;12", now).is_empty());
+        assert_eq!(
+            decoder.push_at(b"q", now + INPUT_SEQUENCE_TIMEOUT),
+            vec![InputEvent::Key(Key::Char(b'q'))]
+        );
+        assert!(decoder.pending.is_empty());
+    }
+
+    #[test]
+    fn runtime_invalid_mouse_fields_are_rejected_and_quit_survives() {
+        let mut decoder = InputDecoder::default();
+        assert_eq!(
+            decoder.push(b"\x1b[<0;;12;5Mq"),
+            vec![InputEvent::Key(Key::Char(b'q'))]
+        );
+        assert_eq!(
+            decoder.push(b"\x1b[<0;12q"),
+            vec![InputEvent::Key(Key::Char(b'q'))]
+        );
+        assert_eq!(
+            decoder.push(b"\x1b[<0;0;5Mq"),
+            vec![InputEvent::Key(Key::Char(b'q'))]
+        );
+        assert!(decoder.pending.is_empty());
+    }
+
+    #[test]
+    fn runtime_mouse_prefixes_have_a_fixed_storage_bound() {
+        let mut decoder = InputDecoder::default();
+        let mut malformed = b"\x1b[<".to_vec();
+        malformed.extend(std::iter::repeat_n(b'1', 10_000));
+        decoder.push(&malformed);
+        assert!(decoder.pending.len() < MAX_MOUSE_SEQUENCE_BYTES);
+        assert_eq!(decoder.push(b"q"), vec![InputEvent::Key(Key::Char(b'q'))]);
+    }
+
+    #[test]
+    fn runtime_process_worker_never_starts_a_second_sample_in_flight() {
+        let (sender, receiver) = mpsc::channel();
+        let mut sampler = ProcessSampler {
+            pending: Some(receiver),
+        };
+        sampler.start();
+        assert!(sampler.poll().is_none());
+        sender.send(Ok(Vec::new())).unwrap();
+        assert!(sampler.poll().unwrap().unwrap().is_empty());
+        assert!(sampler.pending.is_none());
+    }
+
+    #[test]
+    fn runtime_process_worker_reports_a_disconnection() {
+        let (sender, receiver) = mpsc::channel();
+        let mut sampler = ProcessSampler {
+            pending: Some(receiver),
+        };
+        drop(sender);
+        assert!(sampler.poll().unwrap().is_err());
+        assert!(sampler.pending.is_none());
+    }
+
+    #[test]
+    fn runtime_commands_drain_output_larger_than_a_pipe() {
+        let output = run_command_with_timeout(
+            Command::new("sh").args(["-c", "dd if=/dev/zero bs=65536 count=4 2>/dev/null"]),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 262_144);
+    }
+
+    #[test]
+    fn runtime_commands_are_killed_when_the_deadline_expires() {
+        let start = Instant::now();
+        let error = run_command_with_timeout(
+            Command::new("sh").args(["-c", "exec sleep 5"]),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn runtime_process_queries_request_no_arguments() {
+        assert!(PS_PROCESSES[1].ends_with("comm="));
+        assert!(is_login_process("login"));
+        assert!(is_login_process("/usr/bin/login"));
+        assert!(is_ghostty_app(
+            "/Applications/Ghostty.app/Contents/MacOS/ghostty"
+        ));
+        assert!(is_ghostty_app("ghostty"));
+    }
+
+    #[test]
+    fn runtime_deadline_closes_stdout_in_background_descendants() {
+        let pid_file = env::temp_dir().join(format!(
+            "ghostty-top-runtime-child-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let start = Instant::now();
+        let error = run_command_with_timeout(
+            Command::new("sh")
+                .env("GHOSTTY_TOP_CHILD_PID_FILE", &pid_file)
+                .args([
+                    "-c",
+                    "sleep 30 & echo $! > \"$GHOSTTY_TOP_CHILD_PID_FILE\"; exit 0",
+                ]),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let child_pid = fs::read_to_string(&pid_file).unwrap();
+        fs::remove_file(pid_file).unwrap();
+        let status = run_command_with_timeout(
+            Command::new("ps").args(["-p", child_pid.trim(), "-o", "stat="]),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let state = String::from_utf8_lossy(&status.stdout);
+        // A killed descendant can briefly be a zombie before the OS reaps it.
+        assert!(
+            state.trim().is_empty() || state.trim_start().starts_with('Z'),
+            "background child survived: {state}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_all_focus_probes_fit_inside_the_credit_window() {
+        assert!(
+            USAGE_POLL_INTERVAL
+                + USAGE_SAMPLE_TIMEOUT
+                + PRESENCE_QUERY_TIMEOUT * 2
+                + GHOSTTY_RUNNING_TIMEOUT
+                < MAX_CREDITED_GAP
+        );
     }
 }
