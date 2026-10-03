@@ -8,33 +8,57 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-mkdir -p binaries
 
-slices=""
-missing=""
-for target in aarch64-apple-darwin x86_64-apple-darwin; do
-    if rustup target list --installed | grep -qx "$target"; then
-        cargo build --release --target "$target"
-        slices="$slices target/$target/release/ghostty-top"
-    else
-        missing="$missing $target"
-    fi
-done
-
-if [ -z "$slices" ]; then
-    echo "error: no Apple targets installed; run: rustup target add aarch64-apple-darwin" >&2
+package_version=$(awk '
+    match($0, /"version"[[:space:]]*:[[:space:]]*"[^"]*"/) {
+        value = substr($0, RSTART, RLENGTH)
+        sub(/^[^:]*:[[:space:]]*"/, "", value)
+        sub(/"$/, "", value)
+        print value
+        exit
+    }
+' package.json)
+cargo_version=$(awk '
+    /^[[:space:]]*\[package\][[:space:]]*$/ { package = 1; next }
+    /^[[:space:]]*\[/ { package = 0 }
+    package && /^[[:space:]]*version[[:space:]]*=/ {
+        value = $0
+        sub(/^[^=]*=[[:space:]]*"/, "", value)
+        sub(/"[[:space:]]*(#.*)?$/, "", value)
+        print value
+        exit
+    }
+' Cargo.toml)
+if [ -z "$package_version" ] || [ -z "$cargo_version" ] || [ "$package_version" != "$cargo_version" ]; then
+    echo "error: package.json version ($package_version) must match Cargo.toml version ($cargo_version)" >&2
     exit 1
 fi
 
-lipo -create -output binaries/ghostty-top $slices
-chmod +x binaries/ghostty-top
-
+installed_targets=$(rustup target list --installed)
+missing=""
+for target in aarch64-apple-darwin x86_64-apple-darwin; do
+    if ! printf '%s\n' "$installed_targets" | grep -qx "$target"; then
+        missing="$missing $target"
+    fi
+done
 if [ -n "$missing" ]; then
-    echo >&2
-    for target in $missing; do
-        echo "warning: $target is missing, so the package will not run there." >&2
-        echo "         fix with: rustup target add $target" >&2
-    done
+    echo "error: both Apple targets are required; run: rustup target add$missing" >&2
+    exit 1
+fi
+
+for target in aarch64-apple-darwin x86_64-apple-darwin; do
+    cargo build --release --target "$target"
+done
+
+mkdir -p binaries
+lipo -create -output binaries/ghostty-top \
+    target/aarch64-apple-darwin/release/ghostty-top \
+    target/x86_64-apple-darwin/release/ghostty-top
+lipo -verify_arch arm64 x86_64 binaries/ghostty-top
+chmod +x binaries/ghostty-top
+if [ ! -x binaries/ghostty-top ]; then
+    echo "error: binaries/ghostty-top is not executable" >&2
+    exit 1
 fi
 
 echo
