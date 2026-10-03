@@ -3729,13 +3729,19 @@ fn memory_value(kib: u64, footprint_available: bool) -> String {
 }
 
 fn human_bytes(kib: u64) -> String {
-    let bytes = kib as f64 * 1024.0;
-    if bytes >= 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.1} GiB", bytes / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024.0 * 1024.0 {
-        format!("{:.1} MiB", bytes / (1024.0 * 1024.0))
+    const UNITS: [&str; 7] = ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB"];
+    let mut value = kib as f64;
+    let mut unit = 0;
+    // Four digits plus a decimal and unit exceed RAM's nine columns.
+    // Promote before rounding crosses 1000, even before the binary boundary.
+    while value >= if unit == 0 { 1024.0 } else { 999.95 } && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value:.0} {}", UNITS[unit])
     } else {
-        format!("{:.0} KiB", bytes / 1024.0)
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -5364,5 +5370,31 @@ mod tests {
             "header\nsnapshot\n"
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn memory_figures_promote_before_rounding_widens_the_column() {
+        assert_eq!(human_bytes(1023), "1023 KiB");
+        assert_eq!(human_bytes(1024), "1.0 MiB");
+        assert_eq!(human_bytes(1_048_524), "1.0 GiB");
+        assert_eq!(human_bytes(1_023_948), "999.9 MiB");
+        assert_eq!(human_bytes(1_023_949), "1.0 GiB");
+        assert_eq!(human_bytes(1_048_525), "1.0 GiB");
+        assert_eq!(human_bytes(1024_u64.pow(3)), "1.0 TiB");
+        assert_eq!(human_bytes(u64::MAX), "16.0 ZiB");
+        for power in 1..=6 {
+            let boundary = 1024_u64.pow(power);
+            for value in [boundary - 1, boundary, boundary + 1] {
+                assert!(human_bytes(value).len() <= 9, "{value}");
+            }
+        }
+        for power in 1..=5 {
+            for amount in 999..=1025 {
+                let value = amount * 1024_u64.pow(power);
+                assert!(human_bytes(value).len() <= 9, "{value}");
+                assert!(memory_value(value, false).len() <= 9, "fallback {value}");
+            }
+        }
+        assert!(human_bytes(u64::MAX).len() <= 9);
     }
 }
