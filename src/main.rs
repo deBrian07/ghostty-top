@@ -2836,6 +2836,14 @@ fn render(app: &App) -> Layout {
 /// layout can be exercised at any terminal geometry without a real terminal.
 fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layout) {
     let mut lines = Vec::new();
+    let tracker_error = app
+        .usage_tracker
+        .as_ref()
+        .and_then(|tracker| tracker.last_error.as_ref());
+    let footer_rows = 2
+        + usize::from(has_memory_fallback(app))
+        + usize::from(tracker_error.is_some())
+        + usize::from(app.last_error.is_some());
     let shared_cpu = app.ghostty.as_ref().map_or(0.0, |p| p.cpu);
     let shared_ram = app.ghostty.as_ref().map_or(0, |p| p.footprint_kib);
     let terminal_cpu: f64 = app.terminals.iter().map(|t| t.cpu).sum();
@@ -2892,9 +2900,9 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
         layout.zones.extend(header_zones);
         lines.push(header_line);
         let max_rows = if app.expanded {
-            height.saturating_sub(15)
+            height.saturating_sub(13 + footer_rows)
         } else {
-            height.saturating_sub(8)
+            height.saturating_sub(6 + footer_rows)
         }
         .min(app.terminals.len());
         let shown_start = if max_rows == 0 {
@@ -2978,7 +2986,7 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
             lines.push(format!(
                 "{DIM}{UNDERLINE}     PID      CPU        RAM   RESIDENT   COMMAND{RESET}"
             ));
-            let process_rows = height.saturating_sub(lines.len() + 2);
+            let process_rows = height.saturating_sub(lines.len() + footer_rows);
             let command_width = width.saturating_sub(EXPANDED_FIXED_WIDTH).max(12);
             for process in terminal.processes.iter().take(process_rows) {
                 lines.push(format!(
@@ -2996,27 +3004,14 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
     if has_memory_fallback(app) {
         lines.push(format!("{DIM}~ RAM includes resident-size fallback; physical footprint was unavailable.{RESET}"));
     }
-    if let Some(error) = app
-        .usage_tracker
-        .as_ref()
-        .and_then(|tracker| tracker.last_error.as_ref())
-    {
+    if let Some(error) = tracker_error {
         lines.push(format!("{RED}Tracking paused: {error}{RESET}"));
     }
     if let Some(error) = &app.last_error {
         lines.push(format!("\x1b[31mSampling error: {error}{RESET}"));
     }
     lines.push(String::new());
-    let (hint, hint_zones) = hint_line(
-        lines.len() + 1,
-        &[
-            ("↑ up", Some(ClickAction::SelectPrevious)),
-            ("↓ down", Some(ClickAction::SelectNext)),
-            ("enter expand", Some(ClickAction::ToggleExpand)),
-            ("u usage", Some(ClickAction::ShowUsage)),
-            ("q quit", Some(ClickAction::Quit)),
-        ],
-    );
+    let (hint, hint_zones) = view_hint(lines.len() + 1, width, View::Monitor);
     layout.zones.extend(hint_zones);
     lines.push(hint);
     fit_frame(lines, layout, height, width)
@@ -3204,13 +3199,7 @@ fn render_usage(app: &App, height: usize, width: usize) -> (Vec<String>, Layout)
     }
 
     lines.push(String::new());
-    let (hint, hint_zones) = hint_line(
-        lines.len() + 1,
-        &[
-            ("u back to monitor", Some(ClickAction::ShowMonitor)),
-            ("q quit", Some(ClickAction::Quit)),
-        ],
-    );
+    let (hint, hint_zones) = view_hint(lines.len() + 1, width, View::Usage);
     layout.zones.extend(hint_zones);
     lines.push(hint);
     fit_frame(lines, layout, height, width)
@@ -3340,13 +3329,7 @@ fn render_usage_compact(app: &App, height: usize, width: usize) -> (Vec<String>,
             }
         }
     }
-    let (hint, zones) = hint_line(
-        lines.len() + 1,
-        &[
-            ("u back to monitor", Some(ClickAction::ShowMonitor)),
-            ("q quit", Some(ClickAction::Quit)),
-        ],
-    );
+    let (hint, zones) = view_hint(lines.len() + 1, width, View::Usage);
     lines.push(hint);
     layout.zones.extend(zones);
     fit_frame(lines, layout, height, width)
@@ -3625,14 +3608,21 @@ fn scale_selector(row: usize, active: UsageScale) -> (String, Vec<ClickZone>) {
 /// The single dim line of chrome at the bottom of a view. Segments naming an
 /// action are also click targets, so the hint doubles as the mouse affordance.
 fn hint_line(row: usize, segments: &[(&str, Option<ClickAction>)]) -> (String, Vec<ClickZone>) {
-    const SEPARATOR: &str = "  ·  ";
+    hint_line_with_separator(row, segments, "  ·  ")
+}
+
+fn hint_line_with_separator(
+    row: usize,
+    segments: &[(&str, Option<ClickAction>)],
+    separator: &str,
+) -> (String, Vec<ClickZone>) {
     let mut line = String::from(DIM);
     let mut column = 1;
     let mut zones = Vec::new();
     for (index, (label, action)) in segments.iter().enumerate() {
         if index > 0 {
-            line.push_str(SEPARATOR);
-            column += display_width(SEPARATOR);
+            line.push_str(separator);
+            column += display_width(separator);
         }
         line.push_str(label);
         if let Some(action) = action {
@@ -3647,6 +3637,75 @@ fn hint_line(row: usize, segments: &[(&str, Option<ClickAction>)]) -> (String, V
     }
     line.push_str(RESET);
     (line, zones)
+}
+
+/// Prioritize view switching and quitting when a narrow window cannot fit
+/// all keyboard hints. Every variant still derives its click zones from text.
+fn view_hint(row: usize, width: usize, view: View) -> (String, Vec<ClickZone>) {
+    let full_monitor = [
+        ("↑ up", Some(ClickAction::SelectPrevious)),
+        ("↓ down", Some(ClickAction::SelectNext)),
+        ("enter expand", Some(ClickAction::ToggleExpand)),
+        ("u usage", Some(ClickAction::ShowUsage)),
+        ("q quit", Some(ClickAction::Quit)),
+    ];
+    let full_usage = [
+        ("u back to monitor", Some(ClickAction::ShowMonitor)),
+        ("q quit", Some(ClickAction::Quit)),
+    ];
+    let full = hint_line(
+        row,
+        if view == View::Monitor {
+            &full_monitor
+        } else {
+            &full_usage
+        },
+    );
+    if display_width(&full.0) <= width {
+        return full;
+    }
+    let switch = if view == View::Monitor {
+        ClickAction::ShowUsage
+    } else {
+        ClickAction::ShowMonitor
+    };
+    let switch_label = if view == View::Monitor {
+        "u usage"
+    } else {
+        "u back"
+    };
+    let medium = hint_line(
+        row,
+        &[
+            (switch_label, Some(switch)),
+            ("q quit", Some(ClickAction::Quit)),
+        ],
+    );
+    if display_width(&medium.0) <= width {
+        if view == View::Monitor {
+            let navigation = hint_line(
+                row,
+                &[
+                    (switch_label, Some(switch)),
+                    ("q quit", Some(ClickAction::Quit)),
+                    ("↑↓ move", None),
+                ],
+            );
+            if display_width(&navigation.0) <= width {
+                return navigation;
+            }
+        }
+        return medium;
+    }
+    if width >= 3 {
+        hint_line_with_separator(
+            row,
+            &[("u", Some(switch)), ("q", Some(ClickAction::Quit))],
+            if width >= 5 { " · " } else { " " },
+        )
+    } else {
+        hint_line(row, &[("q", Some(ClickAction::Quit))])
+    }
 }
 
 /// Renders the sortable column headings and the columns each one occupies.
@@ -3987,7 +4046,7 @@ fn display_unit(value: &str, start: usize) -> (usize, usize) {
         if character == '\u{200d}' {
             joined = true;
         } else if joined {
-            if character == '\x1b' {
+            if !emoji_joinable(first) || !emoji_joinable(character) {
                 break;
             }
             width = width.max(character_width(character));
@@ -4007,8 +4066,15 @@ fn display_unit(value: &str, start: usize) -> (usize, usize) {
     (end, width)
 }
 
+fn emoji_joinable(character: char) -> bool {
+    matches!(character as u32, 0xa9 | 0xae | 0x203c | 0x2049 | 0x2122 | 0x2139
+        | 0x2194..=0x21ff | 0x2300..=0x23ff | 0x2600..=0x27bf
+        | 0x2934..=0x2935 | 0x2b05..=0x2b55 | 0x3030 | 0x303d | 0x3297 | 0x3299
+        | 0x1f000..=0x1faff)
+}
+
 // Unicode 14 combining/format and wide/fullwidth properties. CJK extension
-// planes and the emoji block stay wide even for newer, unassigned characters.
+// planes and unassigned emoji remain wide; assigned text emoji need VS16.
 const ZERO_WIDTH_RANGES: &[(u32, u32)] = &[
     (0xad, 0xad),
     (0x300, 0x36f),
@@ -4443,7 +4509,43 @@ const WIDE_CHARACTER_RANGES: &[(u32, u32)] = &[
     (0x1f240, 0x1f248),
     (0x1f250, 0x1f251),
     (0x1f260, 0x1f265),
-    (0x1f300, 0x1faff),
+    (0x1f300, 0x1f320),
+    (0x1f32d, 0x1f335),
+    (0x1f337, 0x1f37c),
+    (0x1f37e, 0x1f393),
+    (0x1f3a0, 0x1f3ca),
+    (0x1f3cf, 0x1f3d3),
+    (0x1f3e0, 0x1f3f0),
+    (0x1f3f4, 0x1f3f4),
+    (0x1f3f8, 0x1f43e),
+    (0x1f440, 0x1f440),
+    (0x1f442, 0x1f4fc),
+    (0x1f4ff, 0x1f53d),
+    (0x1f54b, 0x1f54e),
+    (0x1f550, 0x1f567),
+    (0x1f57a, 0x1f57a),
+    (0x1f595, 0x1f596),
+    (0x1f5a4, 0x1f5a4),
+    (0x1f5fb, 0x1f64f),
+    (0x1f680, 0x1f6c5),
+    (0x1f6cc, 0x1f6cc),
+    (0x1f6d0, 0x1f6d2),
+    (0x1f6d5, 0x1f6df),
+    (0x1f6eb, 0x1f6ef),
+    (0x1f6f4, 0x1f6ff),
+    (0x1f774, 0x1f77f),
+    (0x1f7d9, 0x1f7ff),
+    (0x1f80c, 0x1f80f),
+    (0x1f848, 0x1f84f),
+    (0x1f85a, 0x1f85f),
+    (0x1f888, 0x1f88f),
+    (0x1f8ae, 0x1f8af),
+    (0x1f8b2, 0x1f8ff),
+    (0x1f90c, 0x1f93a),
+    (0x1f93c, 0x1f945),
+    (0x1f947, 0x1f9ff),
+    (0x1fa54, 0x1fa5f),
+    (0x1fa6e, 0x1faff),
     (0x20000, 0x3fffd),
 ];
 
@@ -6123,6 +6225,72 @@ mod tests {
             }
         }
         assert!(human_bytes(u64::MAX).len() <= 9);
+    }
+
+    #[test]
+    fn expanded_monitor_reserves_space_for_all_status_messages() {
+        let mut app = populated_app(UsageScale::Daily);
+        app.expanded = true;
+        app.terminals[0].processes = vec![p(201, 100, "ttys000", 1.0, 4096, "node"); 100];
+        app.terminals[0].footprint_complete = false;
+        app.usage_tracker.as_mut().unwrap().last_error = Some("focus query timed out".into());
+        app.last_error = Some("process query failed".into());
+        let (frame, _) = render_monitor(&app, 24, 100);
+        for text in [
+            "Tracking paused",
+            "~ RAM includes",
+            "Sampling error",
+            "over 15m",
+        ] {
+            assert!(
+                frame.iter().any(|line| strip_ansi(line).contains(text)),
+                "{text}"
+            );
+        }
+        assert!(frame.len() <= 24);
+    }
+
+    #[test]
+    fn joining_only_collapses_emoji_sequences() {
+        assert_eq!(display_width("a\u{200d}b"), 2);
+        assert_eq!(display_width("🐈\u{200d}x"), 3);
+        assert_eq!(display_width("👩🏽‍💻"), 2);
+        assert_eq!(display_width("🐈‍⬛"), 2);
+        assert_eq!(display_width("🌡"), 1);
+        assert_eq!(display_width("🌡️"), 2);
+    }
+
+    #[test]
+    fn narrow_footers_keep_the_primary_controls_clickable() {
+        for view in [View::Monitor, View::Usage] {
+            let action = if view == View::Monitor {
+                ClickAction::ShowUsage
+            } else {
+                ClickAction::ShowMonitor
+            };
+            for width in 1..=30 {
+                let (line, zones) = view_hint(4, width, view);
+                let text = strip_ansi(&line);
+                assert!(display_width(&line) <= width, "{text:?} at {width}");
+                assert!(zones.iter().any(|zone| zone.action == ClickAction::Quit));
+                if width >= 3 {
+                    assert!(zones.iter().any(|zone| zone.action == action));
+                }
+                for zone in zones {
+                    assert!(zone.start_column <= zone.end_column && zone.end_column <= width);
+                    assert_eq!(zone.row, 4);
+                    let first = text.chars().nth(zone.start_column - 1).unwrap();
+                    assert_eq!(
+                        first,
+                        if zone.action == ClickAction::Quit {
+                            'q'
+                        } else {
+                            'u'
+                        }
+                    );
+                }
+            }
+        }
     }
 
     #[test]
