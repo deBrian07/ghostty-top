@@ -15,8 +15,8 @@ before writing code.
 
 - **Zero dependencies.** `Cargo.lock` contains exactly one package: this one.
   Everything is the standard library, command-line tools that ship with macOS
-  (`ps`, `lsof`, `ioreg`, `osascript`, `stty`, `launchctl`, `pgrep`), and one
-  libSystem call. Do not add a crate. If something seems to need one, it almost
+  (`ps`, `lsof`, `ioreg`, `osascript`, `stty`, `launchctl`, `pgrep`), and small
+  libSystem calls for footprint, signal handling and launchd identity. Do not add a crate. If something seems to need one, it almost
   certainly does not — the TUI, the ANSI handling, the mouse decoding, and the
   civil-date maths are all hand-rolled here already.
 - **Setup stays trivial.** Build and run; no config file, no flags required, no
@@ -26,7 +26,8 @@ before writing code.
 - **Never modify Ghostty.** Ghostty is observed, never patched or configured.
   Everything comes from read-only queries: its AppleScript dictionary at
   `/Applications/Ghostty.app/Contents/Resources/Ghostty.sdef`, plus `ps`/`lsof`.
-- **macOS only.** `main` exits early on other platforms.
+- **macOS and Linux.** Monitoring works on both; focus tracking and launchd
+  installation are macOS only. `main` exits early on other platforms.
 - **Telemetry is versioned and bounded.** Append snapshots under a per-file
   lock. Rotate at 10 MiB and retain three backups; remove only superseded
   resource/process schemas during a recorded one-time migration. A schema
@@ -37,9 +38,11 @@ before writing code.
 
 ```sh
 cargo build              # or --release
-cargo test               # 51 unit tests, all in the tests module in main.rs
+cargo test               # behavioural tests in the tests module in main.rs
 cargo clippy --all-targets   # expected to be silent
 cargo fmt
+sh scripts/test-build-binaries.sh
+python3 scripts/test-terminal.py
 ```
 
 Run it without touching your real history by pointing `HOME` at a scratch
@@ -65,7 +68,8 @@ macOS is the primary target; Linux runs the monitor. Every difference is
 rather than branching at the call site.
 
 - Data lives under `Application Support` on macOS and `XDG_DATA_HOME` on Linux.
-- `ps` is `-axo …command=` (BSD) versus `-eo …args=` (procps); `stty` takes
+- `ps` is `-axo …comm=` (BSD) versus `-eo …comm=` (procps). Read executable
+  names, never argument vectors. `stty` takes
   `-f` versus `-F`; no tty prints as `??` versus `?` (use `has_tty`).
 - A terminal's root process is `/usr/bin/login` on macOS. Linux Ghostty execs
   the shell directly, so any child of Ghostty holding a tty is a surface.
@@ -76,8 +80,9 @@ rather than branching at the call site.
   no keyword for it, `footprint -a` needs root, and `footprint -p` costs 50–110
   ms per pid, so macOS calls `proc_pid_rusage` directly and Linux reads
   `Pss` + `Swap` from `/proc/PID/smaps_rollup`.
-- **That FFI is the only `unsafe` in the tree.** Keep it that way, and keep it
-  in `phys_footprint_kib` rather than at a call site. `RUSAGE_INFO_V2` has been
+- **Keep FFI scoped to platform helpers.** Footprint calls stay inside
+  `phys_footprint_kib`; signal handlers only set an atomic flag, and command
+  cancellation targets only the spawned command's own process group. `RUSAGE_INFO_V2` has been
   frozen since macOS 10.9 and the flavor argument is the ABI's own versioning,
   so the struct must match it field for field;
   `reads_a_real_physical_footprint` is the test that catches it if it ever
@@ -117,9 +122,10 @@ both `npm pack` and `npm publish`. Without it a clean checkout published a
 tarball with no binary in it, and nothing objected: npm only warns, the install
 still reports success, and the failure surfaces as `command not found`.
 
-The script still warns and keeps going when one Apple target is missing, so
-check its `lipo -info` output says `x86_64 arm64` before publishing. Keep
-`version` in `package.json` and `Cargo.toml` in step.
+The script fails before building if either Apple target is missing or the
+versions differ. It verifies both architectures with `lipo -verify_arch`;
+`lipo -info` reports `x86_64 arm64`. Keep `version` in `package.json` and
+`Cargo.toml` in step. Rust 1.89 or newer supplies the standard-library locks.
 
 ## Layout of `src/main.rs`
 
@@ -141,18 +147,22 @@ pattern, and tests assert the zone spans match the rendered text.
 
 **Column widths are shared between heading and rows.** `monitor_flex_widths`
 is the single source; the header and the data rows both read it. A heading wider
-than its field pushes the whole row out of step — this is why the sort arrow was
-removed from headings.
+than its field pushes the whole row out of step. Sort arrows are truncated
+inside the heading's field, never added outside it.
 
-**Count visible columns, not bytes.** Rendered lines carry ANSI escapes and
-multi-byte glyphs (`·`, `↑↓`, `■`). Track column positions with `chars().count()`
-and strip escapes before measuring. `strip_ansi` in the tests exists for this.
+**Count terminal columns.** `display_width`, `truncate` and `pad_to_width`
+handle wide CJK glyphs, zero-width combining marks and joined emoji. ANSI
+escapes take no columns. Do not use byte length, `chars().count()` or Rust
+format padding for human-supplied labels. `fit_frame` clips both dimensions
+and remaps the retained footer's click zones.
 
 **Nothing slow may run on the UI thread.** The event loop polls input every
 50 ms. AppleScript is slow and variable: the focused-tab query takes ~150 ms and
-the full inventory over 1.5 s, scaling with tab count. Both run on worker
-threads and report back through `mpsc`; `LabelCache` and `poll_inventory` show
-the shape. Give each `osascript` call a timeout matched to its real cost — a
+the full inventory over 1.5 s, scaling with tab count. Process sampling, labels, focus and inventory run on worker
+threads with at most one query in flight per worker. `ProcessSampler`,
+`LabelCache` and `poll_inventory` show the shape. `ps`, `lsof`, `ioreg` and
+`osascript` use the subprocess deadline helper, which drains stdout and kills
+its own process group on timeout. Give each `osascript` call a timeout matched to its real cost — a
 too-tight timeout fails silently and looks like missing data.
 
 **Ghostty is matched by executable path.** `pgrep -x ghostty` does *not* match
@@ -185,8 +195,8 @@ rule survives only as the fallback for when `ps` reports no foreground group.
 
 **The sample budget and the credit window are one rule.** A focus sample is
 timestamped when the AppleScript *answers*, so a slow answer widens the gap to
-the previous sample. `USAGE_POLL_INTERVAL + USAGE_SAMPLE_TIMEOUT` must stay
-inside `MAX_CREDITED_GAP` or a query that succeeds slowly is thrown away
+the previous sample. The poll interval plus the focus-query, presence-probe and process-probe
+timeouts must stay inside `MAX_CREDITED_GAP` or a query that succeeds slowly is thrown away
 anyway; `a_slow_focus_query_still_lands_inside_the_credit_window` pins it. The
 same arithmetic is why a failed sample retries on the normal schedule instead
 of backing off — a longer backoff pushed the *next* sample past the window too,
@@ -195,11 +205,16 @@ so one slow query cost two intervals rather than one.
 **`save` merges, `save_replacing` does not.** Two processes record by default:
 the login tracker and the TUI, which enables tracking unconditionally. Each
 holds its own snapshot and rewrites the whole file, so the periodic flush
-re-reads and keeps the larger count per tab — they watch the same wall clock,
+locks a separate inode, re-reads and keeps the larger count per tab — they watch the same wall clock,
 so the larger count is the more complete one, not something to add to. Use
 `save_replacing` only for the one-shot commands that deliberately delete rows;
 `--clear-demo-history` is the reason the split exists, because merging
 resurrected everything it had just removed.
+
+**Terminal cleanup must survive abnormal exit.** Release builds abort on
+panic, so the panic hook restores stty and ANSI state before the diagnostic.
+SIGTERM, SIGHUP and SIGINT set the shutdown flag; the event loop flushes and
+lets the terminal guard restore state. Never perform IO in a signal handler.
 
 **Tracking correctness beats tracking coverage.** Time is credited only when
 Ghostty is frontmost, the user is present (`away_reason`), and both the

@@ -14,7 +14,8 @@ bun install -g ghostty-top
 Or `npm install -g ghostty-top`. Or build it yourself with
 `cargo install --path .`.
 
-Nothing else to install and nothing to configure.
+Nothing else to install and nothing to configure. Building from source needs
+Rust 1.89 or newer.
 
 **Linux:** build from source with `cargo install --path .`. The monitor works
 the same, but the usage calendar doesn't: Ghostty only reports which tab you're
@@ -99,8 +100,9 @@ Ghostty. That permission is only needed once.
 - Memory adds up each process, and programs often share memory, so treat the
   number as a rough guide.
 - A **leak warning** points at one process whose memory has been climbing
-  steadily for a few minutes. It's worth a look, but it isn't proof of a
-  problem.
+  steadily for a few minutes. Growth compares averaged edges of a rolling
+  window of up to 15 minutes; the warning shows its actual span. It's worth
+  a look, but it isn't proof of a problem.
 
 Run `ghostty-top --help` to see every option.
 
