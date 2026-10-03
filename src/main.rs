@@ -2892,13 +2892,15 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
         layout.zones.extend(header_zones);
         lines.push(header_line);
         let max_rows = if app.expanded {
-            height.saturating_sub(15).max(3)
+            height.saturating_sub(15)
         } else {
-            height.saturating_sub(8).max(3)
+            height.saturating_sub(8)
         }
         .min(app.terminals.len());
-        let shown_start = if app.selected >= max_rows {
-            app.selected + 1 - max_rows
+        let shown_start = if max_rows == 0 {
+            app.selected.min(app.terminals.len())
+        } else if app.selected >= max_rows {
+            (app.selected + 1 - max_rows).min(app.terminals.len())
         } else {
             0
         };
@@ -2994,6 +2996,13 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
     if has_memory_fallback(app) {
         lines.push(format!("{DIM}~ RAM includes resident-size fallback; physical footprint was unavailable.{RESET}"));
     }
+    if let Some(error) = app
+        .usage_tracker
+        .as_ref()
+        .and_then(|tracker| tracker.last_error.as_ref())
+    {
+        lines.push(format!("{RED}Tracking paused: {error}{RESET}"));
+    }
     if let Some(error) = &app.last_error {
         lines.push(format!("\x1b[31mSampling error: {error}{RESET}"));
     }
@@ -3010,15 +3019,13 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
     );
     layout.zones.extend(hint_zones);
     lines.push(hint);
-    fit_targets(&mut layout, width);
-    let lines = lines
-        .into_iter()
-        .map(|line| fit_to_width(&line, width))
-        .collect();
-    (lines, layout)
+    fit_frame(lines, layout, height, width)
 }
 
 fn render_usage(app: &App, height: usize, width: usize) -> (Vec<String>, Layout) {
+    if height < 20 {
+        return render_usage_compact(app, height, width);
+    }
     const WEEKDAYS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
     let weeks = visible_weeks(width);
     let mut lines = vec![format!(
@@ -3206,12 +3213,198 @@ fn render_usage(app: &App, height: usize, width: usize) -> (Vec<String>, Layout)
     );
     layout.zones.extend(hint_zones);
     lines.push(hint);
+    fit_frame(lines, layout, height, width)
+}
+
+/// Short windows show the current week horizontally instead of squeezing
+/// seven weekday rows off-screen. The scale controls and footer remain usable.
+fn render_usage_compact(app: &App, height: usize, width: usize) -> (Vec<String>, Layout) {
+    const WEEKDAYS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+    let tracker = app.usage_tracker.as_ref();
+    let today = tracker
+        .map(|value| value.current_day.clone())
+        .or_else(local_date)
+        .unwrap_or_else(|| "1970-01-01".to_string());
+    let today_number = date_to_day_number(&today).unwrap_or(0);
+    let by_week = app.usage_scale != UsageScale::Daily;
+    let cell_width = if by_week { CALENDAR_CELL_WIDTH } else { 3 };
+    let weeks = if by_week { visible_weeks(width) } else { 1 };
+    let start = today_number - sunday_index(today_number) - (weeks as i64 - 1) * 7;
+    let daily = daily_totals(tracker, start, weeks, today_number);
+    let mut lines = vec![format!("{BOLD}{GREEN}ghostty-top{RESET}  usage calendar")];
+    let mut layout = Layout::default();
+    if height >= 6 {
+        lines.push(format!(
+            "{}  •  {} total",
+            if by_week {
+                format!("Last {weeks} weeks")
+            } else {
+                "This week".into()
+            },
+            human_duration(sum_seconds(daily.iter().copied()))
+        ));
+    }
+    if height >= 8 {
+        let status = if !TRACKS_FOCUS {
+            format!("Not recording: {FOCUS_UNAVAILABLE}.")
+        } else if let Some(error) = tracker.and_then(|value| value.last_error.as_ref()) {
+            format!("Tracking paused: {error}")
+        } else if let Some(away) = tracker.and_then(|value| value.away) {
+            format!("Paused while {}.", away.reason())
+        } else {
+            "Counting while Ghostty is frontmost and you are present.".into()
+        };
+        lines.push(format!("{DIM}{status}{RESET}"));
+    }
+    let (scale, zones) = scale_selector(lines.len() + 1, app.usage_scale);
+    lines.push(scale);
+    layout.zones.extend(zones);
+    if height >= 5 {
+        lines.push(if by_week {
+            format!("{DIM}{}{RESET}", month_header(start, weeks))
+        } else {
+            format!("{DIM}{}{RESET}", WEEKDAYS.join(" "))
+        });
+    }
+    let values = if by_week {
+        weekly_usage(&daily, app.usage_scale)
+    } else {
+        daily.clone()
+    };
+    let peak = usage_peak(&values, app.usage_scale);
+    let mut line = if by_week {
+        " ".repeat(CALENDAR_GUTTER)
+    } else {
+        String::new()
+    };
+    let row = lines.len() + 1;
+    for (index, value) in values.iter().enumerate() {
+        let number = start + if by_week { index * 7 } else { index } as i64;
+        if number > today_number {
+            line.push_str(&" ".repeat(cell_width));
+            continue;
+        }
+        let day = day_number_to_date(number);
+        let style = if app.selected_day.as_deref() == Some(day.as_str()) {
+            CALENDAR_SELECTED
+        } else if app.hovered_day.as_deref() == Some(day.as_str()) {
+            CALENDAR_HOVER
+        } else {
+            CALENDAR_RAMP[usage_level(*value, peak)]
+        };
+        let column = display_width(&line) + 1;
+        line.push_str(&format!(
+            "{style}{CALENDAR_BLOCK}{RESET}{}",
+            " ".repeat(cell_width - 1)
+        ));
+        layout.calendar_cells.push(CalendarCell {
+            start_column: column,
+            end_column: column + cell_width - 1,
+            row,
+            day,
+        });
+    }
+    lines.push(line);
+    if height >= 9 {
+        if let Some(day) = app.hovered_day.as_ref().or(app.selected_day.as_ref()) {
+            lines.push(format!(
+                "{}  •  {}",
+                selection_label(day, by_week),
+                human_duration(usage_total_for_days(tracker, &selection_days(day, by_week)))
+            ));
+        } else {
+            lines.push(format!(
+                "{DIM}Click a {} for its tab breakdown.{RESET}",
+                if by_week { "column" } else { "day" }
+            ));
+        }
+    }
+    if let Some(day) = &app.selected_day {
+        let days = selection_days(day, by_week);
+        let available = height.saturating_sub(lines.len() + 2);
+        if available > 0 {
+            lines.push(format!(
+                "{BOLD}{} breakdown{RESET}",
+                selection_label(day, by_week)
+            ));
+            for (name, seconds) in usage_breakdown(tracker, &days)
+                .into_iter()
+                .take(available - 1)
+            {
+                let duration = human_duration(seconds);
+                let name_width = width.saturating_sub(display_width(&duration) + 3);
+                lines.push(format!(
+                    "  {} {duration}",
+                    pad_to_width(&name, name_width, false)
+                ));
+            }
+        }
+    }
+    let (hint, zones) = hint_line(
+        lines.len() + 1,
+        &[
+            ("u back to monitor", Some(ClickAction::ShowMonitor)),
+            ("q quit", Some(ClickAction::Quit)),
+        ],
+    );
+    lines.push(hint);
+    layout.zones.extend(zones);
+    fit_frame(lines, layout, height, width)
+}
+
+/// Keep the footer when rows run out, and map click targets to exactly the rows
+/// retained on screen. Hidden terminal rows must also stop accepting clicks.
+fn fit_frame(
+    mut lines: Vec<String>,
+    mut layout: Layout,
+    height: usize,
+    width: usize,
+) -> (Vec<String>, Layout) {
+    let original_height = lines.len();
+    if original_height > height {
+        let footer = lines.pop().unwrap();
+        lines.truncate(height.saturating_sub(1));
+        if height > 0 {
+            lines.push(footer);
+        }
+        let retained_body = height.saturating_sub(1);
+        let map_row = |row: usize| {
+            if height > 0 && row == original_height {
+                Some(height)
+            } else if row <= retained_body {
+                Some(row)
+            } else {
+                None
+            }
+        };
+        layout.zones.retain_mut(|zone| {
+            if let Some(row) = map_row(zone.row) {
+                zone.row = row;
+                true
+            } else {
+                false
+            }
+        });
+        layout.calendar_cells.retain_mut(|cell| {
+            if let Some(row) = map_row(cell.row) {
+                cell.row = row;
+                true
+            } else {
+                false
+            }
+        });
+        layout.shown_count = layout
+            .shown_count
+            .min(retained_body.saturating_sub(layout.terminal_start_row.saturating_sub(1)));
+    }
     fit_targets(&mut layout, width);
-    let lines = lines
-        .into_iter()
-        .map(|line| fit_to_width(&line, width))
-        .collect();
-    (lines, layout)
+    (
+        lines
+            .into_iter()
+            .map(|line| fit_to_width(&line, width))
+            .collect(),
+        layout,
+    )
 }
 
 /// Days a selected column covers: one day in the grid, a whole week in a chart.
@@ -5375,8 +5568,12 @@ mod tests {
                             for width in [0, 1, 2, 3, 5, 10, 20, 40, 60, 80, 100, 140, 300] {
                                 let (monitor, _) = render_monitor(app, height, width);
                                 let (usage, _) = render_usage(app, height, width);
-                                assert!(!monitor.is_empty());
-                                assert!(!usage.is_empty());
+                                assert!(monitor.len() <= height);
+                                assert!(usage.len() <= height);
+                                if height > 0 {
+                                    assert!(!monitor.is_empty());
+                                    assert!(!usage.is_empty());
+                                }
                             }
                         }
                     }
@@ -5393,7 +5590,10 @@ mod tests {
         let (rows, columns) = terminal_size();
         assert!(rows > 0 && columns > 0, "terminal size must never be zero");
 
-        for (frame, _) in [render_monitor(&app, 0, 0), render_usage(&app, 0, 0)] {
+        for (frame, _) in [
+            render_monitor(&app, rows, columns),
+            render_usage(&app, rows, columns),
+        ] {
             assert!(!frame.is_empty());
         }
     }
@@ -5960,5 +6160,72 @@ mod tests {
         assert_eq!(display_width(&row[..cpu]), 3 + tab_width + 4);
         let (_, zones) = hint_line(1, &[("日本語", Some(ClickAction::Quit))]);
         assert_eq!(zones[0].end_column, 6);
+    }
+
+    #[test]
+    fn short_frames_keep_controls_and_drop_hidden_click_targets() {
+        for scale in UsageScale::ALL {
+            let mut app = populated_app(scale);
+            app.selected_day = Some("2026-08-02".into());
+            app.hovered_day = Some("2026-08-02".into());
+            for expanded in [false, true] {
+                app.expanded = expanded;
+                for height in 0..=24 {
+                    for (frame, layout) in [
+                        render_monitor(&app, height, 100),
+                        render_usage(&app, height, 100),
+                    ] {
+                        assert!(frame.len() <= height);
+                        for zone in &layout.zones {
+                            assert!(zone.row > 0 && zone.row <= frame.len());
+                        }
+                        for cell in &layout.calendar_cells {
+                            assert!(cell.row > 0 && cell.row <= frame.len());
+                        }
+                        if height > 0 {
+                            assert!(strip_ansi(frame.last().unwrap()).contains("q quit"));
+                            assert!(layout
+                                .zones
+                                .iter()
+                                .any(|zone| zone.action == ClickAction::Quit
+                                    && zone.row == frame.len()));
+                        }
+                        if layout.shown_count > 0 {
+                            assert!(
+                                layout.terminal_start_row + layout.shown_count - 1 < frame.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_calendar_still_shows_clickable_days() {
+        let app = populated_app(UsageScale::Daily);
+        let (frame, layout) = render_usage(&app, 6, 100);
+        assert_eq!(frame.len(), 6);
+        assert_eq!(layout.calendar_cells.len(), 5);
+        assert!(strip_ansi(&frame[3]).contains("Su Mo Tu We Th Fr Sa"));
+        for cell in &layout.calendar_cells {
+            assert_eq!(cell.row, 5);
+            let weekday = sunday_index(date_to_day_number(&cell.day).unwrap()) as usize;
+            assert_eq!(cell.start_column, weekday * 3 + 1);
+        }
+        assert!(layout
+            .zones
+            .iter()
+            .any(|zone| zone.action == ClickAction::ShowMonitor));
+    }
+
+    #[test]
+    fn the_monitor_explains_when_focus_tracking_is_paused() {
+        let mut app = populated_app(UsageScale::Daily);
+        app.usage_tracker.as_mut().unwrap().last_error = Some("focus query timed out".into());
+        let (frame, _) = render_monitor(&app, 24, 100);
+        assert!(frame
+            .iter()
+            .any(|line| strip_ansi(line).contains("Tracking paused: focus query timed out")));
     }
 }
