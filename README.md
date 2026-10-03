@@ -86,10 +86,11 @@ Ghostty. That permission is only needed once.
 
 - CPU adds up every process in a tab, so it can go over 100% on a Mac with
   several cores.
-- RAM is the same number Activity Monitor shows. It counts memory the Mac has
-  compressed or moved to disk, not just what is in RAM right now, so it is often
-  much bigger than the "resident" number `ps` and `top` print. Press `enter` on
-  a tab to see both side by side.
+- RAM uses physical footprint, the metric Activity Monitor shows, including
+  compressed and swapped memory. When macOS denies a reading (often for
+  root-owned `login` or `sudo` processes), it falls back to resident size and
+  marks the process and tab with `~`. That total may understate memory use.
+  Press `enter` to compare RAM and RESIDENT.
 - Memory adds up each process, and programs often share memory, so treat the
   number as a rough guide.
 - A **leak warning** points at one process whose memory has been climbing

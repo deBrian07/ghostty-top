@@ -319,6 +319,7 @@ struct Process {
     /// What Activity Monitor calls Memory. Falls back to `rss_kib` when the
     /// process cannot be read. See `phys_footprint_kib`.
     footprint_kib: u64,
+    footprint_available: bool,
     elapsed: String,
     age_seconds: u64,
     command: String,
@@ -375,6 +376,7 @@ struct Terminal {
     /// The tab's memory as Activity Monitor would count it, and the number the
     /// RAM column shows.
     footprint_kib: u64,
+    footprint_complete: bool,
     processes: Vec<Process>,
     activity: String,
     elapsed: String,
@@ -445,9 +447,24 @@ struct MemoryHistory {
     suspicious_windows: u8,
     clear_windows: u8,
     alert_active: bool,
+    footprint_available: Option<bool>,
 }
 
 impl MemoryHistory {
+    fn record_reading(&mut self, now: Instant, process: &Process) -> MemoryTrend {
+        // A change from footprint to resident size is a metric change, not a
+        // sudden allocation/free. It cannot be joined to the previous series.
+        if self
+            .footprint_available
+            .is_some_and(|available| available != process.footprint_available)
+        {
+            *self = Self::default();
+        }
+        let trend = self.record(now, process.footprint_kib, process.age_seconds);
+        self.footprint_available = Some(process.footprint_available);
+        trend
+    }
+
     fn record(&mut self, now: Instant, footprint_kib: u64, age_seconds: u64) -> MemoryTrend {
         if age_seconds < self.age_seconds {
             *self = MemoryHistory::default();
@@ -768,7 +785,7 @@ impl App {
                     continue;
                 }
                 let history = self.memory_history.entry(process.pid).or_default();
-                let trend = history.record(now, process.footprint_kib, process.age_seconds);
+                let trend = history.record_reading(now, process);
                 if update_leak_state(history, trend.suspected)
                     && worst
                         .as_ref()
@@ -1863,32 +1880,33 @@ fn append_resource_history(
     terminals: &[Terminal],
     ghostty: Option<&Process>,
 ) -> io::Result<()> {
-    // v2 adds footprint and the leaking process's name. The header is written
+    // v3 records whether each memory reading includes an RSS fallback. The header is written
     // once, when the file is created, so a new column means a new file rather
     // than rows that no longer match the heading above them.
-    let Some(path) = default_data_dir().map(|directory| directory.join("resources-v2.tsv")) else {
+    let Some(path) = default_data_dir().map(|directory| directory.join("resources-v3.tsv")) else {
         return Ok(());
     };
     let mut file = open_history_file(
         &path,
-        "timestamp\tday\tkind\tid\tcpu_percent\tfootprint_kib\trss_kib\tprocesses\tage_seconds\tactivity\tmemory_growth_kib\tleak_suspected\tleak_process",
+        "timestamp\tday\tkind\tid\tcpu_percent\tfootprint_kib\trss_kib\tprocesses\tage_seconds\tactivity\tmemory_growth_kib\tleak_suspected\tleak_process\tfootprint_complete",
     )?;
     let timestamp = unix_timestamp();
     if let Some(process) = ghostty {
         writeln!(
             file,
-            "{timestamp}\t{}\tapp\tghostty\t{:.1}\t{}\t{}\t1\t{}\tghostty\t0\tfalse\t",
+            "{timestamp}\t{}\tapp\tghostty\t{:.1}\t{}\t{}\t1\t{}\tghostty\t0\tfalse\t\t{}",
             clean_field(day),
             process.cpu,
             process.footprint_kib,
             process.rss_kib,
             process.age_seconds,
+            process.footprint_available,
         )?;
     }
     for terminal in terminals {
         writeln!(
             file,
-            "{timestamp}\t{}\tterminal\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{timestamp}\t{}\tterminal\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             clean_field(day),
             clean_field(&terminal.tty),
             terminal.cpu,
@@ -1900,6 +1918,7 @@ fn append_resource_history(
             terminal.memory_growth_kib,
             terminal.leak_suspected,
             clean_field(&terminal.leak_process),
+            terminal.footprint_complete,
         )?;
     }
     append_process_history(timestamp, day, terminals, ghostty)?;
@@ -1912,12 +1931,12 @@ fn append_process_history(
     terminals: &[Terminal],
     ghostty: Option<&Process>,
 ) -> io::Result<()> {
-    let Some(path) = default_data_dir().map(|directory| directory.join("processes-v2.tsv")) else {
+    let Some(path) = default_data_dir().map(|directory| directory.join("processes-v3.tsv")) else {
         return Ok(());
     };
     let mut file = open_history_file(
         &path,
-        "timestamp\tday\tkind\tterminal_tty\tterminal_root_pid\tpid\tppid\tcpu_percent\tfootprint_kib\trss_kib\tage_seconds\tstarted_at\texecutable_name\texecutable_path",
+        "timestamp\tday\tkind\tterminal_tty\tterminal_root_pid\tpid\tppid\tcpu_percent\tfootprint_kib\trss_kib\tage_seconds\tstarted_at\texecutable_name\texecutable_path\tfootprint_available",
     )?;
     if let Some(process) = ghostty {
         writeln!(
@@ -1955,7 +1974,7 @@ fn process_history_row(
 ) -> String {
     let executable_path = process.command.split_whitespace().next().unwrap_or("?");
     format!(
-        "{timestamp}\t{}\t{}\t{}\t{terminal_root_pid}\t{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{timestamp}\t{}\t{}\t{}\t{terminal_root_pid}\t{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         clean_field(day),
         clean_field(kind),
         clean_field(terminal_tty),
@@ -1968,6 +1987,7 @@ fn process_history_row(
         timestamp.saturating_sub(process.age_seconds),
         clean_field(&command_name(&process.command)),
         clean_field(executable_path),
+        process.footprint_available,
     )
 }
 
@@ -2377,7 +2397,9 @@ fn sample_processes() -> Result<Vec<Process>, String> {
     // macOS that is a syscall costing microseconds; on Linux the processes we
     // are not allowed to read fail immediately, which is most of them.
     for process in &mut processes {
-        process.footprint_kib = phys_footprint_kib(process.pid).unwrap_or(process.rss_kib);
+        let footprint = phys_footprint_kib(process.pid);
+        process.footprint_available = footprint.is_some();
+        process.footprint_kib = footprint.unwrap_or(process.rss_kib);
     }
     Ok(processes)
 }
@@ -2405,6 +2427,7 @@ fn parse_process(line: &str) -> Option<Process> {
         // Filled in by `sample_processes`; resident size is the honest stand-in
         // until then.
         footprint_kib: rss_kib,
+        footprint_available: false,
         elapsed,
         age_seconds,
         command,
@@ -2460,6 +2483,7 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
         let cpu = members.iter().map(|p| p.cpu).sum();
         let rss_kib = members.iter().map(|p| p.rss_kib).sum();
         let footprint_kib = members.iter().map(|p| p.footprint_kib).sum();
+        let footprint_complete = members.iter().all(|p| p.footprint_available);
         members.sort_by_key(|process| std::cmp::Reverse(process.footprint_kib));
         // The kernel already knows what the tab is running: the tty hands the
         // keyboard to one process group, and that group's leader is the
@@ -2488,6 +2512,7 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
             cpu,
             rss_kib,
             footprint_kib,
+            footprint_complete,
             processes: members,
             activity,
             elapsed: root.elapsed.clone(),
@@ -2750,9 +2775,9 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
     ));
     lines.push(format!(
         "Ghostty  {YELLOW}{shared_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}    {} terminals  {YELLOW}{terminal_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}",
-        human_bytes(shared_ram),
+        memory_value(shared_ram, app.ghostty.as_ref().is_none_or(|p| p.footprint_available)),
         app.terminals.len(),
-        human_bytes(terminal_ram),
+        memory_value(terminal_ram, app.terminals.iter().all(|t| t.footprint_complete)),
     ));
     lines.push(String::new());
 
@@ -2806,7 +2831,7 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
                 "{marker}  {:<tab_width$} {YELLOW}{:>6.1}%{RESET}{row_style} {CYAN}{:>9}{RESET}{row_style} {}{row_style} {:>7} {:>11} {}",
                 truncate(&terminal.label, tab_width),
                 terminal.cpu,
-                human_bytes(terminal.footprint_kib),
+                memory_value(terminal.footprint_kib, terminal.footprint_complete),
                 trend_cell(terminal),
                 terminal.processes.len(),
                 terminal.elapsed,
@@ -2861,7 +2886,7 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
                     "  {:>6}  {YELLOW}{:>6.1}%{RESET}  {CYAN}{:>9}{RESET}  {DIM}{:>9}{RESET}   {}",
                     process.pid,
                     process.cpu,
-                    human_bytes(process.footprint_kib),
+                    memory_value(process.footprint_kib, process.footprint_available),
                     human_bytes(process.rss_kib),
                     truncate(&process.command, command_width),
                 ));
@@ -2869,6 +2894,9 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
         }
     }
 
+    if has_memory_fallback(app) {
+        lines.push(format!("{DIM}~ RAM includes resident-size fallback; physical footprint was unavailable.{RESET}"));
+    }
     if let Some(error) = &app.last_error {
         lines.push(format!("\x1b[31mSampling error: {error}{RESET}"));
     }
@@ -3557,7 +3585,7 @@ fn print_snapshot(app: &App) {
     println!(
         "Ghostty shared: {:>6.1}% CPU  {:>8} RAM",
         ghostty.cpu,
-        human_bytes(ghostty.footprint_kib)
+        memory_value(ghostty.footprint_kib, ghostty.footprint_available)
     );
     println!(
         "{:<24} {:>7}  {:>9}  {:>11}  {:>5}  {:>11}  ACTIVITY",
@@ -3568,7 +3596,7 @@ fn print_snapshot(app: &App) {
             "{:<24} {:>6.1}%  {:>9}  {:>11}  {:>5}  {:>11}  {}{}",
             truncate(&terminal.label, 24),
             terminal.cpu,
-            human_bytes(terminal.footprint_kib),
+            memory_value(terminal.footprint_kib, terminal.footprint_complete),
             if terminal.memory_samples < 2 {
                 "sampling".to_string()
             } else {
@@ -3583,6 +3611,23 @@ fn print_snapshot(app: &App) {
                 ""
             }
         );
+    }
+    if has_memory_fallback(app) {
+        println!("~ RAM includes resident-size fallback; physical footprint was unavailable.");
+    }
+}
+
+fn has_memory_fallback(app: &App) -> bool {
+    app.ghostty.as_ref().is_some_and(|p| !p.footprint_available)
+        || app.terminals.iter().any(|t| !t.footprint_complete)
+}
+
+fn memory_value(kib: u64, footprint_available: bool) -> String {
+    let text = human_bytes(kib);
+    if footprint_available {
+        text
+    } else {
+        format!("{}~", text.replace(' ', ""))
     }
 }
 
@@ -3672,6 +3717,7 @@ mod tests {
             cpu,
             rss_kib: rss,
             footprint_kib: rss,
+            footprint_available: true,
             elapsed: "01:00".into(),
             age_seconds: 60,
             command: command.into(),
@@ -4645,6 +4691,7 @@ mod tests {
                 cpu: index as f64 * 7.5,
                 rss_kib: 4096 * (index as u64 + 1),
                 footprint_kib: 5120 * (index as u64 + 1),
+                footprint_complete: true,
                 processes: vec![p(
                     200 + index,
                     100 + index,
@@ -4959,7 +5006,7 @@ mod tests {
         let row = process_history_row(1_000, "2026-08-06", "terminal", "ttys001", 7, &process);
         // pid, ppid, cpu, footprint, resident.
         assert!(row.contains("\t42\t7\t12.5\t8192\t4096\t"));
-        assert!(row.ends_with("\tpython3\t/usr/bin/python3"));
+        assert!(row.ends_with("\tpython3\t/usr/bin/python3\ttrue"));
         assert!(!row.contains("server.py"));
         assert!(!row.contains("secret"));
     }
@@ -5093,5 +5140,52 @@ mod tests {
             30
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resident_fallback_is_visible_in_the_tab_and_process_readings() {
+        let mut process = p(11, 10, "ttys001", 0.0, 4 * 1024, "node");
+        process.footprint_available = false;
+        let processes = vec![
+            p(1, 0, "??", 0.0, 32 * 1024, "ghostty"),
+            p(10, 1, "ttys001", 0.0, 1024, "/usr/bin/login"),
+            process,
+        ];
+        let (ghostty, terminals) = aggregate(&processes);
+        assert!(!terminals[0].footprint_complete);
+        let mut app = App::new(Duration::from_secs(1));
+        app.terminals = terminals;
+        app.ghostty = ghostty;
+        app.expanded = true;
+        let (frame, _) = render_monitor(&app, 30, 100);
+        assert!(frame.iter().any(|line| line.contains("4.0MiB~")));
+        assert!(frame
+            .iter()
+            .any(|line| line.contains("resident-size fallback")));
+        assert!(process_history_row(
+            100,
+            "2026-08-18",
+            "terminal",
+            "ttys001",
+            10,
+            &app.terminals[0].processes[0]
+        )
+        .ends_with("\tfalse"));
+    }
+
+    #[test]
+    fn switching_memory_metrics_starts_a_new_leak_series() {
+        let start = Instant::now();
+        let mut history = MemoryHistory::default();
+        let mut process = p(11, 10, "ttys001", 0.0, 100 * 1024, "node");
+        history.record_reading(start, &process);
+        process.footprint_kib = 120 * 1024;
+        history.record_reading(start + Duration::from_secs(1), &process);
+        assert_eq!(history.samples.len(), 2);
+        process.footprint_available = false;
+        process.footprint_kib = process.rss_kib;
+        history.record_reading(start + Duration::from_secs(2), &process);
+        assert_eq!(history.samples.len(), 1);
+        assert_eq!(history.samples[0].1, 100 * 1024);
     }
 }

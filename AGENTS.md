@@ -68,8 +68,7 @@ rather than branching at the call site.
 - A terminal's root process is `/usr/bin/login` on macOS. Linux Ghostty execs
   the shell directly, so any child of Ghostty holding a tty is a surface.
 - Working directories come from `lsof` on macOS and `/proc/PID/cwd` on Linux.
-- **Memory comes from `phys_footprint_kib`, not `ps`.** The RAM column has to
-  agree with Activity Monitor, which reports physical footprint: dirty pages
+- **Memory prefers `phys_footprint_kib`.** Activity Monitor reports physical footprint: dirty pages
   plus everything compressed or swapped out, plus IOKit mappings. Resident size
   misses all of that and had Ghostty at 109 MB against a real 1763 MB. `ps` has
   no keyword for it, `footprint -a` needs root, and `footprint -p` costs 50–110
@@ -81,7 +80,8 @@ rather than branching at the call site.
   so the struct must match it field for field;
   `reads_a_real_physical_footprint` is the test that catches it if it ever
   stops matching. A failed reading must return `None` so the caller falls back
-  to resident size — never report a live process as using no memory.
+  to resident size and marks that process and its tab with `~`. Mixed totals
+  may understate memory. Changing metric resets that process's leak series.
 - **Focused-tab tracking is macOS only.** Ghostty reports the focused tab
   through AppleScript and offers nothing equivalent elsewhere, so `TRACKS_FOCUS`
   is false on Linux and the calendar says so. Do not fake it by watching window
