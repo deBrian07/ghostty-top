@@ -2,6 +2,7 @@
 name = "ghostty-top"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 description = "A lightweight per-terminal CPU and memory monitor for Ghostty on macOS"
 license = "MIT"
 
@@ -14,4 +15,3 @@ strip = true
 lto = true
 codegen-units = 1
 panic = "abort"
-
