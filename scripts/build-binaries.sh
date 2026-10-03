@@ -54,7 +54,9 @@ mkdir -p binaries
 lipo -create -output binaries/ghostty-top \
     target/aarch64-apple-darwin/release/ghostty-top \
     target/x86_64-apple-darwin/release/ghostty-top
-lipo -verify_arch arm64 x86_64 binaries/ghostty-top
+for architecture in arm64 x86_64; do
+    lipo binaries/ghostty-top -verify_arch "$architecture"
+done
 chmod +x binaries/ghostty-top
 if [ ! -x binaries/ghostty-top ]; then
     echo "error: binaries/ghostty-top is not executable" >&2

@@ -28,16 +28,20 @@ cat > "$fixture/mock-bin/lipo" <<'MOCK'
 #!/bin/sh
 set -eu
 printf 'lipo %s\n' "$*" >> "$PACKAGING_LOG"
-[ "$1" != "${FAIL_LIPO:-}" ] || exit 1
-case "$1" in
+operation=$1
+if [ "$1" = binaries/ghostty-top ]; then operation=$2; fi
+[ "$operation" != "${FAIL_LIPO:-}" ] || exit 1
+case "$operation" in
     -create)
         [ "$2" = -output ]
         [ -f "$4" ] && [ -f "$5" ]
         printf 'universal binary\n' > "$3"
         ;;
     -verify_arch)
-        [ "$2 $3" = 'arm64 x86_64' ]
-        [ -f "$4" ]
+        [ "$2" = -verify_arch ]
+        [ "$#" = 3 ]
+        case "$3" in arm64|x86_64) ;; *) exit 1 ;; esac
+        [ -f "$1" ]
         ;;
     -info)
         [ -x "$2" ]
@@ -143,7 +147,8 @@ done
 reset_fixture
 sh "$fixture/scripts/build-binaries.sh" > "$fixture/output" 2>&1
 [ "$(grep -c '^cargo ' "$PACKAGING_LOG")" = 2 ]
-grep -qx 'lipo -verify_arch arm64 x86_64 binaries/ghostty-top' "$PACKAGING_LOG"
+grep -qx 'lipo binaries/ghostty-top -verify_arch arm64' "$PACKAGING_LOG"
+grep -qx 'lipo binaries/ghostty-top -verify_arch x86_64' "$PACKAGING_LOG"
 grep -q 'arm64 x86_64' "$fixture/output"
 [ -x "$fixture/binaries/ghostty-top" ]
 passed=$((passed + 1))
