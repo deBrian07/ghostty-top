@@ -23,7 +23,6 @@ const HISTORY_WINDOW: Duration = Duration::from_secs(15 * 60);
 const MIN_LEAK_DURATION: Duration = Duration::from_secs(3 * 60);
 const MIN_LEAK_SAMPLES: usize = 8;
 const MIN_LEAK_GROWTH_KIB: i64 = 48 * 1024;
-const MIN_LEAK_GROWTH_RATIO: f64 = 0.10;
 const MIN_LEAK_SLOPE_KIB_PER_MIN: f64 = 4.0 * 1024.0;
 const MIN_LEAK_R_SQUARED: f64 = 0.70;
 const MIN_UPWARD_SAMPLE_RATIO: f64 = 0.70;
@@ -387,6 +386,7 @@ struct Terminal {
     /// The process a leak warning is about, and how much it has grown.
     leak_process: String,
     leak_growth_kib: i64,
+    leak_span: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -470,6 +470,7 @@ struct MemoryTrend {
     growth_kib: i64,
     slope_kib_per_min: f64,
     suspected: bool,
+    span: Duration,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -757,7 +758,7 @@ impl App {
 
             // Whichever process has grown most among those that look like they
             // are leaking gets named; a tab is only as suspect as its worst one.
-            let mut worst: Option<(String, i64)> = None;
+            let mut worst: Option<(String, i64, Duration)> = None;
             for process in &terminal.processes {
                 // Small processes are ignored until they grow into the floor,
                 // but one already being watched keeps its history.
@@ -771,21 +772,23 @@ impl App {
                 if update_leak_state(history, trend.suspected)
                     && worst
                         .as_ref()
-                        .is_none_or(|(_, growth)| trend.growth_kib > *growth)
+                        .is_none_or(|(_, growth, _)| trend.growth_kib > *growth)
                 {
-                    worst = Some((command_name(&process.command), trend.growth_kib));
+                    worst = Some((command_name(&process.command), trend.growth_kib, trend.span));
                 }
             }
             match worst {
-                Some((name, growth)) => {
+                Some((name, growth, span)) => {
                     terminal.leak_suspected = true;
                     terminal.leak_process = name;
                     terminal.leak_growth_kib = growth;
+                    terminal.leak_span = span;
                 }
                 None => {
                     terminal.leak_suspected = false;
                     terminal.leak_process.clear();
                     terminal.leak_growth_kib = 0;
+                    terminal.leak_span = Duration::ZERO;
                 }
             }
         }
@@ -2481,6 +2484,7 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
             leak_suspected: false,
             leak_process: String::new(),
             leak_growth_kib: 0,
+            leak_span: Duration::ZERO,
         });
     }
     (ghostty, terminals)
@@ -2573,11 +2577,6 @@ fn analyze_memory_history(samples: &VecDeque<(Instant, u64)>) -> MemoryTrend {
         / edge_count as f64;
     let growth = recent - baseline;
     let duration = last_time.duration_since(*first_time);
-    let ratio = if baseline > 0.0 {
-        growth / baseline
-    } else {
-        0.0
-    };
     let points: Vec<(f64, f64)> = samples
         .iter()
         .map(|(time, rss)| (time.duration_since(*first_time).as_secs_f64(), *rss as f64))
@@ -2586,7 +2585,10 @@ fn analyze_memory_history(samples: &VecDeque<(Instant, u64)>) -> MemoryTrend {
     let slope_kib_per_min = slope_per_second * 60.0;
     let recent_start = points.len() / 2;
     let (recent_slope_per_second, _) = linear_regression(&points[recent_start..]);
-    let tolerance = (baseline * 0.01).max(2.0 * 1024.0);
+    // Footprint includes compressed pages, so residency churn is not noise
+    // here. A fixed 256 KiB allowance also cannot hide larger drops merely
+    // because an otherwise identical leak starts from a large baseline.
+    let tolerance = 256.0;
     let upward_samples = samples
         .iter()
         .zip(samples.iter().skip(1))
@@ -2594,12 +2596,12 @@ fn analyze_memory_history(samples: &VecDeque<(Instant, u64)>) -> MemoryTrend {
         .count();
     let upward_ratio = upward_samples as f64 / (samples.len() - 1) as f64;
     MemoryTrend {
+        span: duration,
         growth_kib: growth.round() as i64,
         slope_kib_per_min,
         suspected: samples.len() >= MIN_LEAK_SAMPLES
             && duration >= MIN_LEAK_DURATION
             && growth >= MIN_LEAK_GROWTH_KIB as f64
-            && ratio >= MIN_LEAK_GROWTH_RATIO
             && slope_kib_per_min >= MIN_LEAK_SLOPE_KIB_PER_MIN
             && r_squared >= MIN_LEAK_R_SQUARED
             && recent_slope_per_second >= slope_per_second * 0.35
@@ -2823,9 +2825,10 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
             ));
             if terminal.leak_suspected {
                 lines.push(format!(
-                    "{BOLD}{RED}⚠ Potential memory leak in {}: {} since tracking began{RESET}",
+                    "{BOLD}{RED}⚠ Potential memory leak in {}: {} over {} (averaged edges){RESET}",
                     terminal.leak_process,
                     signed_human_kib(terminal.leak_growth_kib),
+                    human_duration(terminal.leak_span.as_secs()),
                 ));
             }
             // RESIDENT is here so the gap between the two is legible rather
@@ -4645,6 +4648,7 @@ mod tests {
                 leak_suspected: index % 4 == 0,
                 leak_process: "node".into(),
                 leak_growth_kib: 96 * 1024,
+                leak_span: Duration::from_secs(900),
             });
         }
         app
@@ -4944,5 +4948,56 @@ mod tests {
         assert!(row.ends_with("\tpython3\t/usr/bin/python3"));
         assert!(!row.contains("server.py"));
         assert!(!row.contains("secret"));
+    }
+
+    #[test]
+    fn sustained_growth_is_detected_even_on_a_large_footprint() {
+        let start = Instant::now();
+        for baseline in [544 * 1024, 8 * 1024 * 1024] {
+            let samples = (0..=12)
+                .map(|index| {
+                    (
+                        start + Duration::from_secs(index * 20),
+                        baseline + index * 5 * 1024,
+                    )
+                })
+                .collect();
+            let trend = analyze_memory_history(&samples);
+            assert!(
+                trend.suspected,
+                "missed the same growth on baseline {baseline}"
+            );
+            assert_eq!(trend.span, Duration::from_secs(240));
+        }
+    }
+
+    #[test]
+    fn large_back_and_forth_allocations_are_not_a_steady_leak() {
+        let start = Instant::now();
+        let samples = (0..=12)
+            .map(|index| {
+                (
+                    start + Duration::from_secs(index * 20),
+                    (8 * 1024 + index * 8 + if index % 2 == 0 { 16 } else { 0 }) * 1024,
+                )
+            })
+            .collect();
+        assert!(!analyze_memory_history(&samples).suspected);
+    }
+
+    #[test]
+    fn growth_span_follows_the_retained_window() {
+        let start = Instant::now();
+        let mut history = MemoryHistory::default();
+        let mut trend = MemoryTrend::default();
+        for step in 0..=60 {
+            trend = history.record(
+                start + Duration::from_secs(step * 60),
+                (100 + step * 5) * 1024,
+                step * 60,
+            );
+        }
+        assert_eq!(trend.span, HISTORY_WINDOW);
+        assert!(trend.growth_kib < 300 * 1024);
     }
 }
