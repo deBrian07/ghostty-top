@@ -79,6 +79,11 @@ memory readings. It does not save anything you type or anything printed in your
 terminal, and it never saves command arguments or environment variables,
 because those can contain passwords and keys.
 
+Detailed telemetry rotates when a file reaches 10 MiB, keeping three backups
+per file. The oldest backup is deleted on the next rotation. Superseded
+resource and process schemas are removed when the current schema first opens.
+Daily totals in `usage.tsv` are kept; uninstalling the tracker preserves them.
+
 The first time it reads tab names, macOS asks you to allow it to control
 Ghostty. That permission is only needed once.
 

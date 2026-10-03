@@ -27,9 +27,11 @@ before writing code.
   Everything comes from read-only queries: its AppleScript dictionary at
   `/Applications/Ghostty.app/Contents/Resources/Ghostty.sdef`, plus `ps`/`lsof`.
 - **macOS only.** `main` exits early on other platforms.
-- **Data is append-only and versioned.** Files under
-  `~/Library/Application Support/ghostty-top/` are never pruned or rewritten.
-  A schema change means a new `-v2` file, not an edited `-v1` one.
+- **Telemetry is versioned and bounded.** Append snapshots under a per-file
+  lock. Rotate at 10 MiB and retain three backups; remove only superseded
+  resource/process schemas during a recorded one-time migration. A schema
+  change means a new filename. Keep daily totals in `usage.tsv`, whose atomic
+  merge-and-rewrite is also protected by a separate lock file.
 
 ## Commands
 

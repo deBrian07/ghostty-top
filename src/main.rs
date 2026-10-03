@@ -79,6 +79,8 @@ const INVENTORY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const INVENTORY_HEARTBEAT: Duration = Duration::from_secs(15 * 60);
 const RESOURCE_HISTORY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const HISTORY_SCHEMA_VERSION: &str = "1";
+const HISTORY_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+const HISTORY_BACKUPS: usize = 3;
 
 // Platform differences live here so the rest of the file stays one
 // implementation. macOS behaviour is unchanged: every macOS branch is the code
@@ -2027,16 +2029,99 @@ fn lock_file(path: &Path) -> io::Result<fs::File> {
     Ok(lock)
 }
 
-fn open_history_file(path: &PathBuf, header: &str) -> io::Result<fs::File> {
+struct HistoryFile {
+    file: fs::File,
+    // Kept until the whole snapshot is written, including its header. Locking
+    // a separate inode makes rotation safe against another recorder.
+    _lock: fs::File,
+}
+
+impl Write for HistoryFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.file.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn history_backup(path: &Path, index: usize) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        index
+    ))
+}
+
+fn rotate_history(path: &Path, limit: u64) -> io::Result<()> {
+    if fs::metadata(path).map_or(true, |metadata| metadata.len() < limit) {
+        return Ok(());
+    }
+    let oldest = history_backup(path, HISTORY_BACKUPS);
+    match fs::remove_file(&oldest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    for index in (1..HISTORY_BACKUPS).rev() {
+        let source = history_backup(path, index);
+        match fs::rename(source, history_backup(path, index + 1)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    fs::rename(path, history_backup(path, 1))
+}
+
+fn remove_superseded_history(path: &Path) -> io::Result<()> {
+    let obsolete: &[&str] = match path.file_name().and_then(|name| name.to_str()) {
+        Some("resources-v3.tsv") => &["resources-v1.tsv", "resources-v2.tsv"],
+        Some("processes-v3.tsv") => &["processes-v1.tsv", "processes-v2.tsv"],
+        _ => &[],
+    };
+    let Some(directory) = path.parent() else {
+        return Ok(());
+    };
+    for name in obsolete {
+        let old_path = directory.join(name);
+        // An older tracker may still be finishing a snapshot. Do not delete
+        // the inode underneath a writer that participates in the same lock.
+        let _lock = lock_file(&old_path)?;
+        for old_file in std::iter::once(old_path.clone())
+            .chain((1..=HISTORY_BACKUPS).map(|index| history_backup(&old_path, index)))
+        {
+            match fs::remove_file(old_file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_history_file(path: &PathBuf, header: &str) -> io::Result<HistoryFile> {
+    open_history_file_with_limit(path, header, HISTORY_ROTATE_BYTES)
+}
+
+fn open_history_file_with_limit(path: &Path, header: &str, limit: u64) -> io::Result<HistoryFile> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let lock = lock_file(path)?;
+    let migration_marker = path.with_extension("retention-v1");
+    rotate_history(path, limit)?;
     let needs_header = fs::metadata(path).map_or(true, |metadata| metadata.len() == 0);
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     if needs_header {
         writeln!(file, "{header}")?;
     }
-    Ok(file)
+    if !migration_marker.exists() {
+        remove_superseded_history(path)?;
+        fs::write(migration_marker, b"superseded telemetry removed\n")?;
+    }
+    Ok(HistoryFile { file, _lock: lock })
 }
 
 fn unix_timestamp() -> u64 {
@@ -5187,5 +5272,85 @@ mod tests {
         history.record_reading(start + Duration::from_secs(2), &process);
         assert_eq!(history.samples.len(), 1);
         assert_eq!(history.samples[0].1, 100 * 1024);
+    }
+
+    #[test]
+    fn history_rotation_keeps_recent_files_with_one_header_each() {
+        let directory =
+            env::temp_dir().join(format!("ghostty-top-rotation-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("resources-v3.tsv");
+        for index in 0..8 {
+            let mut file = open_history_file_with_limit(&path, "header", 10).unwrap();
+            writeln!(file, "record-{index}").unwrap();
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), "header\nrecord-7\n");
+        for index in 1..=HISTORY_BACKUPS {
+            assert_eq!(
+                fs::read_to_string(history_backup(&path, index)).unwrap(),
+                format!("header\nrecord-{}\n", 7 - index)
+            );
+        }
+        assert!(!history_backup(&path, HISTORY_BACKUPS + 1).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn new_telemetry_schema_removes_only_its_superseded_files() {
+        let directory =
+            env::temp_dir().join(format!("ghostty-top-migration-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        for name in [
+            "resources-v1.tsv",
+            "resources-v2.tsv",
+            "processes-v2.tsv",
+            "usage.tsv",
+            "tab-history-v1.tsv",
+        ] {
+            fs::write(directory.join(name), "keep-or-remove").unwrap();
+        }
+        let path = directory.join("resources-v3.tsv");
+        drop(open_history_file_with_limit(&path, "header", 10).unwrap());
+        assert!(!directory.join("resources-v1.tsv").exists());
+        assert!(!directory.join("resources-v2.tsv").exists());
+        for name in ["processes-v2.tsv", "usage.tsv", "tab-history-v1.tsv"] {
+            assert_eq!(
+                fs::read_to_string(directory.join(name)).unwrap(),
+                "keep-or-remove"
+            );
+        }
+        // Cleanup is a migration, not a deletion repeated at every append.
+        fs::write(
+            directory.join("resources-v2.tsv"),
+            "older tracker restarted",
+        )
+        .unwrap();
+        drop(open_history_file_with_limit(&path, "header", 10).unwrap());
+        assert!(directory.join("resources-v2.tsv").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_history_snapshot_excludes_other_writers_until_it_finishes() {
+        let directory =
+            env::temp_dir().join(format!("ghostty-top-history-lock-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("tab-history-v1.tsv");
+        let mut file = open_history_file_with_limit(&path, "header", 10).unwrap();
+        assert_eq!(
+            open_history_file_with_limit(&path, "header", 10)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        writeln!(file, "snapshot").unwrap();
+        drop(file);
+        drop(open_history_file_with_limit(&path, "header", 10).unwrap());
+        assert_eq!(
+            fs::read_to_string(history_backup(&path, 1)).unwrap(),
+            "header\nsnapshot\n"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }
