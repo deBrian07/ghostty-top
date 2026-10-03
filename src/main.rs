@@ -1115,14 +1115,14 @@ impl UsageTracker {
         }
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let update = match away_reason() {
+            let update = away_reason().and_then(|away| match away {
                 Some(away) => Ok(FocusUpdate::Away(away)),
                 None => query_focused_tab().map(|focus| FocusUpdate::Sample {
                     focus,
                     at: Instant::now(),
                     wall: SystemTime::now(),
                 }),
-            };
+            });
             let _ = sender.send(update);
         });
         self.pending_focus = Some(receiver);
@@ -1380,53 +1380,95 @@ impl Away {
 /// sleep needs no check here: the elapsed-time guard in `tick` discards the
 /// gap, because a sleeping Mac cannot poll in the first place.
 #[cfg(not(target_os = "macos"))]
-fn away_reason() -> Option<Away> {
-    None
+fn away_reason() -> Result<Option<Away>, String> {
+    Ok(None)
 }
 
 #[cfg(target_os = "macos")]
-fn away_reason() -> Option<Away> {
-    if lid_is_closed() {
-        return Some(Away::LidClosed);
+fn away_reason() -> Result<Option<Away>, String> {
+    if lid_is_closed()? {
+        return Ok(Some(Away::LidClosed));
     }
-    // Covers a locked screen, a sleeping display, and simply walking off.
-    if hid_idle_time().is_some_and(|idle| idle > MAX_IDLE) {
-        return Some(Away::Idle);
+    // Unknown presence breaks the credit interval, just like a failed focus
+    // query: assuming the user is present would invent time after a probe stalls.
+    if hid_idle_time()? > MAX_IDLE {
+        return Ok(Some(Away::Idle));
     }
-    None
+    Ok(None)
 }
 
 #[cfg(target_os = "macos")]
-fn lid_is_closed() -> bool {
-    // Desktop Macs have no clamshell key at all, so a missing value means open.
-    ioreg_value(
+fn lid_is_closed() -> Result<bool, String> {
+    let value = ioreg_value(
         &["-r", "-k", "AppleClamshellState", "-d", "1"],
         "AppleClamshellState",
-    )
-    .is_some_and(|state| state.trim() == "Yes")
+    )?;
+    parse_clamshell_state(value.as_deref())
 }
 
 #[cfg(target_os = "macos")]
-fn hid_idle_time() -> Option<Duration> {
-    let nanoseconds: u64 = ioreg_value(&["-c", "IOHIDSystem", "-d", "4"], "HIDIdleTime")?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(Duration::from_nanos(nanoseconds))
+fn hid_idle_time() -> Result<Duration, String> {
+    let value = ioreg_value(&["-c", "IOHIDSystem", "-d", "4"], "HIDIdleTime")?;
+    parse_idle_time(value.as_deref())
 }
 
-/// Reads `"<key>" = <value>` out of an ioreg dump.
+#[cfg(any(target_os = "macos", test))]
+fn parse_clamshell_state(value: Option<&str>) -> Result<bool, String> {
+    // Desktop Macs have no clamshell key; only a successful missing key is open.
+    match value.map(str::trim) {
+        None | Some("No") => Ok(false),
+        Some("Yes") => Ok(true),
+        Some(_) => Err("could not determine whether the lid is closed".to_string()),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_idle_time(value: Option<&str>) -> Result<Duration, String> {
+    let nanoseconds = value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .ok_or_else(|| "could not determine whether the user is present".to_string())?;
+    Ok(Duration::from_nanos(nanoseconds))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_ioreg_response<'a>(
+    success: bool,
+    output: &'a str,
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    if !success {
+        return Err(format!("ioreg could not read {key}"));
+    }
+    let property = format!("\"{key}\"");
+    for line in output.lines() {
+        let Some(rest) = line
+            .trim_start_matches(|character: char| character.is_whitespace() || character == '|')
+            .strip_prefix(&property)
+        else {
+            continue;
+        };
+        let value = rest
+            .trim_start()
+            .strip_prefix('=')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("ioreg returned a malformed {key} value"))?;
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
+/// Reads `"<key>" = <value>` out of a successful ioreg dump.
 #[cfg(target_os = "macos")]
-fn ioreg_value(arguments: &[&str], key: &str) -> Option<String> {
+fn ioreg_value(arguments: &[&str], key: &str) -> Result<Option<String>, String> {
     let output = run_command_with_timeout(
         Command::new("ioreg").args(arguments),
         PRESENCE_QUERY_TIMEOUT,
     )
-    .ok()?;
-    let needle = format!("\"{key}\" = ");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| Some(line.split_once(&needle)?.1.to_string()))
+    .map_err(|error| format!("could not read presence state {key}: {error}"))?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|error| format!("ioreg returned invalid text for {key}: {error}"))?;
+    parse_ioreg_response(output.status.success(), text, key).map(|value| value.map(str::to_string))
 }
 
 fn default_usage_path() -> Option<PathBuf> {
@@ -6577,6 +6619,55 @@ mod tests {
         assert!(frame
             .iter()
             .any(|line| strip_ansi(line).contains("Tracking paused: focus query timed out")));
+    }
+
+    #[test]
+    fn presence_missing_clamshell_is_open_only_after_a_successful_probe() {
+        let absent = parse_ioreg_response(true, "", "AppleClamshellState").unwrap();
+        assert_eq!(parse_clamshell_state(absent), Ok(false));
+        assert!(parse_ioreg_response(false, "", "AppleClamshellState").is_err());
+        assert_eq!(parse_clamshell_state(Some("Yes")), Ok(true));
+        assert_eq!(parse_clamshell_state(Some("No")), Ok(false));
+        assert!(parse_clamshell_state(Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn presence_missing_or_malformed_idle_time_prevents_credit() {
+        for value in [
+            None,
+            Some(""),
+            Some("unknown"),
+            Some("-1"),
+            Some("18446744073709551616"),
+        ] {
+            assert!(
+                parse_idle_time(value).is_err(),
+                "accepted unknown idle time: {value:?}"
+            );
+        }
+        assert_eq!(
+            parse_idle_time(Some(" 123000000000 ")),
+            Ok(Duration::from_secs(123))
+        );
+        assert_eq!(parse_idle_time(Some("0")), Ok(Duration::ZERO));
+    }
+
+    #[test]
+    fn presence_failed_and_malformed_registry_responses_are_errors() {
+        assert!(parse_ioreg_response(false, "\"HIDIdleTime\" = 0", "HIDIdleTime").is_err());
+        assert!(parse_ioreg_response(true, "\"HIDIdleTime\" =", "HIDIdleTime").is_err());
+        assert!(
+            parse_ioreg_response(true, "\"AppleClamshellState\" No", "AppleClamshellState")
+                .is_err()
+        );
+        let idle = parse_ioreg_response(
+            true,
+            "    | |     \"HIDIdleTime\" = 42000000000\n",
+            "HIDIdleTime",
+        )
+        .unwrap();
+        assert_eq!(parse_idle_time(idle), Ok(Duration::from_secs(42)));
+        assert!(parse_idle_time(parse_ioreg_response(true, "", "HIDIdleTime").unwrap()).is_err());
     }
 
     #[test]
