@@ -2018,7 +2018,19 @@ fn append_tracker_event(event: &str) -> io::Result<()> {
     )
 }
 
-fn lock_file(path: &Path) -> io::Result<fs::File> {
+struct FileLock {
+    file: fs::File,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Explicit unlock also releases any descriptor briefly inherited by
+        // a subprocess spawned on another thread while this file was open.
+        let _ = self.file.unlock();
+    }
+}
+
+fn lock_file(path: &Path) -> io::Result<FileLock> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -2026,14 +2038,14 @@ fn lock_file(path: &Path) -> io::Result<fs::File> {
         .truncate(false)
         .open(path.with_extension("lock"))?;
     lock.try_lock().map_err(io::Error::from)?;
-    Ok(lock)
+    Ok(FileLock { file: lock })
 }
 
 struct HistoryFile {
     file: fs::File,
     // Kept until the whole snapshot is written, including its header. Locking
     // a separate inode makes rotation safe against another recorder.
-    _lock: fs::File,
+    _lock: FileLock,
 }
 
 impl Write for HistoryFile {
@@ -2101,7 +2113,7 @@ fn remove_superseded_history(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn open_history_file(path: &PathBuf, header: &str) -> io::Result<HistoryFile> {
+fn open_history_file(path: &Path, header: &str) -> io::Result<HistoryFile> {
     open_history_file_with_limit(path, header, HISTORY_ROTATE_BYTES)
 }
 
