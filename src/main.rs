@@ -918,6 +918,9 @@ impl UsageStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        // The lock must have its own inode: renaming usage.tsv would otherwise
+        // let a second writer lock the replacement while we hold the old file.
+        let _lock = lock_file(&path)?;
         // Re-read before the wholesale rewrite below. Anything another process
         // has recorded since we loaded is only in the file, and writing our own
         // view straight over the top would delete it.
@@ -1991,6 +1994,17 @@ fn append_tracker_event(event: &str) -> io::Result<()> {
         INVENTORY_POLL_INTERVAL.as_secs(),
         RESOURCE_HISTORY_INTERVAL.as_secs(),
     )
+}
+
+fn lock_file(path: &Path) -> io::Result<fs::File> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    lock.try_lock().map_err(io::Error::from)?;
+    Ok(lock)
 }
 
 fn open_history_file(path: &PathBuf, header: &str) -> io::Result<fs::File> {
@@ -4999,5 +5013,85 @@ mod tests {
         }
         assert_eq!(trend.span, HISTORY_WINDOW);
         assert!(trend.growth_kib < 300 * 1024);
+    }
+
+    #[test]
+    fn simultaneous_usage_writers_preserve_every_tab() {
+        let directory =
+            env::temp_dir().join(format!("ghostty-top-concurrent-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("usage.tsv");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let mut store = UsageStore::load(Some(path));
+                    store.add(
+                        "2026-08-18",
+                        &FocusedTab {
+                            tab_id: format!("tab-{index}"),
+                            tab_name: format!("Tab {index}"),
+                            terminal_id: String::new(),
+                            terminal_name: String::new(),
+                        },
+                        60,
+                    );
+                    barrier.wait();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        match store.save() {
+                            Ok(()) => break,
+                            Err(error)
+                                if error.kind() == io::ErrorKind::WouldBlock
+                                    && Instant::now() < deadline =>
+                            {
+                                thread::yield_now()
+                            }
+                            Err(error) => panic!("save failed: {error}"),
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let store = UsageStore::load(Some(path));
+        assert_eq!(store.days["2026-08-18"].len(), 8);
+        assert!(store.days["2026-08-18"]
+            .values()
+            .all(|tab| tab.seconds == 60));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_busy_usage_file_is_retried_without_losing_pending_time() {
+        let directory = env::temp_dir().join(format!("ghostty-top-locked-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("usage.tsv");
+        let lock = lock_file(&path).unwrap();
+        let mut store = UsageStore::load(Some(path.clone()));
+        store.add(
+            "2026-08-18",
+            &FocusedTab {
+                tab_id: "tab".into(),
+                tab_name: "Name".into(),
+                terminal_id: String::new(),
+                terminal_name: String::new(),
+            },
+            30,
+        );
+        assert_eq!(store.save().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(store.dirty);
+        assert!(!path.exists());
+        drop(lock);
+        store.save().unwrap();
+        assert_eq!(
+            UsageStore::load(Some(path)).days["2026-08-18"]["tab"].seconds,
+            30
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }
