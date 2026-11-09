@@ -161,6 +161,17 @@ The join is therefore ambiguous whenever two tabs share a directory, and
 surface owns that directory. Showing the directory is correct; guessing a name
 puts the wrong label on a row. Do not "improve" this into a heuristic.
 
+**herdr panes are joined by shell pid, focus by title.** herdr runs panes
+under a detached `herdr server`, so `aggregate` never sees them;
+`herdr_terminals` gives each server a row and groups its panes by herdr tab
+beneath it, and `sort_terminals` keeps them there. The pane-to-process join uses
+the shell pid herdr reports over its socket (read-only `session.snapshot` and
+`pane.process_info`), never a directory. Focused time goes to a herdr tab only
+when the focused Ghostty surface's title equals herdr's default
+`{hostname}: {workspace}` for exactly one local session; anything else stays
+with the Ghostty tab. Remote sessions have no local socket and are ignored on
+purpose.
+
 **Leaks are judged per process, trends per tab.** `App.memory_history` is
 keyed by pid and `App.tab_memory_history` by root pid, and they are not
 interchangeable. A tab's total jumps every time a subprocess starts or exits, so
