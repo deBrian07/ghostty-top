@@ -1338,6 +1338,69 @@ fn query_herdr_panes() -> HashMap<i32, HerdrPane> {
     panes
 }
 
+/// The herdr tab on screen in a focused Ghostty surface. herdr titles the
+/// terminal it runs in `{hostname}: {workspace}` by default, rendered by the
+/// server that owns the panes, so a surface titled with this machine's name and
+/// a local session's focused workspace is showing that session. A remote
+/// session names its own host and fails the match, as do a customised title and
+/// two local sessions showing the same workspace name; the time then stays
+/// with the Ghostty tab rather than going to a guess.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn herdr_focus(
+    focus: &FocusedTab,
+    hostname: &str,
+    sessions: &[(String, Json)],
+) -> Option<FocusedTab> {
+    let mut found = sessions.iter().filter_map(|(session, snapshot)| {
+        let workspace_id = snapshot.get("focused_workspace_id")?.text()?;
+        let workspace = snapshot
+            .get("workspaces")?
+            .items()
+            .iter()
+            .find(|item| item.get("workspace_id").and_then(Json::text) == Some(workspace_id))?
+            .get("label")?
+            .text()?;
+        if focus.terminal_name != format!("{hostname}: {workspace}") {
+            return None;
+        }
+        let tab_id = snapshot.get("focused_tab_id")?.text()?;
+        Some(FocusedTab {
+            tab_id: format!("herdr:{session}:{tab_id}"),
+            tab_name: format!("herdr › {}", herdr_tab_label(snapshot, tab_id)?),
+            terminal_id: snapshot
+                .get("focused_pane_id")
+                .and_then(Json::text)
+                .unwrap_or_default()
+                .to_string(),
+            terminal_name: focus.terminal_name.clone(),
+        })
+    });
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
+}
+
+#[cfg(target_os = "macos")]
+fn local_herdr_focus(focus: &FocusedTab) -> Option<FocusedTab> {
+    let sessions: Vec<(String, Json)> = herdr_sockets()
+        .into_iter()
+        .filter_map(|(name, socket)| {
+            let snapshot = herdr_request(&socket, "session.snapshot", "{}")?.take("snapshot")?;
+            Some((name, snapshot))
+        })
+        .collect();
+    if sessions.is_empty() {
+        return None;
+    }
+    // Read every time: macOS renames the host when the network changes, and
+    // herdr renders the title with whatever the name is now.
+    let output = Command::new("hostname")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    let hostname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    herdr_focus(focus, &hostname, &sessions)
+}
+
 fn json_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -1984,12 +2047,13 @@ end tell"#;
     if fields.len() != 4 {
         return Err("Ghostty returned an unexpected focus response".to_string());
     }
-    Ok(Some(FocusedTab {
+    let focus = FocusedTab {
         tab_id: fields[0].to_string(),
         tab_name: fields[1].to_string(),
         terminal_id: fields[2].to_string(),
         terminal_name: fields[3].to_string(),
-    }))
+    };
+    Ok(Some(local_herdr_focus(&focus).unwrap_or(focus)))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -4375,6 +4439,47 @@ mod tests {
             Some("Agents › 2nd-brain")
         );
         assert_eq!(herdr_tab_label(&snapshot, "w1:t9"), None);
+    }
+
+    #[test]
+    fn focused_time_goes_to_the_herdr_tab_only_when_the_title_proves_it_is_local() {
+        let snapshot = |workspace: &str| {
+            parse_json(&format!(
+                r#"{{"focused_workspace_id":"w1","focused_tab_id":"w1:t4","focused_pane_id":"w1:p4",
+                   "workspaces":[{{"workspace_id":"w1","label":"{workspace}"}}],
+                   "tabs":[{{"tab_id":"w1:t4","workspace_id":"w1","label":"ghostty-top"}}]}}"#
+            ))
+            .unwrap()
+        };
+        let ghostty = |title: &str| FocusedTab {
+            tab_id: "tab-1".into(),
+            tab_name: "herdr".into(),
+            terminal_id: "T1".into(),
+            terminal_name: title.into(),
+        };
+        let local = vec![("default".to_string(), snapshot("Agents"))];
+
+        let focus = herdr_focus(&ghostty("mac.local: Agents"), "mac.local", &local).unwrap();
+        assert_eq!(focus.tab_id, "herdr:default:w1:t4");
+        assert_eq!(focus.tab_name, "herdr › Agents › ghostty-top");
+        assert_eq!(focus.terminal_id, "w1:p4");
+
+        // A remote session renders its own hostname into the title.
+        assert_eq!(
+            herdr_focus(&ghostty("devbox: Agents"), "mac.local", &local),
+            None
+        );
+        // An ordinary Ghostty tab, or a customised herdr title.
+        assert_eq!(herdr_focus(&ghostty("~/code"), "mac.local", &local), None);
+        // Two local sessions on the same workspace name cannot be told apart.
+        let twins = vec![
+            ("default".to_string(), snapshot("Agents")),
+            ("work".to_string(), snapshot("Agents")),
+        ];
+        assert_eq!(
+            herdr_focus(&ghostty("mac.local: Agents"), "mac.local", &twins),
+            None
+        );
     }
 
     #[test]
