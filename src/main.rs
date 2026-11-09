@@ -3172,8 +3172,9 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
     } else {
         format!("{DIM}·  press{RESET} u {DIM}for the usage calendar{RESET}")
     };
-    lines.push(format!(
-        "{BOLD}{GREEN}ghostty-top{RESET}  {calendar_teaser}{alert_status}",
+    lines.push(with_version(
+        format!("{BOLD}{GREEN}ghostty-top{RESET}  {calendar_teaser}{alert_status}"),
+        width,
     ));
     lines.push(format!(
         "Ghostty  {YELLOW}{shared_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}    {} terminals  {YELLOW}{terminal_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}",
@@ -3322,8 +3323,11 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
 fn render_usage(app: &App, height: usize, width: usize) -> (Vec<String>, Layout) {
     const WEEKDAYS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
     let weeks = visible_weeks(width);
-    let mut lines = vec![format!(
-        "{BOLD}{GREEN}ghostty-top{RESET}  {BOLD}usage calendar{RESET}  {DIM}time spent with each Ghostty tab focused{RESET}"
+    let mut lines = vec![with_version(
+        format!(
+            "{BOLD}{GREEN}ghostty-top{RESET}  {BOLD}usage calendar{RESET}  {DIM}time spent with each Ghostty tab focused{RESET}"
+        ),
+        width,
     )];
     let mut layout = Layout::default();
     let tracker = app.usage_tracker.as_ref();
@@ -4023,6 +4027,27 @@ fn human_bytes(kib: u64) -> String {
     }
 }
 
+/// Puts the version at the right edge of a title line, clipping the line
+/// to make room. Only a very narrow window drops the version instead.
+fn with_version(line: String, width: usize) -> String {
+    let version = concat!("v", env!("CARGO_PKG_VERSION"));
+    if width < 40 {
+        return line;
+    }
+    let line = fit_to_width(&line, width - version.len() - 2);
+    let mut used = 0;
+    let mut in_escape = false;
+    for character in line.chars() {
+        match character {
+            '\x1b' => in_escape = true,
+            _ if in_escape => in_escape = !character.is_ascii_alphabetic(),
+            _ => used += 1,
+        }
+    }
+    let gap = " ".repeat(width - used - version.len());
+    format!("{line}{gap}{DIM}{version}{RESET}")
+}
+
 /// Cuts a rendered line to the terminal width, counting only visible columns.
 /// Colour escapes are copied through rather than counted, so a long line is
 /// clipped at the edge instead of wrapping and tearing the frame apart.
@@ -4480,6 +4505,30 @@ mod tests {
             herdr_focus(&ghostty("mac.local: Agents"), "mac.local", &twins),
             None
         );
+    }
+
+    #[test]
+    fn the_version_sits_at_the_right_edge_when_there_is_room() {
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        let line = with_version(format!("{BOLD}ghostty-top{RESET}"), 40);
+        let gap = " ".repeat(40 - "ghostty-top".len() - version.len());
+        assert_eq!(
+            line,
+            format!("{BOLD}ghostty-top{RESET}{gap}{DIM}{version}{RESET}")
+        );
+
+        // A long line is clipped to make room rather than hiding the version.
+        let long = with_version("x".repeat(60), 40);
+        assert_eq!(
+            long,
+            format!(
+                "{}{RESET}  {DIM}{version}{RESET}",
+                "x".repeat(40 - 2 - version.len())
+            )
+        );
+
+        // Too narrow for both: the title keeps its words.
+        assert_eq!(with_version("ghostty-top".to_string(), 30), "ghostty-top");
     }
 
     #[test]
