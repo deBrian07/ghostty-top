@@ -2361,61 +2361,65 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
         }
     }
 
-    let self_pid = std::process::id() as i32;
     let mut terminals = Vec::with_capacity(roots.len());
     for root in roots {
-        let mut members: Vec<Process> = processes
+        let members = processes
             .iter()
             .filter(|p| owner.get(&p.pid) == Some(&root.pid))
-            .filter(|p| {
-                p.pid != self_pid && !(p.ppid == self_pid && command_name(&p.command) == "ps")
-            })
             .cloned()
             .collect();
-        let cpu = members.iter().map(|p| p.cpu).sum();
-        let rss_kib = members.iter().map(|p| p.rss_kib).sum();
-        let footprint_kib = members.iter().map(|p| p.footprint_kib).sum();
-        members.sort_by_key(|process| std::cmp::Reverse(process.footprint_kib));
-        // The kernel already knows what the tab is running: the tty hands the
-        // keyboard to one process group, and that group's leader is the
-        // program. Guessing from CPU used to name a busy background job.
-        let foreground = members.iter().find(|p| {
-            p.tpgid > 0 && p.pid == p.pgid && p.pgid == p.tpgid && !is_login_process(&p.command)
-        });
-        let activity = match foreground {
-            // A tab sitting at its prompt is running its shell, which is worth
-            // saying plainly rather than by name.
-            Some(process) if is_shell(&process.command) => "shell".to_string(),
-            Some(process) => command_name(&process.command),
-            // No foreground group is reported while a tab is between commands,
-            // so fall back to whatever is working hardest.
-            None => members
-                .iter()
-                .filter(|p| !is_login_process(&p.command) && !is_shell(&p.command))
-                .max_by(|a, b| a.cpu.total_cmp(&b.cpu).then(a.rss_kib.cmp(&b.rss_kib)))
-                .map(|p| command_name(&p.command))
-                .unwrap_or_else(|| "shell".to_string()),
-        };
-        terminals.push(Terminal {
-            root_pid: root.pid,
-            label: root.tty.clone(),
-            tty: root.tty.clone(),
-            cpu,
-            rss_kib,
-            footprint_kib,
-            processes: members,
-            activity,
-            elapsed: root.elapsed.clone(),
-            age_seconds: root.age_seconds,
-            memory_growth_kib: 0,
-            memory_slope_kib_per_min: 0.0,
-            memory_samples: 0,
-            leak_suspected: false,
-            leak_process: String::new(),
-            leak_growth_kib: 0,
-        });
+        terminals.push(terminal_for(root, members));
     }
     (ghostty, terminals)
+}
+
+/// One row: the root process a terminal hangs from and everything it owns.
+fn terminal_for(root: &Process, mut members: Vec<Process>) -> Terminal {
+    let self_pid = std::process::id() as i32;
+    members
+        .retain(|p| p.pid != self_pid && !(p.ppid == self_pid && command_name(&p.command) == "ps"));
+    let cpu = members.iter().map(|p| p.cpu).sum();
+    let rss_kib = members.iter().map(|p| p.rss_kib).sum();
+    let footprint_kib = members.iter().map(|p| p.footprint_kib).sum();
+    members.sort_by_key(|process| std::cmp::Reverse(process.footprint_kib));
+    // The kernel already knows what the tab is running: the tty hands the
+    // keyboard to one process group, and that group's leader is the
+    // program. Guessing from CPU used to name a busy background job.
+    let foreground = members.iter().find(|p| {
+        p.tpgid > 0 && p.pid == p.pgid && p.pgid == p.tpgid && !is_login_process(&p.command)
+    });
+    let activity = match foreground {
+        // A tab sitting at its prompt is running its shell, which is worth
+        // saying plainly rather than by name.
+        Some(process) if is_shell(&process.command) => "shell".to_string(),
+        Some(process) => command_name(&process.command),
+        // No foreground group is reported while a tab is between commands,
+        // so fall back to whatever is working hardest.
+        None => members
+            .iter()
+            .filter(|p| !is_login_process(&p.command) && !is_shell(&p.command))
+            .max_by(|a, b| a.cpu.total_cmp(&b.cpu).then(a.rss_kib.cmp(&b.rss_kib)))
+            .map(|p| command_name(&p.command))
+            .unwrap_or_else(|| "shell".to_string()),
+    };
+    Terminal {
+        root_pid: root.pid,
+        label: root.tty.clone(),
+        tty: root.tty.clone(),
+        cpu,
+        rss_kib,
+        footprint_kib,
+        processes: members,
+        activity,
+        elapsed: root.elapsed.clone(),
+        age_seconds: root.age_seconds,
+        memory_growth_kib: 0,
+        memory_slope_kib_per_min: 0.0,
+        memory_samples: 0,
+        leak_suspected: false,
+        leak_process: String::new(),
+        leak_growth_kib: 0,
+    }
 }
 
 fn child_map(processes: &[Process]) -> HashMap<i32, Vec<i32>> {
