@@ -36,6 +36,7 @@
     "x64"
   ],
   "scripts": {
-    "build": "./scripts/build-binaries.sh"
+    "build": "./scripts/build-binaries.sh",
+    "prepack": "./scripts/build-binaries.sh"
   }
 }

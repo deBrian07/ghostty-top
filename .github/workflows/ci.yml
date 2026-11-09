@@ -36,6 +36,9 @@ jobs:
       - name: Formatting
         run: cargo fmt --check
 
+      - name: Release checks
+        run: sh scripts/test-build-binaries.sh
+
       # Warnings fail the build: the tree is expected to be clippy-clean on
       # both platforms, which is what keeps the cfg-gated code honest.
       - name: Lint
@@ -45,6 +48,9 @@ jobs:
       # column name for this platform fails here.
       - name: Tests
         run: cargo test
+
+      - name: Terminal cleanup and input
+        run: python3 scripts/test-terminal.py
 
       - name: Smoke test
         run: |
