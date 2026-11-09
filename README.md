@@ -14,7 +14,8 @@ bun install -g ghostty-top
 Or `npm install -g ghostty-top`. Or build it yourself with
 `cargo install --path .`.
 
-Nothing else to install and nothing to configure.
+Nothing else to install and nothing to configure. Building from source needs
+Rust 1.89 or newer.
 
 **Linux:** build from source with `cargo install --path .`. The monitor works
 the same, but the usage calendar doesn't: Ghostty only reports which tab you're
@@ -89,6 +90,11 @@ memory readings. It does not save anything you type or anything printed in your
 terminal, and it never saves command arguments or environment variables,
 because those can contain passwords and keys.
 
+Detailed telemetry rotates when a file reaches 10 MiB, keeping three backups
+per file. The oldest backup is deleted on the next rotation. Superseded
+resource and process schemas are removed when the current schema first opens.
+Daily totals in `usage.tsv` are kept; uninstalling the tracker preserves them.
+
 The first time it reads tab names, macOS asks you to allow it to control
 Ghostty. That permission is only needed once.
 
@@ -96,15 +102,17 @@ Ghostty. That permission is only needed once.
 
 - CPU adds up every process in a tab, so it can go over 100% on a Mac with
   several cores.
-- RAM is the same number Activity Monitor shows. It counts memory the Mac has
-  compressed or moved to disk, not just what is in RAM right now, so it is often
-  much bigger than the "resident" number `ps` and `top` print. Press `enter` on
-  a tab to see both side by side.
+- RAM uses physical footprint, the metric Activity Monitor shows, including
+  compressed and swapped memory. When macOS denies a reading (often for
+  root-owned `login` or `sudo` processes), it falls back to resident size and
+  marks the process and tab with `~`. That total may understate memory use.
+  Press `enter` to compare RAM and RESIDENT.
 - Memory adds up each process, and programs often share memory, so treat the
   number as a rough guide.
 - A **leak warning** points at one process whose memory has been climbing
-  steadily for a few minutes. It's worth a look, but it isn't proof of a
-  problem.
+  steadily for a few minutes. Growth compares averaged edges of a rolling
+  window of up to 15 minutes; the warning shows its actual span. It's worth
+  a look, but it isn't proof of a problem.
 
 Run `ghostty-top --help` to see every option.
 

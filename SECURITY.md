@@ -12,9 +12,10 @@ which is private. Expect a reply within a day.
 
 Worth knowing when judging whether something is a security problem:
 
-- It reads the process list with `ps` and `lsof`, and asks Ghostty for its tab
-  names and folder paths through macOS Automation. It reads only; it never
-  changes Ghostty or any other program.
+- It reads executable names and process metrics with `ps`, working directories
+  with `lsof`, and asks Ghostty for tab names and folder paths through macOS
+  Automation. It never changes Ghostty or the observed programs. Timed-out
+  query commands are stopped, including descendants in their own process group.
 - It saves history to `~/Library/Application Support/ghostty-top/`. That stays
   on your Mac. Nothing is ever uploaded.
 - It deliberately does not save what you type, what your terminal prints,

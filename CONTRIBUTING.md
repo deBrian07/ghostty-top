@@ -19,7 +19,8 @@ These are not negotiable, so check your change against them first:
 2. **Nothing to set up.** Install it, run it, done. No config file, no flags
    you have to pass, no setup steps.
 
-The tool is macOS only, because it reads Ghostty and macOS specific things.
+Monitoring works on macOS and Linux. Focus tracking uses Ghostty's macOS
+AppleScript interface. Build with Rust 1.89 or newer.
 
 ## Getting set up
 
@@ -33,7 +34,7 @@ cargo run
 
 ## Before you open a pull request
 
-Run these four. CI runs the same ones, so if they pass locally the build
+Run these checks. CI runs the same ones, so if they pass locally the build
 should be green:
 
 ```sh
@@ -41,6 +42,8 @@ cargo fmt
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo run -- --once
+sh scripts/test-build-binaries.sh
+python3 scripts/test-terminal.py
 ```
 
 Warnings are treated as errors, so a clippy warning will fail the build.

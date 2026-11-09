@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +26,6 @@ const HISTORY_WINDOW: Duration = Duration::from_secs(15 * 60);
 const MIN_LEAK_DURATION: Duration = Duration::from_secs(3 * 60);
 const MIN_LEAK_SAMPLES: usize = 8;
 const MIN_LEAK_GROWTH_KIB: i64 = 48 * 1024;
-const MIN_LEAK_GROWTH_RATIO: f64 = 0.10;
 const MIN_LEAK_SLOPE_KIB_PER_MIN: f64 = 4.0 * 1024.0;
 const MIN_LEAK_R_SQUARED: f64 = 0.70;
 const MIN_UPWARD_SAMPLE_RATIO: f64 = 0.70;
@@ -64,14 +65,66 @@ const TAB_LABEL_REFRESH: Duration = Duration::from_secs(15);
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(8);
 const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+/// The longest gap `credited_time` will pay out. Anything wider is treated as
+/// a stall or a sleep rather than time the user spent looking at a tab.
+const MAX_CREDITED_GAP: Duration = Duration::from_secs(15);
+/// A sample is timestamped when the query *answers*, so a slow answer widens
+/// the gap to the previous sample. The budget therefore has to leave room for
+/// a whole poll interval on top of itself, or a query that succeeds slowly
+/// still gets thrown away. One second was far too tight: the query answers in
+/// 0.26 s at the median but has a long tail, so the budget sat inside the
+/// distribution and fired on roughly one sample in forty.
 #[cfg(target_os = "macos")]
-const USAGE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(1);
+const USAGE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(target_os = "macos")]
 const LAUNCH_AGENT_LABEL: &str = "com.debrian07.ghostty-top.tracker";
 const INVENTORY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const INVENTORY_HEARTBEAT: Duration = Duration::from_secs(15 * 60);
 const RESOURCE_HISTORY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const HISTORY_SCHEMA_VERSION: &str = "1";
+const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_MOUSE_SEQUENCE_BYTES: usize = 32;
+const PROCESS_SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const DIRECTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(target_os = "macos")]
+const PRESENCE_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(target_os = "macos")]
+const GHOSTTY_RUNNING_TIMEOUT: Duration = Duration::from_millis(500);
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_shutdown(_: i32) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+struct SignalGuard {
+    original: [(i32, usize); 3],
+}
+
+impl SignalGuard {
+    fn enter() -> Self {
+        SHUTDOWN_REQUESTED.store(false, Ordering::Relaxed);
+        // signal's handlers are pointer-sized values, including SIG_DFL and
+        // SIG_IGN. The handler itself only touches an atomic, never terminal IO.
+        let original = [1, 2, 15].map(|number| {
+            let previous = unsafe { signal(number, request_shutdown as *const () as usize) };
+            (number, previous)
+        });
+        Self { original }
+    }
+}
+
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        for (number, handler) in self.original {
+            if handler != usize::MAX {
+                unsafe { signal(number, handler) };
+            }
+        }
+    }
+}
+const HISTORY_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+const HISTORY_BACKUPS: usize = 3;
 
 // Platform differences live here so the rest of the file stays one
 // implementation. macOS behaviour is unchanged: every macOS branch is the code
@@ -83,20 +136,20 @@ const STTY_FILE: &str = "-f";
 #[cfg(not(target_os = "macos"))]
 const STTY_FILE: &str = "-F";
 
-/// BSD `ps` takes `-axo`; procps wants `-eo` and spells the column `args`.
+/// Read executable names only: argument lists can include credentials.
 #[cfg(target_os = "macos")]
 const PS_PROCESSES: [&str; 2] = [
     "-axo",
-    "pid=,ppid=,pgid=,tpgid=,tty=,%cpu=,rss=,etime=,command=",
+    "pid=,ppid=,pgid=,tpgid=,tty=,%cpu=,rss=,etime=,comm=",
 ];
 #[cfg(not(target_os = "macos"))]
 const PS_PROCESSES: [&str; 2] = [
     "-eo",
-    "pid=,ppid=,pgid=,tpgid=,tty=,%cpu=,rss=,etime=,args=",
+    "pid=,ppid=,pgid=,tpgid=,tty=,%cpu=,rss=,etime=,comm=",
 ];
 
 #[cfg(target_os = "macos")]
-const PS_COMMANDS: [&str; 2] = ["-axo", "command="];
+const PS_COMMANDS: [&str; 2] = ["-axo", "comm="];
 /// Ghostty only reports which tab is focused through its AppleScript
 /// dictionary, which exists on macOS alone. Without it there is no way to tell
 /// tabs apart, so focused-time tracking is a macOS feature.
@@ -294,6 +347,7 @@ impl ClickZone {
 #[derive(Default)]
 struct InputDecoder {
     pending: Vec<u8>,
+    incomplete_since: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +366,7 @@ struct Process {
     /// What Activity Monitor calls Memory. Falls back to `rss_kib` when the
     /// process cannot be read. See `phys_footprint_kib`.
     footprint_kib: u64,
+    footprint_available: bool,
     elapsed: String,
     age_seconds: u64,
     command: String,
@@ -376,6 +431,7 @@ struct Terminal {
     /// The tab's memory as Activity Monitor would count it, and the number the
     /// RAM column shows.
     footprint_kib: u64,
+    footprint_complete: bool,
     processes: Vec<Process>,
     activity: String,
     elapsed: String,
@@ -390,6 +446,7 @@ struct Terminal {
     /// The herdr server a row belongs to. The server's own row holds its own
     /// pid, and its tabs are drawn as branches beneath it.
     herdr_server: Option<i32>,
+    leak_span: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -448,9 +505,24 @@ struct MemoryHistory {
     suspicious_windows: u8,
     clear_windows: u8,
     alert_active: bool,
+    footprint_available: Option<bool>,
 }
 
 impl MemoryHistory {
+    fn record_reading(&mut self, now: Instant, process: &Process) -> MemoryTrend {
+        // A change from footprint to resident size is a metric change, not a
+        // sudden allocation/free. It cannot be joined to the previous series.
+        if self
+            .footprint_available
+            .is_some_and(|available| available != process.footprint_available)
+        {
+            *self = Self::default();
+        }
+        let trend = self.record(now, process.footprint_kib, process.age_seconds);
+        self.footprint_available = Some(process.footprint_available);
+        trend
+    }
+
     fn record(&mut self, now: Instant, footprint_kib: u64, age_seconds: u64) -> MemoryTrend {
         if age_seconds < self.age_seconds {
             *self = MemoryHistory::default();
@@ -473,6 +545,7 @@ struct MemoryTrend {
     growth_kib: i64,
     slope_kib_per_min: f64,
     suspected: bool,
+    span: Duration,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -578,7 +651,11 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        match sample_processes() {
+        self.apply_process_sample(sample_processes());
+    }
+
+    fn apply_process_sample(&mut self, sample: Result<Vec<Process>, String>) {
+        match sample {
             Ok(processes) => {
                 let selected_tty = self.terminals.get(self.selected).map(|t| t.tty.clone());
                 let (ghostty, mut terminals) = aggregate(&processes);
@@ -761,7 +838,7 @@ impl App {
 
             // Whichever process has grown most among those that look like they
             // are leaking gets named; a tab is only as suspect as its worst one.
-            let mut worst: Option<(String, i64)> = None;
+            let mut worst: Option<(String, i64, Duration)> = None;
             for process in &terminal.processes {
                 // Small processes are ignored until they grow into the floor,
                 // but one already being watched keeps its history.
@@ -771,25 +848,27 @@ impl App {
                     continue;
                 }
                 let history = self.memory_history.entry(process.pid).or_default();
-                let trend = history.record(now, process.footprint_kib, process.age_seconds);
+                let trend = history.record_reading(now, process);
                 if update_leak_state(history, trend.suspected)
                     && worst
                         .as_ref()
-                        .is_none_or(|(_, growth)| trend.growth_kib > *growth)
+                        .is_none_or(|(_, growth, _)| trend.growth_kib > *growth)
                 {
-                    worst = Some((command_name(&process.command), trend.growth_kib));
+                    worst = Some((command_name(&process.command), trend.growth_kib, trend.span));
                 }
             }
             match worst {
-                Some((name, growth)) => {
+                Some((name, growth, span)) => {
                     terminal.leak_suspected = true;
                     terminal.leak_process = name;
                     terminal.leak_growth_kib = growth;
+                    terminal.leak_span = span;
                 }
                 None => {
                     terminal.leak_suspected = false;
                     terminal.leak_process.clear();
                     terminal.leak_growth_kib = 0;
+                    terminal.leak_span = Duration::ZERO;
                 }
             }
         }
@@ -827,17 +906,37 @@ impl App {
     }
 }
 
+/// Whether a write folds in what is already on disk.
+#[derive(Clone, Copy, PartialEq)]
+enum Merge {
+    WithFile,
+    No,
+}
+
 impl UsageStore {
     fn load(path: Option<PathBuf>) -> Self {
         let mut store = Self {
             path,
             ..Self::default()
         };
-        let Some(path) = &store.path else {
-            return store;
-        };
+        if let Some(path) = store.path.clone() {
+            store.merge_file(&path);
+        }
+        store
+    }
+
+    /// Folds a usage file into this store, keeping the larger count wherever
+    /// both sides know a tab.
+    ///
+    /// Two processes record at once in the default setup — the login tracker
+    /// and the TUI — and each holds its own view of the day. They are watching
+    /// the same wall clock, so the larger count is the more complete one rather
+    /// than something to add on top. Merging is also self-healing: a process
+    /// keeps its own totals in memory, so a count momentarily lost to a racing
+    /// writer comes back on the next save.
+    fn merge_file(&mut self, path: &Path) {
         let Ok(contents) = fs::read_to_string(path) else {
-            return store;
+            return;
         };
         for line in contents.lines() {
             let mut fields = line.splitn(4, '\t');
@@ -849,16 +948,19 @@ impl UsageStore {
             let Ok(seconds) = seconds.parse::<u64>() else {
                 continue;
             };
-            let seconds = seconds.min(MAX_DAILY_SECONDS);
-            store.days.entry(day.to_string()).or_default().insert(
-                tab_id.to_string(),
-                TabUsage {
-                    name: name.to_string(),
-                    seconds,
-                },
-            );
+            let entry = self
+                .days
+                .entry(day.to_string())
+                .or_default()
+                .entry(tab_id.to_string())
+                .or_default();
+            entry.seconds = entry.seconds.max(seconds.min(MAX_DAILY_SECONDS));
+            // Ours is the fresher name when we have one; the file supplies it
+            // for tabs this process has never seen.
+            if entry.name.is_empty() {
+                entry.name = name.to_string();
+            }
         }
-        store
     }
 
     fn add(&mut self, day: &str, focus: &FocusedTab, seconds: u64) {
@@ -876,16 +978,39 @@ impl UsageStore {
         self.dirty = true;
     }
 
+    /// The periodic flush. Merges first, so a tab another process recorded
+    /// while we held our snapshot survives the rewrite.
     fn save(&mut self) -> io::Result<()> {
+        self.write(Merge::WithFile)
+    }
+
+    /// Writes this store over whatever is on disk. Only for the one-shot
+    /// commands that deliberately remove rows: they own the file for the
+    /// length of one run, and merging would resurrect exactly what they were
+    /// asked to delete.
+    fn save_replacing(&mut self) -> io::Result<()> {
+        self.write(Merge::No)
+    }
+
+    fn write(&mut self, merge: Merge) -> io::Result<()> {
         if !self.dirty {
             return Ok(());
         }
-        let Some(path) = &self.path else {
+        let Some(path) = self.path.clone() else {
             self.dirty = false;
             return Ok(());
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+        }
+        // The lock must have its own inode: renaming usage.tsv would otherwise
+        // let a second writer lock the replacement while we hold the old file.
+        let _lock = lock_file(&path)?;
+        // Re-read before the wholesale rewrite below. Anything another process
+        // has recorded since we loaded is only in the file, and writing our own
+        // view straight over the top would delete it.
+        if merge == Merge::WithFile {
+            self.merge_file(&path);
         }
         let mut contents = String::new();
         for (day, tabs) in &self.days {
@@ -899,9 +1024,12 @@ impl UsageStore {
                 ));
             }
         }
-        let temporary = path.with_extension("tmp");
+        // Per-process scratch name: a shared one lets two writers truncate and
+        // fill the same file at once, so a rename can publish half of somebody
+        // else's write. Same directory, so the rename stays atomic.
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         fs::write(&temporary, contents)?;
-        fs::rename(temporary, path)?;
+        fs::rename(&temporary, &path)?;
         self.dirty = false;
         Ok(())
     }
@@ -984,9 +1112,14 @@ impl UsageTracker {
                     self.next_poll = now + USAGE_POLL_INTERVAL;
                 }
                 Ok(Err(error)) => {
+                    // The focus is unknown after a failure, so the interval it
+                    // covered cannot be credited. Retry on the normal schedule
+                    // anyway: a longer backoff used to push the next sample
+                    // past MAX_CREDITED_GAP, which meant one failed query threw
+                    // away the interval that followed it as well.
                     self.forget_focus();
                     self.last_error = Some(error);
-                    self.next_poll = now + Duration::from_secs(30);
+                    self.next_poll = now + USAGE_POLL_INTERVAL;
                 }
                 Err(mpsc::TryRecvError::Empty) => return false,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -1000,14 +1133,14 @@ impl UsageTracker {
         }
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let update = match away_reason() {
+            let update = away_reason().and_then(|away| match away {
                 Some(away) => Ok(FocusUpdate::Away(away)),
                 None => query_focused_tab().map(|focus| FocusUpdate::Sample {
                     focus,
                     at: Instant::now(),
                     wall: SystemTime::now(),
                 }),
-            };
+            });
             let _ = sender.send(update);
         });
         self.pending_focus = Some(receiver);
@@ -1129,7 +1262,7 @@ end repeat
 end repeat
 return resultText
 end tell"#;
-    let output = run_osascript(SCRIPT, INVENTORY_TIMEOUT)?;
+    let output = run_osascript(SCRIPT, "tab name", INVENTORY_TIMEOUT)?;
     Ok(output
         .trim_end()
         .split('\x1e')
@@ -1162,12 +1295,10 @@ fn shell_working_directories(pids: &[i32]) -> HashMap<i32, String> {
         .map(i32::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let Ok(output) = Command::new("lsof")
-        .args(["-a", "-d", "cwd", "-p", &list, "-Fpn"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
+    let Ok(output) = run_command_with_timeout(
+        Command::new("lsof").args(["-a", "-d", "cwd", "-p", &list, "-Fpn"]),
+        DIRECTORY_QUERY_TIMEOUT,
+    ) else {
         return HashMap::new();
     };
     let text = String::from_utf8_lossy(&output.stdout);
@@ -1227,6 +1358,7 @@ fn shell_pid(terminal: &Terminal) -> i32 {
 /// Where a herdr pane sits in its session, keyed by the pane's shell pid.
 #[derive(Clone, Debug, PartialEq)]
 struct HerdrPane {
+    session: String,
     tab_id: String,
     label: String,
 }
@@ -1235,10 +1367,11 @@ struct HerdrPane {
 /// is a wedged server, not a slow one.
 const HERDR_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// A herdr server is `herdr server`, or `herdr --session NAME server` for a
-/// named session. `herdr server stop` and friends are short-lived commands.
-fn is_herdr_server(command: &str) -> bool {
-    command_name(command) == "herdr" && command.split_whitespace().last() == Some("server")
+/// `ps` is read without arguments, so `herdr server` and the `herdr` client
+/// share a name. The server is the one detached from any terminal; the client
+/// always runs inside one.
+fn is_herdr_server(process: &Process) -> bool {
+    command_name(&process.command) == "herdr" && !has_tty(&process.tty)
 }
 
 /// API sockets of the herdr sessions on this machine. Sessions attached over
@@ -1305,7 +1438,7 @@ fn herdr_tab_label(snapshot: &Json, tab_id: &str) -> Option<String> {
 /// than a guess by directory.
 fn query_herdr_panes() -> HashMap<i32, HerdrPane> {
     let mut panes = HashMap::new();
-    for (_, socket) in herdr_sockets() {
+    for (session, socket) in herdr_sockets() {
         let Some(snapshot) =
             herdr_request(&socket, "session.snapshot", "{}").and_then(|r| r.take("snapshot"))
         else {
@@ -1329,6 +1462,7 @@ fn query_herdr_panes() -> HashMap<i32, HerdrPane> {
             panes.insert(
                 shell_pid as i32,
                 HerdrPane {
+                    session: session.clone(),
                     tab_id: tab_id.to_string(),
                     label,
                 },
@@ -1627,7 +1761,7 @@ impl JsonParser<'_> {
 /// freezes the monotonic clock across a sleep or keeps counting through it, one
 /// of the two readings exposes the gap and the sample is dropped.
 fn credited_time(previous: (Instant, SystemTime), now: (Instant, SystemTime)) -> Option<Duration> {
-    let limit = USAGE_POLL_INTERVAL * 3;
+    let limit = MAX_CREDITED_GAP;
     let elapsed = now.0.duration_since(previous.0);
     // A backwards wall clock yields an error here, which also fails the check.
     let wall_elapsed = now.1.duration_since(previous.1).ok()?;
@@ -1665,54 +1799,95 @@ impl Away {
 /// sleep needs no check here: the elapsed-time guard in `tick` discards the
 /// gap, because a sleeping Mac cannot poll in the first place.
 #[cfg(not(target_os = "macos"))]
-fn away_reason() -> Option<Away> {
-    None
+fn away_reason() -> Result<Option<Away>, String> {
+    Ok(None)
 }
 
 #[cfg(target_os = "macos")]
-fn away_reason() -> Option<Away> {
-    if lid_is_closed() {
-        return Some(Away::LidClosed);
+fn away_reason() -> Result<Option<Away>, String> {
+    if lid_is_closed()? {
+        return Ok(Some(Away::LidClosed));
     }
-    // Covers a locked screen, a sleeping display, and simply walking off.
-    if hid_idle_time().is_some_and(|idle| idle > MAX_IDLE) {
-        return Some(Away::Idle);
+    // Unknown presence breaks the credit interval, just like a failed focus
+    // query: assuming the user is present would invent time after a probe stalls.
+    if hid_idle_time()? > MAX_IDLE {
+        return Ok(Some(Away::Idle));
     }
-    None
+    Ok(None)
 }
 
 #[cfg(target_os = "macos")]
-fn lid_is_closed() -> bool {
-    // Desktop Macs have no clamshell key at all, so a missing value means open.
-    ioreg_value(
+fn lid_is_closed() -> Result<bool, String> {
+    let value = ioreg_value(
         &["-r", "-k", "AppleClamshellState", "-d", "1"],
         "AppleClamshellState",
+    )?;
+    parse_clamshell_state(value.as_deref())
+}
+
+#[cfg(target_os = "macos")]
+fn hid_idle_time() -> Result<Duration, String> {
+    let value = ioreg_value(&["-c", "IOHIDSystem", "-d", "4"], "HIDIdleTime")?;
+    parse_idle_time(value.as_deref())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_clamshell_state(value: Option<&str>) -> Result<bool, String> {
+    // Desktop Macs have no clamshell key; only a successful missing key is open.
+    match value.map(str::trim) {
+        None | Some("No") => Ok(false),
+        Some("Yes") => Ok(true),
+        Some(_) => Err("could not determine whether the lid is closed".to_string()),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_idle_time(value: Option<&str>) -> Result<Duration, String> {
+    let nanoseconds = value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .ok_or_else(|| "could not determine whether the user is present".to_string())?;
+    Ok(Duration::from_nanos(nanoseconds))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_ioreg_response<'a>(
+    success: bool,
+    output: &'a str,
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    if !success {
+        return Err(format!("ioreg could not read {key}"));
+    }
+    let property = format!("\"{key}\"");
+    for line in output.lines() {
+        let Some(rest) = line
+            .trim_start_matches(|character: char| character.is_whitespace() || character == '|')
+            .strip_prefix(&property)
+        else {
+            continue;
+        };
+        let value = rest
+            .trim_start()
+            .strip_prefix('=')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("ioreg returned a malformed {key} value"))?;
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
+/// Reads `"<key>" = <value>` out of a successful ioreg dump.
+#[cfg(target_os = "macos")]
+fn ioreg_value(arguments: &[&str], key: &str) -> Result<Option<String>, String> {
+    let output = run_command_with_timeout(
+        Command::new("ioreg").args(arguments),
+        PRESENCE_QUERY_TIMEOUT,
     )
-    .is_some_and(|state| state.trim() == "Yes")
-}
-
-#[cfg(target_os = "macos")]
-fn hid_idle_time() -> Option<Duration> {
-    let nanoseconds: u64 = ioreg_value(&["-c", "IOHIDSystem", "-d", "4"], "HIDIdleTime")?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(Duration::from_nanos(nanoseconds))
-}
-
-/// Reads `"<key>" = <value>` out of an ioreg dump.
-#[cfg(target_os = "macos")]
-fn ioreg_value(arguments: &[&str], key: &str) -> Option<String> {
-    let output = Command::new("ioreg")
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let needle = format!("\"{key}\" = ");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| Some(line.split_once(&needle)?.1.to_string()))
+    .map_err(|error| format!("could not read presence state {key}: {error}"))?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|error| format!("ioreg returned invalid text for {key}: {error}"))?;
+    parse_ioreg_response(output.status.success(), text, key).map(|value| value.map(str::to_string))
 }
 
 fn default_usage_path() -> Option<PathBuf> {
@@ -1776,7 +1951,7 @@ fn clear_demo_history_at(path: Option<PathBuf>) -> io::Result<usize> {
     });
     if changed_days > 0 {
         store.dirty = true;
-        store.save()?;
+        store.save_replacing()?;
     }
     Ok(changed_days)
 }
@@ -2038,7 +2213,7 @@ set theTerminal to focused terminal of theTab
 set separator to ASCII character 9
 return (id of theTab as text) & separator & (name of theTab as text) & separator & (id of theTerminal as text) & separator & (name of theTerminal as text)
 end tell"#;
-    let output = run_osascript(SCRIPT, USAGE_SAMPLE_TIMEOUT)?;
+    let output = run_osascript(SCRIPT, "focused tab", USAGE_SAMPLE_TIMEOUT)?;
     let output = output.trim();
     if output.is_empty() {
         return Ok(None);
@@ -2094,7 +2269,7 @@ return resultText
 end tell"#;
     // Walking every surface scales with tab count and routinely runs past a
     // second, so this query is given room and is never issued on the UI thread.
-    let output = run_osascript(SCRIPT, INVENTORY_TIMEOUT)?;
+    let output = run_osascript(SCRIPT, "tab inventory", INVENTORY_TIMEOUT)?;
     parse_tab_inventory(&output)
 }
 
@@ -2130,39 +2305,93 @@ fn parse_tab_inventory(output: &str) -> Result<Vec<TabObservation>, String> {
     Ok(observations)
 }
 
-#[cfg(target_os = "macos")]
-fn run_osascript(script: &str, timeout: Duration) -> Result<String, String> {
-    let mut child = Command::new("osascript")
-        .args(["-e", script])
+/// Read stdout while the child runs: waiting first deadlocks when a query
+/// produces more than the pipe can hold. The deadline includes draining output.
+fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<std::process::Output> {
+    let deadline = Instant::now() + timeout;
+    let mut child = command
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("could not start Ghostty tracking: {error}"))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Err("Ghostty Automation permission is unavailable".to_string());
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = stdout.read_to_end(&mut output).map(|_| output);
+        let _ = sender.send(result);
+    });
+    let result = (|| {
+        let mut output = None;
+        loop {
+            if output.is_none() {
+                match receiver.try_recv() {
+                    Ok(bytes) => output = Some(bytes?),
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(io::Error::other("command output reader stopped"));
+                    }
                 }
-                let mut output = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    stdout
-                        .read_to_string(&mut output)
-                        .map_err(|error| format!("could not read Ghostty state: {error}"))?;
+            }
+            // Keep the child unreaped until stdout closes. Its PID then cannot
+            // be reused while a descendant still owns the pipe or process group.
+            if let Some(stdout) = output.take() {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(std::process::Output {
+                        status,
+                        stdout,
+                        stderr: Vec::new(),
+                    });
                 }
-                return Ok(output);
+                output = Some(stdout);
             }
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("Ghostty focus query timed out; allow Automation access".to_string());
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "command timed out"));
             }
-            Err(error) => return Err(format!("could not query focused tab: {error}")),
+            thread::sleep(Duration::from_millis(10));
         }
+    })();
+    if result.is_err() {
+        terminate_process_group(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        // Group termination also closes inherited stdout in descendants, so
+        // the reader can finish instead of accumulating a thread every retry.
+        let _ = receiver.recv_timeout(Duration::from_millis(100));
     }
+    result
+}
+
+fn terminate_process_group(pid: u32) {
+    // process_group(0) gives the child a group owned solely by this command.
+    // A negative PID targets that group, including children retaining stdout.
+    unsafe { kill(-(pid as i32), 9) };
+}
+
+#[cfg(target_os = "macos")]
+fn run_osascript(script: &str, what: &str, timeout: Duration) -> Result<String, String> {
+    let output = run_command_with_timeout(Command::new("osascript").args(["-e", script]), timeout)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                format!(
+                    "Ghostty took longer than {}s to answer the {what} query",
+                    timeout.as_secs()
+                )
+            } else {
+                format!("could not query Ghostty state: {error}")
+            }
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "Ghostty refused the {what} query; allow Automation access"
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("could not read Ghostty state: {error}"))
 }
 
 fn append_tab_inventory(day: &str, observations: &[TabObservation]) -> io::Result<()> {
@@ -2206,32 +2435,33 @@ fn append_resource_history(
     terminals: &[Terminal],
     ghostty: Option<&Process>,
 ) -> io::Result<()> {
-    // v2 adds footprint and the leaking process's name. The header is written
+    // v3 records whether each memory reading includes an RSS fallback. The header is written
     // once, when the file is created, so a new column means a new file rather
     // than rows that no longer match the heading above them.
-    let Some(path) = default_data_dir().map(|directory| directory.join("resources-v2.tsv")) else {
+    let Some(path) = default_data_dir().map(|directory| directory.join("resources-v3.tsv")) else {
         return Ok(());
     };
     let mut file = open_history_file(
         &path,
-        "timestamp\tday\tkind\tid\tcpu_percent\tfootprint_kib\trss_kib\tprocesses\tage_seconds\tactivity\tmemory_growth_kib\tleak_suspected\tleak_process",
+        "timestamp\tday\tkind\tid\tcpu_percent\tfootprint_kib\trss_kib\tprocesses\tage_seconds\tactivity\tmemory_growth_kib\tleak_suspected\tleak_process\tfootprint_complete",
     )?;
     let timestamp = unix_timestamp();
     if let Some(process) = ghostty {
         writeln!(
             file,
-            "{timestamp}\t{}\tapp\tghostty\t{:.1}\t{}\t{}\t1\t{}\tghostty\t0\tfalse\t",
+            "{timestamp}\t{}\tapp\tghostty\t{:.1}\t{}\t{}\t1\t{}\tghostty\t0\tfalse\t\t{}",
             clean_field(day),
             process.cpu,
             process.footprint_kib,
             process.rss_kib,
             process.age_seconds,
+            process.footprint_available,
         )?;
     }
     for terminal in terminals {
         writeln!(
             file,
-            "{timestamp}\t{}\tterminal\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{timestamp}\t{}\tterminal\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             clean_field(day),
             clean_field(&terminal.tty),
             terminal.cpu,
@@ -2243,6 +2473,7 @@ fn append_resource_history(
             terminal.memory_growth_kib,
             terminal.leak_suspected,
             clean_field(&terminal.leak_process),
+            terminal.footprint_complete,
         )?;
     }
     append_process_history(timestamp, day, terminals, ghostty)?;
@@ -2255,12 +2486,12 @@ fn append_process_history(
     terminals: &[Terminal],
     ghostty: Option<&Process>,
 ) -> io::Result<()> {
-    let Some(path) = default_data_dir().map(|directory| directory.join("processes-v2.tsv")) else {
+    let Some(path) = default_data_dir().map(|directory| directory.join("processes-v3.tsv")) else {
         return Ok(());
     };
     let mut file = open_history_file(
         &path,
-        "timestamp\tday\tkind\tterminal_tty\tterminal_root_pid\tpid\tppid\tcpu_percent\tfootprint_kib\trss_kib\tage_seconds\tstarted_at\texecutable_name\texecutable_path",
+        "timestamp\tday\tkind\tterminal_tty\tterminal_root_pid\tpid\tppid\tcpu_percent\tfootprint_kib\trss_kib\tage_seconds\tstarted_at\texecutable_name\texecutable_path\tfootprint_available",
     )?;
     if let Some(process) = ghostty {
         writeln!(
@@ -2298,7 +2529,7 @@ fn process_history_row(
 ) -> String {
     let executable_path = process.command.split_whitespace().next().unwrap_or("?");
     format!(
-        "{timestamp}\t{}\t{}\t{}\t{terminal_root_pid}\t{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{timestamp}\t{}\t{}\t{}\t{terminal_root_pid}\t{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         clean_field(day),
         clean_field(kind),
         clean_field(terminal_tty),
@@ -2311,6 +2542,7 @@ fn process_history_row(
         timestamp.saturating_sub(process.age_seconds),
         clean_field(&command_name(&process.command)),
         clean_field(executable_path),
+        process.footprint_available,
     )
 }
 
@@ -2339,16 +2571,122 @@ fn append_tracker_event(event: &str) -> io::Result<()> {
     )
 }
 
-fn open_history_file(path: &PathBuf, header: &str) -> io::Result<fs::File> {
+struct FileLock {
+    file: fs::File,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Explicit unlock also releases any descriptor briefly inherited by
+        // a subprocess spawned on another thread while this file was open.
+        let _ = self.file.unlock();
+    }
+}
+
+fn lock_file(path: &Path) -> io::Result<FileLock> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    lock.try_lock().map_err(io::Error::from)?;
+    Ok(FileLock { file: lock })
+}
+
+struct HistoryFile {
+    file: fs::File,
+    // Kept until the whole snapshot is written, including its header. Locking
+    // a separate inode makes rotation safe against another recorder.
+    _lock: FileLock,
+}
+
+impl Write for HistoryFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.file.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn history_backup(path: &Path, index: usize) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        index
+    ))
+}
+
+fn rotate_history(path: &Path, limit: u64) -> io::Result<()> {
+    if fs::metadata(path).map_or(true, |metadata| metadata.len() < limit) {
+        return Ok(());
+    }
+    let oldest = history_backup(path, HISTORY_BACKUPS);
+    match fs::remove_file(&oldest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    for index in (1..HISTORY_BACKUPS).rev() {
+        let source = history_backup(path, index);
+        match fs::rename(source, history_backup(path, index + 1)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    fs::rename(path, history_backup(path, 1))
+}
+
+fn remove_superseded_history(path: &Path) -> io::Result<()> {
+    let obsolete: &[&str] = match path.file_name().and_then(|name| name.to_str()) {
+        Some("resources-v3.tsv") => &["resources-v1.tsv", "resources-v2.tsv"],
+        Some("processes-v3.tsv") => &["processes-v1.tsv", "processes-v2.tsv"],
+        _ => &[],
+    };
+    let Some(directory) = path.parent() else {
+        return Ok(());
+    };
+    for name in obsolete {
+        let old_path = directory.join(name);
+        // An older tracker may still be finishing a snapshot. Do not delete
+        // the inode underneath a writer that participates in the same lock.
+        let _lock = lock_file(&old_path)?;
+        for old_file in std::iter::once(old_path.clone())
+            .chain((1..=HISTORY_BACKUPS).map(|index| history_backup(&old_path, index)))
+        {
+            match fs::remove_file(old_file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_history_file(path: &Path, header: &str) -> io::Result<HistoryFile> {
+    open_history_file_with_limit(path, header, HISTORY_ROTATE_BYTES)
+}
+
+fn open_history_file_with_limit(path: &Path, header: &str, limit: u64) -> io::Result<HistoryFile> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let lock = lock_file(path)?;
+    let migration_marker = path.with_extension("retention-v1");
+    rotate_history(path, limit)?;
     let needs_header = fs::metadata(path).map_or(true, |metadata| metadata.len() == 0);
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     if needs_header {
         writeln!(file, "{header}")?;
     }
-    Ok(file)
+    if !migration_marker.exists() {
+        remove_superseded_history(path)?;
+        fs::write(migration_marker, b"superseded telemetry removed\n")?;
+    }
+    Ok(HistoryFile { file, _lock: lock })
 }
 
 fn unix_timestamp() -> u64 {
@@ -2363,12 +2701,10 @@ fn unix_timestamp() -> u64 {
 /// process list is matched the same way `aggregate` does it instead.
 #[cfg(target_os = "macos")]
 fn ghostty_is_running() -> bool {
-    let Ok(output) = Command::new("ps")
-        .args(PS_COMMANDS)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
+    let Ok(output) = run_command_with_timeout(
+        Command::new("ps").args(PS_COMMANDS),
+        GHOSTTY_RUNNING_TIMEOUT,
+    ) else {
         return false;
     };
     String::from_utf8_lossy(&output.stdout)
@@ -2383,62 +2719,122 @@ fn is_ghostty_app(command: &str) -> bool {
 
 impl InputDecoder {
     fn push(&mut self, bytes: &[u8]) -> Vec<InputEvent> {
+        self.push_at(bytes, Instant::now())
+    }
+
+    fn push_at(&mut self, bytes: &[u8], now: Instant) -> Vec<InputEvent> {
+        // Expire the old prefix before accepting new input, so a later key
+        // cannot be swallowed by an abandoned escape or mouse report.
+        if self
+            .incomplete_since
+            .is_some_and(|start| now.duration_since(start) >= INPUT_SEQUENCE_TIMEOUT)
+        {
+            self.pending.clear();
+            self.incomplete_since = None;
+        }
         self.pending.extend_from_slice(bytes);
         let mut events = Vec::new();
-        loop {
-            if self.pending.is_empty() {
-                break;
-            }
-            if self.pending[0] != 0x1b {
-                events.push(InputEvent::Key(Key::Char(self.pending.remove(0))));
+        let mut consumed = 0;
+        while consumed < self.pending.len() {
+            let remaining = &self.pending[consumed..];
+            if remaining[0] != 0x1b {
+                events.push(InputEvent::Key(Key::Char(remaining[0])));
+                consumed += 1;
                 continue;
             }
-            if self.pending.len() < 2 {
+            if remaining.len() == 1 || remaining == b"\x1b[" {
                 break;
             }
-            if self.pending.starts_with(b"\x1b[<") {
-                let Some(end) = self
-                    .pending
-                    .iter()
-                    .position(|byte| *byte == b'M' || *byte == b'm')
-                else {
-                    break;
-                };
-                let pressed = self.pending[end] == b'M';
-                let body = String::from_utf8_lossy(&self.pending[3..end]);
-                let values: Vec<u16> = body
-                    .split(';')
-                    .filter_map(|part| part.parse().ok())
-                    .collect();
-                if values.len() == 3 {
-                    events.push(InputEvent::Mouse(MouseEvent {
-                        button: values[0],
-                        column: values[1] as usize,
-                        row: values[2] as usize,
-                        pressed,
-                    }));
+            if remaining.starts_with(b"\x1b[<") {
+                let mut end = 3;
+                while end < remaining.len()
+                    && (remaining[end].is_ascii_digit() || remaining[end] == b';')
+                    && end < MAX_MOUSE_SEQUENCE_BYTES
+                {
+                    end += 1;
                 }
-                self.pending.drain(..=end);
+                if end == remaining.len() && end < MAX_MOUSE_SEQUENCE_BYTES {
+                    break;
+                }
+                if end < remaining.len() && matches!(remaining[end], b'M' | b'm') {
+                    let values: Option<Vec<u16>> = std::str::from_utf8(&remaining[3..end])
+                        .ok()
+                        .and_then(|body| {
+                            body.split(';')
+                                .map(str::parse)
+                                .collect::<Result<Vec<_>, _>>()
+                                .ok()
+                        });
+                    if let Some(values) =
+                        values.filter(|values| values.len() == 3 && values[1] > 0 && values[2] > 0)
+                    {
+                        events.push(InputEvent::Mouse(MouseEvent {
+                            button: values[0],
+                            column: values[1] as usize,
+                            row: values[2] as usize,
+                            pressed: remaining[end] == b'M',
+                        }));
+                    }
+                    consumed += end + 1;
+                } else {
+                    // Keep the first non-mouse byte: it may be the quit key.
+                    consumed += end;
+                }
                 continue;
             }
-            if self.pending.len() < 3 {
-                break;
+            if remaining.len() >= 3 {
+                let key = match &remaining[..3] {
+                    b"\x1b[A" => Some(Key::Up),
+                    b"\x1b[B" => Some(Key::Down),
+                    b"\x1b[H" => Some(Key::Home),
+                    b"\x1b[F" => Some(Key::End),
+                    _ => None,
+                };
+                if let Some(key) = key {
+                    events.push(InputEvent::Key(key));
+                    consumed += 3;
+                    continue;
+                }
             }
-            let key = match &self.pending[..3] {
-                b"\x1b[A" => Some(Key::Up),
-                b"\x1b[B" => Some(Key::Down),
-                b"\x1b[H" => Some(Key::Home),
-                b"\x1b[F" => Some(Key::End),
-                _ => None,
-            };
-            if let Some(key) = key {
-                events.push(InputEvent::Key(key));
-                self.pending.drain(..3);
-            } else {
-                self.pending.remove(0);
-            }
+            consumed += 1;
+        }
+        self.pending.drain(..consumed);
+        if self.pending.is_empty() {
+            self.incomplete_since = None;
+        } else if consumed > 0 || self.incomplete_since.is_none() {
+            self.incomplete_since = Some(now);
         }
         events
+    }
+}
+
+#[derive(Default)]
+struct ProcessSampler {
+    pending: Option<mpsc::Receiver<Result<Vec<Process>, String>>>,
+}
+
+impl ProcessSampler {
+    fn start(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(sample_processes());
+        });
+        self.pending = Some(receiver);
+    }
+
+    fn poll(&mut self) -> Option<Result<Vec<Process>, String>> {
+        let result = match self.pending.as_ref()?.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("process sampling worker stopped".to_string())
+            }
+        };
+        self.pending = None;
+        Some(result)
     }
 }
 
@@ -2539,6 +2935,7 @@ fn main() {
         return;
     }
 
+    let _signal_guard = SignalGuard::enter();
     app.enable_usage_tracking();
     app.tracker_outdated = tracker_is_outdated();
 
@@ -2548,12 +2945,20 @@ fn main() {
             std::process::exit(1);
         }
         println!("Tracking focused Ghostty tab usage. Press Ctrl-C to stop.");
+        let mut sampler = ProcessSampler::default();
         let mut next_resource_refresh = Instant::now();
         let mut reported_tracking_error: Option<String> = None;
         loop {
+            if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                app.flush_usage();
+                return;
+            }
             let now = Instant::now();
-            if now >= next_resource_refresh {
-                app.refresh();
+            if let Some(sample) = sampler.poll() {
+                app.apply_process_sample(sample);
+            }
+            if now >= next_resource_refresh && sampler.pending.is_none() {
+                sampler.start();
                 next_resource_refresh = now + Duration::from_secs(60);
             }
             app.track_usage(now);
@@ -2591,16 +2996,25 @@ fn main() {
 
     let mut stdin = io::stdin();
     let mut decoder = InputDecoder::default();
+    let mut sampler = ProcessSampler::default();
     let mut next_sample = Instant::now() + app.interval;
     let mut dirty = true;
     let mut layout = Layout::default();
     loop {
+        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            app.flush_usage();
+            return;
+        }
         if dirty {
             layout = render(&app);
             dirty = false;
         }
-        let mut input = [0_u8; 64];
-        if let Ok(count) = stdin.read(&mut input) {
+        let mut input = [0_u8; 4096];
+        // Limit each batch so a stream of mouse movement cannot starve samples.
+        for _ in 0..16 {
+            let Ok(count) = stdin.read(&mut input) else {
+                break;
+            };
             for event in decoder.push(&input[..count]) {
                 let keep_running = match event {
                     InputEvent::Key(key) => app.handle_key(key),
@@ -2612,10 +3026,17 @@ fn main() {
                 }
                 dirty = true;
             }
+            if count == 0 {
+                break;
+            }
         }
-        if Instant::now() >= next_sample {
+        if let Some(sample) = sampler.poll() {
+            app.apply_process_sample(sample);
+            dirty = true;
+        }
+        if Instant::now() >= next_sample && sampler.pending.is_none() {
             app.poll_labels(Instant::now());
-            app.refresh();
+            sampler.start();
             next_sample = Instant::now() + app.interval;
             dirty = true;
         }
@@ -2626,30 +3047,31 @@ fn main() {
     }
 }
 
-trait IsTerminal {
-    fn is_terminal(&self) -> bool;
-}
-
-impl IsTerminal for io::Stdin {
-    fn is_terminal(&self) -> bool {
-        unsafe { isatty(0) == 1 }
-    }
-}
-
-impl IsTerminal for io::Stdout {
-    fn is_terminal(&self) -> bool {
-        unsafe { isatty(1) == 1 }
-    }
-}
-
 extern "C" {
-    fn isatty(fd: i32) -> i32;
+    fn signal(number: i32, handler: usize) -> usize;
+    fn kill(pid: i32, signal: i32) -> i32;
     #[cfg(target_os = "macos")]
     fn getuid() -> u32;
 }
 
 struct TerminalGuard {
     original: String,
+    active: Arc<AtomicBool>,
+}
+
+fn restore_terminal(original: &str, active: &AtomicBool) {
+    if !active.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let _ = Command::new("stty")
+        .args([STTY_FILE, "/dev/tty", original])
+        .status();
+    let mut stdout = io::stdout();
+    let _ = write!(
+        stdout,
+        "\x1b[?1003l\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l{RESET}"
+    );
+    let _ = stdout.flush();
 }
 
 impl TerminalGuard {
@@ -2674,19 +3096,26 @@ impl TerminalGuard {
         if !ok {
             return None;
         }
+        let active = Arc::new(AtomicBool::new(true));
+        let hook_active = Arc::clone(&active);
+        let hook_original = original.clone();
+        let previous_hook = std::panic::take_hook();
+        // Release builds abort on panic and skip Drop; restore before the
+        // original hook prints its diagnostic or aborts the process.
+        std::panic::set_hook(Box::new(move |info| {
+            SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+            restore_terminal(&hook_original, &hook_active);
+            previous_hook(info);
+        }));
         print!("\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h");
         let _ = io::stdout().flush();
-        Some(Self { original })
+        Some(Self { original, active })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = Command::new("stty")
-            .args([STTY_FILE, "/dev/tty", &self.original])
-            .status();
-        print!("\x1b[?1003l\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l{RESET}");
-        let _ = io::stdout().flush();
+        restore_terminal(&self.original, &self.active);
     }
 }
 
@@ -2696,11 +3125,11 @@ fn usage_and_exit(code: i32) -> ! {
 }
 
 fn sample_processes() -> Result<Vec<Process>, String> {
-    let output = Command::new("ps")
-        .args(PS_PROCESSES)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("could not run ps: {e}"))?;
+    let output = run_command_with_timeout(
+        Command::new("ps").args(PS_PROCESSES),
+        PROCESS_SAMPLE_TIMEOUT,
+    )
+    .map_err(|e| format!("could not run ps: {e}"))?;
     if !output.status.success() {
         return Err(format!("ps exited with {}", output.status));
     }
@@ -2710,7 +3139,9 @@ fn sample_processes() -> Result<Vec<Process>, String> {
     // macOS that is a syscall costing microseconds; on Linux the processes we
     // are not allowed to read fail immediately, which is most of them.
     for process in &mut processes {
-        process.footprint_kib = phys_footprint_kib(process.pid).unwrap_or(process.rss_kib);
+        let footprint = phys_footprint_kib(process.pid);
+        process.footprint_available = footprint.is_some();
+        process.footprint_kib = footprint.unwrap_or(process.rss_kib);
     }
     Ok(processes)
 }
@@ -2738,6 +3169,7 @@ fn parse_process(line: &str) -> Option<Process> {
         // Filled in by `sample_processes`; resident size is the honest stand-in
         // until then.
         footprint_kib: rss_kib,
+        footprint_available: false,
         elapsed,
         age_seconds,
         command,
@@ -2799,6 +3231,7 @@ fn terminal_for(root: &Process, mut members: Vec<Process>) -> Terminal {
     let cpu = members.iter().map(|p| p.cpu).sum();
     let rss_kib = members.iter().map(|p| p.rss_kib).sum();
     let footprint_kib = members.iter().map(|p| p.footprint_kib).sum();
+    let footprint_complete = members.iter().all(|p| p.footprint_available);
     members.sort_by_key(|process| std::cmp::Reverse(process.footprint_kib));
     // The kernel already knows what the tab is running: the tty hands the
     // keyboard to one process group, and that group's leader is the
@@ -2827,6 +3260,7 @@ fn terminal_for(root: &Process, mut members: Vec<Process>) -> Terminal {
         cpu,
         rss_kib,
         footprint_kib,
+        footprint_complete,
         processes: members,
         activity,
         elapsed: root.elapsed.clone(),
@@ -2837,6 +3271,7 @@ fn terminal_for(root: &Process, mut members: Vec<Process>) -> Terminal {
         leak_suspected: false,
         leak_process: String::new(),
         leak_growth_kib: 0,
+        leak_span: Duration::ZERO,
         herdr_server: None,
     }
 }
@@ -2848,16 +3283,13 @@ fn terminal_for(root: &Process, mut members: Vec<Process>) -> Terminal {
 fn herdr_terminals(processes: &[Process], panes: &HashMap<i32, HerdrPane>) -> Vec<Terminal> {
     let by_parent = child_map(processes);
     let mut terminals = Vec::new();
-    for server in processes.iter().filter(|p| is_herdr_server(&p.command)) {
+    for server in processes.iter().filter(|p| is_herdr_server(p)) {
         let mut row = terminal_for(server, vec![server.clone()]);
         // The Ghostty tab running the herdr client is often named "herdr" too.
-        let mut arguments = server.command.split_whitespace();
-        row.label = match arguments.find(|argument| *argument == "--session") {
-            Some(_) => format!("herdr server · {}", arguments.next().unwrap_or("?")),
-            None => "herdr server".to_string(),
-        };
+        row.label = "herdr server".to_string();
         row.tty = "herdr".to_string();
         row.herdr_server = Some(server.pid);
+        let server_row = terminals.len();
         terminals.push(row);
 
         let mut tabs: BTreeMap<String, Vec<&Process>> = BTreeMap::new();
@@ -2889,6 +3321,9 @@ fn herdr_terminals(processes: &[Process], panes: &HashMap<i32, HerdrPane>) -> Ve
             let mut row = terminal_for(root, members);
             if let Some(pane) = shells.iter().find_map(|shell| panes.get(&shell.pid)) {
                 row.label = pane.label.clone();
+                if pane.session != "default" {
+                    terminals[server_row].label = format!("herdr server · {}", pane.session);
+                }
             }
             row.herdr_server = Some(server.pid);
             terminals.push(row);
@@ -2921,7 +3356,7 @@ fn assign_descendants(
 }
 
 fn is_login_process(command: &str) -> bool {
-    command.starts_with("/usr/bin/login ") || command == "/usr/bin/login"
+    command == "login" || command.starts_with("/usr/bin/login ") || command == "/usr/bin/login"
 }
 
 fn is_shell(command: &str) -> bool {
@@ -2984,11 +3419,6 @@ fn analyze_memory_history(samples: &VecDeque<(Instant, u64)>) -> MemoryTrend {
         / edge_count as f64;
     let growth = recent - baseline;
     let duration = last_time.duration_since(*first_time);
-    let ratio = if baseline > 0.0 {
-        growth / baseline
-    } else {
-        0.0
-    };
     let points: Vec<(f64, f64)> = samples
         .iter()
         .map(|(time, rss)| (time.duration_since(*first_time).as_secs_f64(), *rss as f64))
@@ -2997,7 +3427,10 @@ fn analyze_memory_history(samples: &VecDeque<(Instant, u64)>) -> MemoryTrend {
     let slope_kib_per_min = slope_per_second * 60.0;
     let recent_start = points.len() / 2;
     let (recent_slope_per_second, _) = linear_regression(&points[recent_start..]);
-    let tolerance = (baseline * 0.01).max(2.0 * 1024.0);
+    // Footprint includes compressed pages, so residency churn is not noise
+    // here. A fixed 256 KiB allowance also cannot hide larger drops merely
+    // because an otherwise identical leak starts from a large baseline.
+    let tolerance = 256.0;
     let upward_samples = samples
         .iter()
         .zip(samples.iter().skip(1))
@@ -3005,12 +3438,12 @@ fn analyze_memory_history(samples: &VecDeque<(Instant, u64)>) -> MemoryTrend {
         .count();
     let upward_ratio = upward_samples as f64 / (samples.len() - 1) as f64;
     MemoryTrend {
+        span: duration,
         growth_kib: growth.round() as i64,
         slope_kib_per_min,
         suspected: samples.len() >= MIN_LEAK_SAMPLES
             && duration >= MIN_LEAK_DURATION
             && growth >= MIN_LEAK_GROWTH_KIB as f64
-            && ratio >= MIN_LEAK_GROWTH_RATIO
             && slope_kib_per_min >= MIN_LEAK_SLOPE_KIB_PER_MIN
             && r_squared >= MIN_LEAK_R_SQUARED
             && recent_slope_per_second >= slope_per_second * 0.35
@@ -3141,6 +3574,14 @@ fn render(app: &App) -> Layout {
 /// layout can be exercised at any terminal geometry without a real terminal.
 fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layout) {
     let mut lines = Vec::new();
+    let tracker_error = app
+        .usage_tracker
+        .as_ref()
+        .and_then(|tracker| tracker.last_error.as_ref());
+    let footer_rows = 2
+        + usize::from(has_memory_fallback(app))
+        + usize::from(tracker_error.is_some())
+        + usize::from(app.last_error.is_some());
     let shared_cpu = app.ghostty.as_ref().map_or(0.0, |p| p.cpu);
     let shared_ram = app.ghostty.as_ref().map_or(0, |p| p.footprint_kib);
     let terminal_cpu: f64 = app.terminals.iter().map(|t| t.cpu).sum();
@@ -3178,9 +3619,9 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
     ));
     lines.push(format!(
         "Ghostty  {YELLOW}{shared_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}    {} terminals  {YELLOW}{terminal_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}",
-        human_bytes(shared_ram),
+        memory_value(shared_ram, app.ghostty.as_ref().is_none_or(|p| p.footprint_available)),
         app.terminals.len(),
-        human_bytes(terminal_ram),
+        memory_value(terminal_ram, app.terminals.iter().all(|t| t.footprint_complete)),
     ));
     lines.push(String::new());
 
@@ -3198,13 +3639,15 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
         layout.zones.extend(header_zones);
         lines.push(header_line);
         let max_rows = if app.expanded {
-            height.saturating_sub(15).max(3)
+            height.saturating_sub(13 + footer_rows)
         } else {
-            height.saturating_sub(8).max(3)
+            height.saturating_sub(6 + footer_rows)
         }
         .min(app.terminals.len());
-        let shown_start = if app.selected >= max_rows {
-            app.selected + 1 - max_rows
+        let shown_start = if max_rows == 0 {
+            app.selected.min(app.terminals.len())
+        } else if app.selected >= max_rows {
+            (app.selected + 1 - max_rows).min(app.terminals.len())
         } else {
             0
         };
@@ -3231,10 +3674,10 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
             line.push_str(row_style);
             let marker = if selected { "›" } else { " " };
             line.push_str(&format!(
-                "{marker}  {:<tab_width$} {YELLOW}{:>6.1}%{RESET}{row_style} {CYAN}{:>9}{RESET}{row_style} {}{row_style} {:>7} {:>11} {}",
-                truncate(&tree_label(&app.terminals, index), tab_width),
+                "{marker}  {} {YELLOW}{:>6.1}%{RESET}{row_style} {CYAN}{:>9}{RESET}{row_style} {}{row_style} {:>7} {:>11} {}",
+                pad_to_width(&tree_label(&app.terminals, index), tab_width, false),
                 terminal.cpu,
-                human_bytes(terminal.footprint_kib),
+                memory_value(terminal.footprint_kib, terminal.footprint_complete),
                 trend_cell(terminal),
                 terminal.processes.len(),
                 terminal.elapsed,
@@ -3267,9 +3710,10 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
             ));
             if terminal.leak_suspected {
                 lines.push(format!(
-                    "{BOLD}{RED}⚠ Potential memory leak in {}: {} since tracking began{RESET}",
+                    "{BOLD}{RED}⚠ Potential memory leak in {}: {} over {} (averaged edges){RESET}",
                     terminal.leak_process,
                     signed_human_kib(terminal.leak_growth_kib),
+                    human_duration(terminal.leak_span.as_secs()),
                 ));
             }
             // RESIDENT is here so the gap between the two is legible rather
@@ -3281,14 +3725,14 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
             lines.push(format!(
                 "{DIM}{UNDERLINE}     PID      CPU        RAM   RESIDENT   COMMAND{RESET}"
             ));
-            let process_rows = height.saturating_sub(lines.len() + 2);
+            let process_rows = height.saturating_sub(lines.len() + footer_rows);
             let command_width = width.saturating_sub(EXPANDED_FIXED_WIDTH).max(12);
             for process in terminal.processes.iter().take(process_rows) {
                 lines.push(format!(
                     "  {:>6}  {YELLOW}{:>6.1}%{RESET}  {CYAN}{:>9}{RESET}  {DIM}{:>9}{RESET}   {}",
                     process.pid,
                     process.cpu,
-                    human_bytes(process.footprint_kib),
+                    memory_value(process.footprint_kib, process.footprint_available),
                     human_bytes(process.rss_kib),
                     truncate(&process.command, command_width),
                 ));
@@ -3296,31 +3740,26 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
         }
     }
 
+    if has_memory_fallback(app) {
+        lines.push(format!("{DIM}~ RAM includes resident-size fallback; physical footprint was unavailable.{RESET}"));
+    }
+    if let Some(error) = tracker_error {
+        lines.push(format!("{RED}Tracking paused: {error}{RESET}"));
+    }
     if let Some(error) = &app.last_error {
         lines.push(format!("\x1b[31mSampling error: {error}{RESET}"));
     }
     lines.push(String::new());
-    let (hint, hint_zones) = hint_line(
-        lines.len() + 1,
-        &[
-            ("↑ up", Some(ClickAction::SelectPrevious)),
-            ("↓ down", Some(ClickAction::SelectNext)),
-            ("enter expand", Some(ClickAction::ToggleExpand)),
-            ("u usage", Some(ClickAction::ShowUsage)),
-            ("q quit", Some(ClickAction::Quit)),
-        ],
-    );
+    let (hint, hint_zones) = view_hint(lines.len() + 1, width, View::Monitor);
     layout.zones.extend(hint_zones);
     lines.push(hint);
-    fit_targets(&mut layout, width);
-    let lines = lines
-        .into_iter()
-        .map(|line| fit_to_width(&line, width))
-        .collect();
-    (lines, layout)
+    fit_frame(lines, layout, height, width)
 }
 
 fn render_usage(app: &App, height: usize, width: usize) -> (Vec<String>, Layout) {
+    if height < 20 {
+        return render_usage_compact(app, height, width);
+    }
     const WEEKDAYS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
     let weeks = visible_weeks(width);
     let mut lines = vec![with_version(
@@ -3492,8 +3931,8 @@ fn render_usage(app: &App, height: usize, width: usize) -> (Vec<String>, Layout)
                     seconds as f64 / total as f64 * 100.0
                 };
                 lines.push(format!(
-                    "  {:<40} {:>8}   {:>5.1}%",
-                    truncate(&name, 40),
+                    "  {} {:>8}   {:>5.1}%",
+                    pad_to_width(&name, 40, false),
                     human_duration(seconds),
                     share
                 ));
@@ -3502,21 +3941,198 @@ fn render_usage(app: &App, height: usize, width: usize) -> (Vec<String>, Layout)
     }
 
     lines.push(String::new());
-    let (hint, hint_zones) = hint_line(
-        lines.len() + 1,
-        &[
-            ("u back to monitor", Some(ClickAction::ShowMonitor)),
-            ("q quit", Some(ClickAction::Quit)),
-        ],
-    );
+    let (hint, hint_zones) = view_hint(lines.len() + 1, width, View::Usage);
     layout.zones.extend(hint_zones);
     lines.push(hint);
+    fit_frame(lines, layout, height, width)
+}
+
+/// Short windows show the current week horizontally instead of squeezing
+/// seven weekday rows off-screen. The scale controls and footer remain usable.
+fn render_usage_compact(app: &App, height: usize, width: usize) -> (Vec<String>, Layout) {
+    const WEEKDAYS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+    let tracker = app.usage_tracker.as_ref();
+    let today = tracker
+        .map(|value| value.current_day.clone())
+        .or_else(local_date)
+        .unwrap_or_else(|| "1970-01-01".to_string());
+    let today_number = date_to_day_number(&today).unwrap_or(0);
+    let by_week = app.usage_scale != UsageScale::Daily;
+    let cell_width = if by_week { CALENDAR_CELL_WIDTH } else { 3 };
+    let weeks = if by_week { visible_weeks(width) } else { 1 };
+    let start = today_number - sunday_index(today_number) - (weeks as i64 - 1) * 7;
+    let daily = daily_totals(tracker, start, weeks, today_number);
+    let mut lines = vec![with_version(
+        format!("{BOLD}{GREEN}ghostty-top{RESET}  usage calendar"),
+        width,
+    )];
+    let mut layout = Layout::default();
+    if height >= 6 {
+        lines.push(format!(
+            "{}  •  {} total",
+            if by_week {
+                format!("Last {weeks} weeks")
+            } else {
+                "This week".into()
+            },
+            human_duration(sum_seconds(daily.iter().copied()))
+        ));
+    }
+    if height >= 8 {
+        let status = if !TRACKS_FOCUS {
+            format!("Not recording: {FOCUS_UNAVAILABLE}.")
+        } else if let Some(error) = tracker.and_then(|value| value.last_error.as_ref()) {
+            format!("Tracking paused: {error}")
+        } else if let Some(away) = tracker.and_then(|value| value.away) {
+            format!("Paused while {}.", away.reason())
+        } else {
+            "Counting while Ghostty is frontmost and you are present.".into()
+        };
+        lines.push(format!("{DIM}{status}{RESET}"));
+    }
+    let (scale, zones) = scale_selector(lines.len() + 1, app.usage_scale);
+    lines.push(scale);
+    layout.zones.extend(zones);
+    if height >= 5 {
+        lines.push(if by_week {
+            format!("{DIM}{}{RESET}", month_header(start, weeks))
+        } else {
+            format!("{DIM}{}{RESET}", WEEKDAYS.join(" "))
+        });
+    }
+    let values = if by_week {
+        weekly_usage(&daily, app.usage_scale)
+    } else {
+        daily.clone()
+    };
+    let peak = usage_peak(&values, app.usage_scale);
+    let mut line = if by_week {
+        " ".repeat(CALENDAR_GUTTER)
+    } else {
+        String::new()
+    };
+    let row = lines.len() + 1;
+    for (index, value) in values.iter().enumerate() {
+        let number = start + if by_week { index * 7 } else { index } as i64;
+        if number > today_number {
+            line.push_str(&" ".repeat(cell_width));
+            continue;
+        }
+        let day = day_number_to_date(number);
+        let style = if app.selected_day.as_deref() == Some(day.as_str()) {
+            CALENDAR_SELECTED
+        } else if app.hovered_day.as_deref() == Some(day.as_str()) {
+            CALENDAR_HOVER
+        } else {
+            CALENDAR_RAMP[usage_level(*value, peak)]
+        };
+        let column = display_width(&line) + 1;
+        line.push_str(&format!(
+            "{style}{CALENDAR_BLOCK}{RESET}{}",
+            " ".repeat(cell_width - 1)
+        ));
+        layout.calendar_cells.push(CalendarCell {
+            start_column: column,
+            end_column: column + cell_width - 1,
+            row,
+            day,
+        });
+    }
+    lines.push(line);
+    if height >= 9 {
+        if let Some(day) = app.hovered_day.as_ref().or(app.selected_day.as_ref()) {
+            lines.push(format!(
+                "{}  •  {}",
+                selection_label(day, by_week),
+                human_duration(usage_total_for_days(tracker, &selection_days(day, by_week)))
+            ));
+        } else {
+            lines.push(format!(
+                "{DIM}Click a {} for its tab breakdown.{RESET}",
+                if by_week { "column" } else { "day" }
+            ));
+        }
+    }
+    if let Some(day) = &app.selected_day {
+        let days = selection_days(day, by_week);
+        let available = height.saturating_sub(lines.len() + 2);
+        if available > 0 {
+            lines.push(format!(
+                "{BOLD}{} breakdown{RESET}",
+                selection_label(day, by_week)
+            ));
+            for (name, seconds) in usage_breakdown(tracker, &days)
+                .into_iter()
+                .take(available - 1)
+            {
+                let duration = human_duration(seconds);
+                let name_width = width.saturating_sub(display_width(&duration) + 3);
+                lines.push(format!(
+                    "  {} {duration}",
+                    pad_to_width(&name, name_width, false)
+                ));
+            }
+        }
+    }
+    let (hint, zones) = view_hint(lines.len() + 1, width, View::Usage);
+    lines.push(hint);
+    layout.zones.extend(zones);
+    fit_frame(lines, layout, height, width)
+}
+
+/// Keep the footer when rows run out, and map click targets to exactly the rows
+/// retained on screen. Hidden terminal rows must also stop accepting clicks.
+fn fit_frame(
+    mut lines: Vec<String>,
+    mut layout: Layout,
+    height: usize,
+    width: usize,
+) -> (Vec<String>, Layout) {
+    let original_height = lines.len();
+    if original_height > height {
+        let footer = lines.pop().unwrap();
+        lines.truncate(height.saturating_sub(1));
+        if height > 0 {
+            lines.push(footer);
+        }
+        let retained_body = height.saturating_sub(1);
+        let map_row = |row: usize| {
+            if height > 0 && row == original_height {
+                Some(height)
+            } else if row <= retained_body {
+                Some(row)
+            } else {
+                None
+            }
+        };
+        layout.zones.retain_mut(|zone| {
+            if let Some(row) = map_row(zone.row) {
+                zone.row = row;
+                true
+            } else {
+                false
+            }
+        });
+        layout.calendar_cells.retain_mut(|cell| {
+            if let Some(row) = map_row(cell.row) {
+                cell.row = row;
+                true
+            } else {
+                false
+            }
+        });
+        layout.shown_count = layout
+            .shown_count
+            .min(retained_body.saturating_sub(layout.terminal_start_row.saturating_sub(1)));
+    }
     fit_targets(&mut layout, width);
-    let lines = lines
-        .into_iter()
-        .map(|line| fit_to_width(&line, width))
-        .collect();
-    (lines, layout)
+    (
+        lines
+            .into_iter()
+            .map(|line| fit_to_width(&line, width))
+            .collect(),
+        layout,
+    )
 }
 
 /// Days a selected column covers: one day in the grid, a whole week in a chart.
@@ -3737,28 +4353,104 @@ fn scale_selector(row: usize, active: UsageScale) -> (String, Vec<ClickZone>) {
 /// The single dim line of chrome at the bottom of a view. Segments naming an
 /// action are also click targets, so the hint doubles as the mouse affordance.
 fn hint_line(row: usize, segments: &[(&str, Option<ClickAction>)]) -> (String, Vec<ClickZone>) {
-    const SEPARATOR: &str = "  ·  ";
+    hint_line_with_separator(row, segments, "  ·  ")
+}
+
+fn hint_line_with_separator(
+    row: usize,
+    segments: &[(&str, Option<ClickAction>)],
+    separator: &str,
+) -> (String, Vec<ClickZone>) {
     let mut line = String::from(DIM);
     let mut column = 1;
     let mut zones = Vec::new();
     for (index, (label, action)) in segments.iter().enumerate() {
         if index > 0 {
-            line.push_str(SEPARATOR);
-            column += SEPARATOR.chars().count();
+            line.push_str(separator);
+            column += display_width(separator);
         }
         line.push_str(label);
         if let Some(action) = action {
             zones.push(ClickZone {
                 start_column: column,
-                end_column: column + label.chars().count() - 1,
+                end_column: column + display_width(label) - 1,
                 row,
                 action: *action,
             });
         }
-        column += label.chars().count();
+        column += display_width(label);
     }
     line.push_str(RESET);
     (line, zones)
+}
+
+/// Prioritize view switching and quitting when a narrow window cannot fit
+/// all keyboard hints. Every variant still derives its click zones from text.
+fn view_hint(row: usize, width: usize, view: View) -> (String, Vec<ClickZone>) {
+    let full_monitor = [
+        ("↑ up", Some(ClickAction::SelectPrevious)),
+        ("↓ down", Some(ClickAction::SelectNext)),
+        ("enter expand", Some(ClickAction::ToggleExpand)),
+        ("u usage", Some(ClickAction::ShowUsage)),
+        ("q quit", Some(ClickAction::Quit)),
+    ];
+    let full_usage = [
+        ("u back to monitor", Some(ClickAction::ShowMonitor)),
+        ("q quit", Some(ClickAction::Quit)),
+    ];
+    let full = hint_line(
+        row,
+        if view == View::Monitor {
+            &full_monitor
+        } else {
+            &full_usage
+        },
+    );
+    if display_width(&full.0) <= width {
+        return full;
+    }
+    let switch = if view == View::Monitor {
+        ClickAction::ShowUsage
+    } else {
+        ClickAction::ShowMonitor
+    };
+    let switch_label = if view == View::Monitor {
+        "u usage"
+    } else {
+        "u back"
+    };
+    let medium = hint_line(
+        row,
+        &[
+            (switch_label, Some(switch)),
+            ("q quit", Some(ClickAction::Quit)),
+        ],
+    );
+    if display_width(&medium.0) <= width {
+        if view == View::Monitor {
+            let navigation = hint_line(
+                row,
+                &[
+                    (switch_label, Some(switch)),
+                    ("q quit", Some(ClickAction::Quit)),
+                    ("↑↓ move", None),
+                ],
+            );
+            if display_width(&navigation.0) <= width {
+                return navigation;
+            }
+        }
+        return medium;
+    }
+    if width >= 3 {
+        hint_line_with_separator(
+            row,
+            &[("u", Some(switch)), ("q", Some(ClickAction::Quit))],
+            if width >= 5 { " · " } else { " " },
+        )
+    } else {
+        hint_line(row, &[("q", Some(ClickAction::Quit))])
+    }
 }
 
 /// Renders the sortable column headings and the columns each one occupies.
@@ -3924,12 +4616,7 @@ fn header_cell(
     };
     // Clamped to the column width so the arrow can never widen a heading and
     // push the whole row out of step with the data beneath it.
-    let text = truncate(&text, width);
-    let padded = if right_aligned {
-        format!("{text:>width$}")
-    } else {
-        format!("{text:<width$}")
-    };
+    let padded = pad_to_width(&text, width, right_aligned);
     if app.sort == column {
         format!("{ACTIVE_HEADER}{padded}{RESET}")
     } else {
@@ -3949,7 +4636,7 @@ fn trend_cell(terminal: &Terminal) -> String {
     } else {
         "→ stable".to_string()
     };
-    let padded = format!("{:>12}", truncate(&text, 12));
+    let padded = pad_to_width(&text, 12, true);
     if terminal.leak_suspected {
         format!("{BOLD}{RED}{padded}{RESET}")
     } else {
@@ -3987,7 +4674,7 @@ fn print_snapshot(app: &App) {
     println!(
         "Ghostty shared: {:>6.1}% CPU  {:>8} RAM",
         ghostty.cpu,
-        human_bytes(ghostty.footprint_kib)
+        memory_value(ghostty.footprint_kib, ghostty.footprint_available)
     );
     println!(
         "{:<24} {:>7}  {:>9}  {:>11}  {:>5}  {:>11}  ACTIVITY",
@@ -3995,10 +4682,10 @@ fn print_snapshot(app: &App) {
     );
     for (index, terminal) in app.terminals.iter().enumerate() {
         println!(
-            "{:<24} {:>6.1}%  {:>9}  {:>11}  {:>5}  {:>11}  {}{}",
-            truncate(&tree_label(&app.terminals, index), 24),
+            "{} {:>6.1}%  {:>9}  {:>11}  {:>5}  {:>11}  {}{}",
+            pad_to_width(&tree_label(&app.terminals, index), 24, false),
             terminal.cpu,
-            human_bytes(terminal.footprint_kib),
+            memory_value(terminal.footprint_kib, terminal.footprint_complete),
             if terminal.memory_samples < 2 {
                 "sampling".to_string()
             } else {
@@ -4014,16 +4701,39 @@ fn print_snapshot(app: &App) {
             }
         );
     }
+    if has_memory_fallback(app) {
+        println!("~ RAM includes resident-size fallback; physical footprint was unavailable.");
+    }
+}
+
+fn has_memory_fallback(app: &App) -> bool {
+    app.ghostty.as_ref().is_some_and(|p| !p.footprint_available)
+        || app.terminals.iter().any(|t| !t.footprint_complete)
+}
+
+fn memory_value(kib: u64, footprint_available: bool) -> String {
+    let text = human_bytes(kib);
+    if footprint_available {
+        text
+    } else {
+        format!("{}~", text.replace(' ', ""))
+    }
 }
 
 fn human_bytes(kib: u64) -> String {
-    let bytes = kib as f64 * 1024.0;
-    if bytes >= 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.1} GiB", bytes / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024.0 * 1024.0 {
-        format!("{:.1} MiB", bytes / (1024.0 * 1024.0))
+    const UNITS: [&str; 7] = ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB"];
+    let mut value = kib as f64;
+    let mut unit = 0;
+    // Four digits plus a decimal and unit exceed RAM's nine columns.
+    // Promote before rounding crosses 1000, even before the binary boundary.
+    while value >= if unit == 0 { 1024.0 } else { 999.95 } && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value:.0} {}", UNITS[unit])
     } else {
-        format!("{:.0} KiB", bytes / 1024.0)
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -4035,49 +4745,590 @@ fn with_version(line: String, width: usize) -> String {
         return line;
     }
     let line = fit_to_width(&line, width - version.len() - 2);
-    let mut used = 0;
-    let mut in_escape = false;
-    for character in line.chars() {
-        match character {
-            '\x1b' => in_escape = true,
-            _ if in_escape => in_escape = !character.is_ascii_alphabetic(),
-            _ => used += 1,
-        }
-    }
-    let gap = " ".repeat(width - used - version.len());
+    let gap = " ".repeat(width - display_width(&line) - version.len());
     format!("{line}{gap}{DIM}{version}{RESET}")
 }
 
-/// Cuts a rendered line to the terminal width, counting only visible columns.
-/// Colour escapes are copied through rather than counted, so a long line is
-/// clipped at the edge instead of wrapping and tearing the frame apart.
-fn fit_to_width(line: &str, width: usize) -> String {
-    let mut fitted = String::new();
-    let mut visible = 0;
-    let mut characters = line.chars();
-    let mut clipped = false;
-    while let Some(character) = characters.next() {
-        if character == '\x1b' {
-            fitted.push(character);
-            for escape in characters.by_ref() {
-                fitted.push(escape);
-                if escape.is_ascii_alphabetic() {
+/// Terminal columns, rather than Rust's scalar count: combining marks occupy
+/// no cell, CJK characters occupy two, and joined emoji remain one glyph.
+fn display_width(value: &str) -> usize {
+    let mut start = 0;
+    let mut width = 0;
+    while start < value.len() {
+        let (end, columns) = display_unit(value, start);
+        width += columns;
+        start = end;
+    }
+    width
+}
+
+fn pad_to_width(value: &str, width: usize, right_aligned: bool) -> String {
+    let text = truncate(value, width);
+    let padding = " ".repeat(width.saturating_sub(display_width(&text)));
+    if right_aligned {
+        padding + &text
+    } else {
+        text + &padding
+    }
+}
+
+/// Returns a whole visible cluster or ANSI sequence, so clipping never leaves
+/// half a wide glyph or half an emoji sequence at the terminal edge.
+fn display_unit(value: &str, start: usize) -> (usize, usize) {
+    let mut characters = value[start..].char_indices().peekable();
+    let (_, first) = characters.next().unwrap();
+    if first == '\x1b' {
+        let mut end = start + first.len_utf8();
+        if characters
+            .peek()
+            .is_some_and(|(_, character)| *character == '[')
+        {
+            characters.next();
+            end += 1;
+            for (offset, character) in characters {
+                end = start + offset + character.len_utf8();
+                if ('@'..='~').contains(&character) {
                     break;
                 }
             }
-            continue;
         }
-        if visible == width {
-            clipped = true;
+        return (end, 0);
+    }
+    let mut end = start + first.len_utf8();
+    let mut width = character_width(first);
+    let regional = ('\u{1f1e6}'..='\u{1f1ff}').contains(&first);
+    let mut joined = false;
+    for (offset, character) in characters {
+        let modifier = ('\u{1f3fb}'..='\u{1f3ff}').contains(&character);
+        if character == '\u{200d}' {
+            joined = true;
+        } else if joined {
+            if !emoji_joinable(first) || !emoji_joinable(character) {
+                break;
+            }
+            width = width.max(character_width(character));
+            joined = false;
+        } else if character == '\u{fe0f}' || character == '\u{20e3}' || modifier {
+            width = width.max(2);
+        } else if regional && ('\u{1f1e6}'..='\u{1f1ff}').contains(&character) {
+            return (start + offset + character.len_utf8(), 2);
+        } else if character != '\x1b' && character_width(character) == 0 {
+            // Accents, variation selectors and emoji tag characters belong to
+            // the preceding glyph, even when it sits at the clipping boundary.
+        } else {
             break;
         }
-        fitted.push(character);
-        visible += 1;
+        end = start + offset + character.len_utf8();
     }
-    if clipped {
-        fitted.push_str(RESET);
+    (end, width)
+}
+
+fn emoji_joinable(character: char) -> bool {
+    matches!(character as u32, 0xa9 | 0xae | 0x203c | 0x2049 | 0x2122 | 0x2139
+        | 0x2194..=0x21ff | 0x2300..=0x23ff | 0x2600..=0x27bf
+        | 0x2934..=0x2935 | 0x2b05..=0x2b55 | 0x3030 | 0x303d | 0x3297 | 0x3299
+        | 0x1f000..=0x1faff)
+}
+
+// Unicode 14 combining/format and wide/fullwidth properties. CJK extension
+// planes and unassigned emoji remain wide; assigned text emoji need VS16.
+const ZERO_WIDTH_RANGES: &[(u32, u32)] = &[
+    (0xad, 0xad),
+    (0x300, 0x36f),
+    (0x483, 0x489),
+    (0x591, 0x5bd),
+    (0x5bf, 0x5bf),
+    (0x5c1, 0x5c2),
+    (0x5c4, 0x5c5),
+    (0x5c7, 0x5c7),
+    (0x600, 0x605),
+    (0x610, 0x61a),
+    (0x61c, 0x61c),
+    (0x64b, 0x65f),
+    (0x670, 0x670),
+    (0x6d6, 0x6dd),
+    (0x6df, 0x6e4),
+    (0x6e7, 0x6e8),
+    (0x6ea, 0x6ed),
+    (0x70f, 0x70f),
+    (0x711, 0x711),
+    (0x730, 0x74a),
+    (0x7a6, 0x7b0),
+    (0x7eb, 0x7f3),
+    (0x7fd, 0x7fd),
+    (0x816, 0x819),
+    (0x81b, 0x823),
+    (0x825, 0x827),
+    (0x829, 0x82d),
+    (0x859, 0x85b),
+    (0x890, 0x891),
+    (0x898, 0x89f),
+    (0x8ca, 0x902),
+    (0x93a, 0x93a),
+    (0x93c, 0x93c),
+    (0x941, 0x948),
+    (0x94d, 0x94d),
+    (0x951, 0x957),
+    (0x962, 0x963),
+    (0x981, 0x981),
+    (0x9bc, 0x9bc),
+    (0x9c1, 0x9c4),
+    (0x9cd, 0x9cd),
+    (0x9e2, 0x9e3),
+    (0x9fe, 0x9fe),
+    (0xa01, 0xa02),
+    (0xa3c, 0xa3c),
+    (0xa41, 0xa42),
+    (0xa47, 0xa48),
+    (0xa4b, 0xa4d),
+    (0xa51, 0xa51),
+    (0xa70, 0xa71),
+    (0xa75, 0xa75),
+    (0xa81, 0xa82),
+    (0xabc, 0xabc),
+    (0xac1, 0xac5),
+    (0xac7, 0xac8),
+    (0xacd, 0xacd),
+    (0xae2, 0xae3),
+    (0xafa, 0xaff),
+    (0xb01, 0xb01),
+    (0xb3c, 0xb3c),
+    (0xb3f, 0xb3f),
+    (0xb41, 0xb44),
+    (0xb4d, 0xb4d),
+    (0xb55, 0xb56),
+    (0xb62, 0xb63),
+    (0xb82, 0xb82),
+    (0xbc0, 0xbc0),
+    (0xbcd, 0xbcd),
+    (0xc00, 0xc00),
+    (0xc04, 0xc04),
+    (0xc3c, 0xc3c),
+    (0xc3e, 0xc40),
+    (0xc46, 0xc48),
+    (0xc4a, 0xc4d),
+    (0xc55, 0xc56),
+    (0xc62, 0xc63),
+    (0xc81, 0xc81),
+    (0xcbc, 0xcbc),
+    (0xcbf, 0xcbf),
+    (0xcc6, 0xcc6),
+    (0xccc, 0xccd),
+    (0xce2, 0xce3),
+    (0xd00, 0xd01),
+    (0xd3b, 0xd3c),
+    (0xd41, 0xd44),
+    (0xd4d, 0xd4d),
+    (0xd62, 0xd63),
+    (0xd81, 0xd81),
+    (0xdca, 0xdca),
+    (0xdd2, 0xdd4),
+    (0xdd6, 0xdd6),
+    (0xe31, 0xe31),
+    (0xe34, 0xe3a),
+    (0xe47, 0xe4e),
+    (0xeb1, 0xeb1),
+    (0xeb4, 0xebc),
+    (0xec8, 0xecd),
+    (0xf18, 0xf19),
+    (0xf35, 0xf35),
+    (0xf37, 0xf37),
+    (0xf39, 0xf39),
+    (0xf71, 0xf7e),
+    (0xf80, 0xf84),
+    (0xf86, 0xf87),
+    (0xf8d, 0xf97),
+    (0xf99, 0xfbc),
+    (0xfc6, 0xfc6),
+    (0x102d, 0x1030),
+    (0x1032, 0x1037),
+    (0x1039, 0x103a),
+    (0x103d, 0x103e),
+    (0x1058, 0x1059),
+    (0x105e, 0x1060),
+    (0x1071, 0x1074),
+    (0x1082, 0x1082),
+    (0x1085, 0x1086),
+    (0x108d, 0x108d),
+    (0x109d, 0x109d),
+    (0x1160, 0x11ff),
+    (0x135d, 0x135f),
+    (0x1712, 0x1714),
+    (0x1732, 0x1733),
+    (0x1752, 0x1753),
+    (0x1772, 0x1773),
+    (0x17b4, 0x17b5),
+    (0x17b7, 0x17bd),
+    (0x17c6, 0x17c6),
+    (0x17c9, 0x17d3),
+    (0x17dd, 0x17dd),
+    (0x180b, 0x180f),
+    (0x1885, 0x1886),
+    (0x18a9, 0x18a9),
+    (0x1920, 0x1922),
+    (0x1927, 0x1928),
+    (0x1932, 0x1932),
+    (0x1939, 0x193b),
+    (0x1a17, 0x1a18),
+    (0x1a1b, 0x1a1b),
+    (0x1a56, 0x1a56),
+    (0x1a58, 0x1a5e),
+    (0x1a60, 0x1a60),
+    (0x1a62, 0x1a62),
+    (0x1a65, 0x1a6c),
+    (0x1a73, 0x1a7c),
+    (0x1a7f, 0x1a7f),
+    (0x1ab0, 0x1ace),
+    (0x1b00, 0x1b03),
+    (0x1b34, 0x1b34),
+    (0x1b36, 0x1b3a),
+    (0x1b3c, 0x1b3c),
+    (0x1b42, 0x1b42),
+    (0x1b6b, 0x1b73),
+    (0x1b80, 0x1b81),
+    (0x1ba2, 0x1ba5),
+    (0x1ba8, 0x1ba9),
+    (0x1bab, 0x1bad),
+    (0x1be6, 0x1be6),
+    (0x1be8, 0x1be9),
+    (0x1bed, 0x1bed),
+    (0x1bef, 0x1bf1),
+    (0x1c2c, 0x1c33),
+    (0x1c36, 0x1c37),
+    (0x1cd0, 0x1cd2),
+    (0x1cd4, 0x1ce0),
+    (0x1ce2, 0x1ce8),
+    (0x1ced, 0x1ced),
+    (0x1cf4, 0x1cf4),
+    (0x1cf8, 0x1cf9),
+    (0x1dc0, 0x1dff),
+    (0x200b, 0x200f),
+    (0x202a, 0x202e),
+    (0x2060, 0x2064),
+    (0x2066, 0x206f),
+    (0x20d0, 0x20f0),
+    (0x2cef, 0x2cf1),
+    (0x2d7f, 0x2d7f),
+    (0x2de0, 0x2dff),
+    (0x302a, 0x302d),
+    (0x3099, 0x309a),
+    (0xa66f, 0xa672),
+    (0xa674, 0xa67d),
+    (0xa69e, 0xa69f),
+    (0xa6f0, 0xa6f1),
+    (0xa802, 0xa802),
+    (0xa806, 0xa806),
+    (0xa80b, 0xa80b),
+    (0xa825, 0xa826),
+    (0xa82c, 0xa82c),
+    (0xa8c4, 0xa8c5),
+    (0xa8e0, 0xa8f1),
+    (0xa8ff, 0xa8ff),
+    (0xa926, 0xa92d),
+    (0xa947, 0xa951),
+    (0xa980, 0xa982),
+    (0xa9b3, 0xa9b3),
+    (0xa9b6, 0xa9b9),
+    (0xa9bc, 0xa9bd),
+    (0xa9e5, 0xa9e5),
+    (0xaa29, 0xaa2e),
+    (0xaa31, 0xaa32),
+    (0xaa35, 0xaa36),
+    (0xaa43, 0xaa43),
+    (0xaa4c, 0xaa4c),
+    (0xaa7c, 0xaa7c),
+    (0xaab0, 0xaab0),
+    (0xaab2, 0xaab4),
+    (0xaab7, 0xaab8),
+    (0xaabe, 0xaabf),
+    (0xaac1, 0xaac1),
+    (0xaaec, 0xaaed),
+    (0xaaf6, 0xaaf6),
+    (0xabe5, 0xabe5),
+    (0xabe8, 0xabe8),
+    (0xabed, 0xabed),
+    (0xfb1e, 0xfb1e),
+    (0xfe00, 0xfe0f),
+    (0xfe20, 0xfe2f),
+    (0xfeff, 0xfeff),
+    (0xfff9, 0xfffb),
+    (0x101fd, 0x101fd),
+    (0x102e0, 0x102e0),
+    (0x10376, 0x1037a),
+    (0x10a01, 0x10a03),
+    (0x10a05, 0x10a06),
+    (0x10a0c, 0x10a0f),
+    (0x10a38, 0x10a3a),
+    (0x10a3f, 0x10a3f),
+    (0x10ae5, 0x10ae6),
+    (0x10d24, 0x10d27),
+    (0x10eab, 0x10eac),
+    (0x10f46, 0x10f50),
+    (0x10f82, 0x10f85),
+    (0x11001, 0x11001),
+    (0x11038, 0x11046),
+    (0x11070, 0x11070),
+    (0x11073, 0x11074),
+    (0x1107f, 0x11081),
+    (0x110b3, 0x110b6),
+    (0x110b9, 0x110ba),
+    (0x110bd, 0x110bd),
+    (0x110c2, 0x110c2),
+    (0x110cd, 0x110cd),
+    (0x11100, 0x11102),
+    (0x11127, 0x1112b),
+    (0x1112d, 0x11134),
+    (0x11173, 0x11173),
+    (0x11180, 0x11181),
+    (0x111b6, 0x111be),
+    (0x111c9, 0x111cc),
+    (0x111cf, 0x111cf),
+    (0x1122f, 0x11231),
+    (0x11234, 0x11234),
+    (0x11236, 0x11237),
+    (0x1123e, 0x1123e),
+    (0x112df, 0x112df),
+    (0x112e3, 0x112ea),
+    (0x11300, 0x11301),
+    (0x1133b, 0x1133c),
+    (0x11340, 0x11340),
+    (0x11366, 0x1136c),
+    (0x11370, 0x11374),
+    (0x11438, 0x1143f),
+    (0x11442, 0x11444),
+    (0x11446, 0x11446),
+    (0x1145e, 0x1145e),
+    (0x114b3, 0x114b8),
+    (0x114ba, 0x114ba),
+    (0x114bf, 0x114c0),
+    (0x114c2, 0x114c3),
+    (0x115b2, 0x115b5),
+    (0x115bc, 0x115bd),
+    (0x115bf, 0x115c0),
+    (0x115dc, 0x115dd),
+    (0x11633, 0x1163a),
+    (0x1163d, 0x1163d),
+    (0x1163f, 0x11640),
+    (0x116ab, 0x116ab),
+    (0x116ad, 0x116ad),
+    (0x116b0, 0x116b5),
+    (0x116b7, 0x116b7),
+    (0x1171d, 0x1171f),
+    (0x11722, 0x11725),
+    (0x11727, 0x1172b),
+    (0x1182f, 0x11837),
+    (0x11839, 0x1183a),
+    (0x1193b, 0x1193c),
+    (0x1193e, 0x1193e),
+    (0x11943, 0x11943),
+    (0x119d4, 0x119d7),
+    (0x119da, 0x119db),
+    (0x119e0, 0x119e0),
+    (0x11a01, 0x11a0a),
+    (0x11a33, 0x11a38),
+    (0x11a3b, 0x11a3e),
+    (0x11a47, 0x11a47),
+    (0x11a51, 0x11a56),
+    (0x11a59, 0x11a5b),
+    (0x11a8a, 0x11a96),
+    (0x11a98, 0x11a99),
+    (0x11c30, 0x11c36),
+    (0x11c38, 0x11c3d),
+    (0x11c3f, 0x11c3f),
+    (0x11c92, 0x11ca7),
+    (0x11caa, 0x11cb0),
+    (0x11cb2, 0x11cb3),
+    (0x11cb5, 0x11cb6),
+    (0x11d31, 0x11d36),
+    (0x11d3a, 0x11d3a),
+    (0x11d3c, 0x11d3d),
+    (0x11d3f, 0x11d45),
+    (0x11d47, 0x11d47),
+    (0x11d90, 0x11d91),
+    (0x11d95, 0x11d95),
+    (0x11d97, 0x11d97),
+    (0x11ef3, 0x11ef4),
+    (0x13430, 0x13438),
+    (0x16af0, 0x16af4),
+    (0x16b30, 0x16b36),
+    (0x16f4f, 0x16f4f),
+    (0x16f8f, 0x16f92),
+    (0x16fe4, 0x16fe4),
+    (0x1bc9d, 0x1bc9e),
+    (0x1bca0, 0x1bca3),
+    (0x1cf00, 0x1cf2d),
+    (0x1cf30, 0x1cf46),
+    (0x1d167, 0x1d169),
+    (0x1d173, 0x1d182),
+    (0x1d185, 0x1d18b),
+    (0x1d1aa, 0x1d1ad),
+    (0x1d242, 0x1d244),
+    (0x1da00, 0x1da36),
+    (0x1da3b, 0x1da6c),
+    (0x1da75, 0x1da75),
+    (0x1da84, 0x1da84),
+    (0x1da9b, 0x1da9f),
+    (0x1daa1, 0x1daaf),
+    (0x1e000, 0x1e006),
+    (0x1e008, 0x1e018),
+    (0x1e01b, 0x1e021),
+    (0x1e023, 0x1e024),
+    (0x1e026, 0x1e02a),
+    (0x1e130, 0x1e136),
+    (0x1e2ae, 0x1e2ae),
+    (0x1e2ec, 0x1e2ef),
+    (0x1e8d0, 0x1e8d6),
+    (0x1e944, 0x1e94a),
+    (0xe0001, 0xe0001),
+    (0xe0020, 0xe007f),
+    (0xe0100, 0xe01ef),
+];
+
+const WIDE_CHARACTER_RANGES: &[(u32, u32)] = &[
+    (0x1100, 0x115f),
+    (0x231a, 0x231b),
+    (0x2329, 0x232a),
+    (0x23e9, 0x23ec),
+    (0x23f0, 0x23f0),
+    (0x23f3, 0x23f3),
+    (0x25fd, 0x25fe),
+    (0x2614, 0x2615),
+    (0x2648, 0x2653),
+    (0x267f, 0x267f),
+    (0x2693, 0x2693),
+    (0x26a1, 0x26a1),
+    (0x26aa, 0x26ab),
+    (0x26bd, 0x26be),
+    (0x26c4, 0x26c5),
+    (0x26ce, 0x26ce),
+    (0x26d4, 0x26d4),
+    (0x26ea, 0x26ea),
+    (0x26f2, 0x26f3),
+    (0x26f5, 0x26f5),
+    (0x26fa, 0x26fa),
+    (0x26fd, 0x26fd),
+    (0x2705, 0x2705),
+    (0x270a, 0x270b),
+    (0x2728, 0x2728),
+    (0x274c, 0x274c),
+    (0x274e, 0x274e),
+    (0x2753, 0x2755),
+    (0x2757, 0x2757),
+    (0x2795, 0x2797),
+    (0x27b0, 0x27b0),
+    (0x27bf, 0x27bf),
+    (0x2b1b, 0x2b1c),
+    (0x2b50, 0x2b50),
+    (0x2b55, 0x2b55),
+    (0x2e80, 0x2e99),
+    (0x2e9b, 0x2ef3),
+    (0x2f00, 0x2fd5),
+    (0x2ff0, 0x2ffb),
+    (0x3000, 0x303e),
+    (0x3041, 0x3096),
+    (0x3099, 0x30ff),
+    (0x3105, 0x312f),
+    (0x3131, 0x318e),
+    (0x3190, 0x31e3),
+    (0x31f0, 0x321e),
+    (0x3220, 0x3247),
+    (0x3250, 0x4dbf),
+    (0x4e00, 0xa48c),
+    (0xa490, 0xa4c6),
+    (0xa960, 0xa97c),
+    (0xac00, 0xd7a3),
+    (0xf900, 0xfa6d),
+    (0xfa70, 0xfad9),
+    (0xfe10, 0xfe19),
+    (0xfe30, 0xfe52),
+    (0xfe54, 0xfe66),
+    (0xfe68, 0xfe6b),
+    (0xff01, 0xff60),
+    (0xffe0, 0xffe6),
+    (0x16fe0, 0x16fe4),
+    (0x16ff0, 0x16ff1),
+    (0x17000, 0x187f7),
+    (0x18800, 0x18cd5),
+    (0x18d00, 0x18d08),
+    (0x1aff0, 0x1aff3),
+    (0x1aff5, 0x1affb),
+    (0x1affd, 0x1affe),
+    (0x1b000, 0x1b122),
+    (0x1b150, 0x1b152),
+    (0x1b164, 0x1b167),
+    (0x1b170, 0x1b2fb),
+    (0x1f004, 0x1f004),
+    (0x1f0cf, 0x1f0cf),
+    (0x1f18e, 0x1f18e),
+    (0x1f191, 0x1f19a),
+    (0x1f1e6, 0x1f202),
+    (0x1f210, 0x1f23b),
+    (0x1f240, 0x1f248),
+    (0x1f250, 0x1f251),
+    (0x1f260, 0x1f265),
+    (0x1f300, 0x1f320),
+    (0x1f32d, 0x1f335),
+    (0x1f337, 0x1f37c),
+    (0x1f37e, 0x1f393),
+    (0x1f3a0, 0x1f3ca),
+    (0x1f3cf, 0x1f3d3),
+    (0x1f3e0, 0x1f3f0),
+    (0x1f3f4, 0x1f3f4),
+    (0x1f3f8, 0x1f43e),
+    (0x1f440, 0x1f440),
+    (0x1f442, 0x1f4fc),
+    (0x1f4ff, 0x1f53d),
+    (0x1f54b, 0x1f54e),
+    (0x1f550, 0x1f567),
+    (0x1f57a, 0x1f57a),
+    (0x1f595, 0x1f596),
+    (0x1f5a4, 0x1f5a4),
+    (0x1f5fb, 0x1f64f),
+    (0x1f680, 0x1f6c5),
+    (0x1f6cc, 0x1f6cc),
+    (0x1f6d0, 0x1f6d2),
+    (0x1f6d5, 0x1f6df),
+    (0x1f6eb, 0x1f6ef),
+    (0x1f6f4, 0x1f6ff),
+    (0x1f774, 0x1f77f),
+    (0x1f7d9, 0x1f7ff),
+    (0x1f80c, 0x1f80f),
+    (0x1f848, 0x1f84f),
+    (0x1f85a, 0x1f85f),
+    (0x1f888, 0x1f88f),
+    (0x1f8ae, 0x1f8af),
+    (0x1f8b2, 0x1f8ff),
+    (0x1f90c, 0x1f93a),
+    (0x1f93c, 0x1f945),
+    (0x1f947, 0x1f9ff),
+    (0x1fa54, 0x1fa5f),
+    (0x1fa6e, 0x1faff),
+    (0x20000, 0x3fffd),
+];
+
+fn character_width(character: char) -> usize {
+    if character.is_control() || in_character_ranges(character, ZERO_WIDTH_RANGES) {
+        0
+    } else if in_character_ranges(character, WIDE_CHARACTER_RANGES) {
+        2
+    } else {
+        1
     }
-    fitted
+}
+
+fn in_character_ranges(character: char, ranges: &[(u32, u32)]) -> bool {
+    let code = character as u32;
+    ranges
+        .binary_search_by(|(start, end)| {
+            if *end < code {
+                std::cmp::Ordering::Less
+            } else if *start > code {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 /// Drops click targets the frame has no room to draw and clamps the rest to the
@@ -4095,16 +5346,41 @@ fn fit_targets(layout: &mut Layout, width: usize) {
     }
 }
 
-fn truncate(value: &str, max_chars: usize) -> String {
-    let count = value.chars().count();
-    if count <= max_chars {
+fn truncate(value: &str, max_columns: usize) -> String {
+    if display_width(value) <= max_columns {
         return value.to_string();
     }
-    value
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>()
-        + "…"
+    if max_columns == 0 {
+        return String::new();
+    }
+    let fitted = fit_to_width(value, max_columns - 1);
+    // Plain labels inherit the surrounding row style; a reset emitted by the
+    // line clipper would cancel that style halfway through a selected row.
+    let prefix = if value.contains('\x1b') {
+        fitted.as_str()
+    } else {
+        fitted.trim_end_matches(RESET)
+    };
+    prefix.to_string() + "…"
+}
+
+/// Colour escapes pass through without consuming columns. Appending RESET on
+/// clipping keeps a selected row's style from spilling into the following row.
+fn fit_to_width(line: &str, width: usize) -> String {
+    let mut fitted = String::new();
+    let mut visible = 0;
+    let mut start = 0;
+    while start < line.len() {
+        let (end, columns) = display_unit(line, start);
+        if visible + columns > width {
+            fitted.push_str(RESET);
+            break;
+        }
+        fitted.push_str(&line[start..end]);
+        visible += columns;
+        start = end;
+    }
+    fitted
 }
 
 #[cfg(test)]
@@ -4123,6 +5399,7 @@ mod tests {
             cpu,
             rss_kib: rss,
             footprint_kib: rss,
+            footprint_available: true,
             elapsed: "01:00".into(),
             age_seconds: 60,
             command: command.into(),
@@ -4261,6 +5538,52 @@ mod tests {
         assert!(!history.alert_active, "kept a dead process's leak alert");
     }
 
+    /// The login tracker and the TUI both record by default, each holding its
+    /// own view of the file. Before this, whichever saved last replaced the
+    /// file wholesale and the other's rows were gone for good.
+    #[test]
+    fn a_save_keeps_what_another_writer_recorded() {
+        let directory =
+            env::temp_dir().join(format!("ghostty-top-two-writers-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("usage.tsv");
+
+        // What the tracker had written before the TUI started.
+        fs::write(&path, "2026-08-18\ttab-AAA\t3600\tAlpha\n").unwrap();
+        let mut tui = UsageStore::load(Some(path.clone()));
+
+        // The tracker keeps going while the TUI holds its snapshot: it extends
+        // a tab the TUI knows about and starts one it does not.
+        fs::write(
+            &path,
+            "2026-08-18\ttab-AAA\t7200\tAlpha\n2026-08-18\ttab-BBB\t1800\tBravo\n",
+        )
+        .unwrap();
+
+        tui.add(
+            "2026-08-18",
+            &FocusedTab {
+                tab_id: "tab-CCC".into(),
+                tab_name: "Charlie".into(),
+                terminal_id: String::new(),
+                terminal_name: String::new(),
+            },
+            25,
+        );
+        tui.save().unwrap();
+
+        let merged = UsageStore::load(Some(path.clone()));
+        let today = &merged.days["2026-08-18"];
+        assert_eq!(
+            today["tab-AAA"].seconds, 7200,
+            "the tracker's hour was reverted"
+        );
+        assert_eq!(today["tab-BBB"].seconds, 1800, "a whole tab was deleted");
+        assert_eq!(today["tab-CCC"].seconds, 25, "the TUI lost its own row");
+        let _ = fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn saves_and_loads_daily_tab_usage() {
         let directory =
@@ -4324,6 +5647,7 @@ mod tests {
 
     fn herdr_pane(tab_id: &str, label: &str) -> HerdrPane {
         HerdrPane {
+            session: "default".into(),
             tab_id: tab_id.into(),
             label: label.into(),
         }
@@ -4332,14 +5656,7 @@ mod tests {
     #[test]
     fn herdr_panes_are_grouped_by_tab_under_their_server() {
         let processes = vec![
-            p(
-                10,
-                1,
-                "??",
-                0.5,
-                30_000,
-                "/Users/me/.local/bin/herdr server",
-            ),
+            p(10, 1, "??", 0.5, 30_000, "/Users/me/.local/bin/herdr"),
             p(11, 10, "ttys011", 0.0, 2_000, "-zsh"),
             p(12, 11, "ttys011", 4.0, 400_000, "claude"),
             p(13, 10, "ttys013", 0.0, 2_000, "-zsh"),
@@ -4410,23 +5727,36 @@ mod tests {
     #[test]
     fn an_undescribed_herdr_pane_stands_alone_under_its_tty() {
         let processes = vec![
-            p(10, 1, "??", 0.0, 1_000, "herdr --session work server"),
+            p(10, 1, "??", 0.0, 1_000, "herdr"),
             p(11, 10, "ttys011", 0.0, 2_000, "-zsh"),
+            p(21, 10, "ttys021", 0.0, 2_000, "-zsh"),
         ];
-        let terminals = herdr_terminals(&processes, &HashMap::new());
+        let mut work = herdr_pane("w1:t1", "Agents › api");
+        work.session = "work".into();
+        let terminals = herdr_terminals(&processes, &HashMap::from([(21, work)]));
         let labels: Vec<String> = (0..terminals.len())
             .map(|index| tree_label(&terminals, index))
             .collect();
-        assert_eq!(labels, vec!["herdr server · work", "└─ ttys011"]);
+        assert_eq!(
+            labels,
+            vec!["herdr server · work", "├─ ttys011", "└─ Agents › api"]
+        );
     }
 
     #[test]
-    fn only_a_running_herdr_server_is_a_server() {
-        assert!(is_herdr_server("/Users/me/.local/bin/herdr server"));
-        assert!(is_herdr_server("herdr --session work server"));
-        assert!(!is_herdr_server("herdr"));
-        assert!(!is_herdr_server("herdr server stop"));
-        assert!(!is_herdr_server("node server"));
+    fn the_herdr_server_is_the_herdr_without_a_terminal() {
+        assert!(is_herdr_server(&p(
+            1,
+            1,
+            "??",
+            0.0,
+            1,
+            "/Users/me/.local/bin/herdr"
+        )));
+        assert!(is_herdr_server(&p(1, 1, "?", 0.0, 1, "herdr")));
+        // The client runs inside a Ghostty tab.
+        assert!(!is_herdr_server(&p(1, 1, "ttys005", 0.0, 1, "herdr")));
+        assert!(!is_herdr_server(&p(1, 1, "??", 0.0, 1, "node")));
     }
 
     #[test]
@@ -4958,6 +6288,21 @@ mod tests {
         assert!(!is_ghostty_app("ghostty-top"));
     }
 
+    /// The budget and the credit window are two halves of one rule: a query
+    /// that answers slowly still has to be payable, or raising the budget just
+    /// moves the loss instead of fixing it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_slow_focus_query_still_lands_inside_the_credit_window() {
+        assert!(
+            USAGE_POLL_INTERVAL + USAGE_SAMPLE_TIMEOUT <= MAX_CREDITED_GAP,
+            "a query that uses its whole budget would be sampled {:?} after the \
+             previous one, past the {:?} that credited_time will pay out",
+            USAGE_POLL_INTERVAL + USAGE_SAMPLE_TIMEOUT,
+            MAX_CREDITED_GAP,
+        );
+    }
+
     #[test]
     fn sleep_and_stalls_are_not_counted_as_focused_time() {
         let start = Instant::now();
@@ -5240,10 +6585,11 @@ mod tests {
             app.terminals.push(Terminal {
                 root_pid: 100 + index,
                 tty: format!("ttys{index:03}"),
-                label: format!("a tab name that is quite long {index}"),
+                label: format!("日本語 e\u{301} 🐈‍⬛ a tab name {index}"),
                 cpu: index as f64 * 7.5,
                 rss_kib: 4096 * (index as u64 + 1),
                 footprint_kib: 5120 * (index as u64 + 1),
+                footprint_complete: true,
                 processes: vec![p(
                     200 + index,
                     100 + index,
@@ -5252,7 +6598,7 @@ mod tests {
                     4096,
                     "node server.js --flag",
                 )],
-                activity: "node".into(),
+                activity: "👩🏽‍💻 node".into(),
                 elapsed: "01:02:03".into(),
                 age_seconds: 3_723,
                 memory_growth_kib: 1024,
@@ -5262,6 +6608,7 @@ mod tests {
                 leak_process: "node".into(),
                 leak_growth_kib: 96 * 1024,
                 herdr_server: None,
+                leak_span: Duration::from_secs(900),
             });
         }
         app
@@ -5297,8 +6644,12 @@ mod tests {
                             for width in [0, 1, 2, 3, 5, 10, 20, 40, 60, 80, 100, 140, 300] {
                                 let (monitor, _) = render_monitor(app, height, width);
                                 let (usage, _) = render_usage(app, height, width);
-                                assert!(!monitor.is_empty());
-                                assert!(!usage.is_empty());
+                                assert!(monitor.len() <= height);
+                                assert!(usage.len() <= height);
+                                if height > 0 {
+                                    assert!(!monitor.is_empty());
+                                    assert!(!usage.is_empty());
+                                }
                             }
                         }
                     }
@@ -5315,7 +6666,10 @@ mod tests {
         let (rows, columns) = terminal_size();
         assert!(rows > 0 && columns > 0, "terminal size must never be zero");
 
-        for (frame, _) in [render_monitor(&app, 0, 0), render_usage(&app, 0, 0)] {
+        for (frame, _) in [
+            render_monitor(&app, rows, columns),
+            render_usage(&app, rows, columns),
+        ] {
             assert!(!frame.is_empty());
         }
     }
@@ -5337,7 +6691,7 @@ mod tests {
                             ("usage", render_usage(&app, height, width).0),
                         ] {
                             for line in frame {
-                                let visible = strip_ansi(&line).chars().count();
+                                let visible = display_width(&line);
                                 assert!(
                                     visible <= width,
                                     "{name} line of {visible} columns at width {width}: {:?}",
@@ -5426,7 +6780,7 @@ mod tests {
                 for width in [40, 100, 200] {
                     let (lines, _) = render_usage(&app, 30, width);
                     for line in lines {
-                        assert!(strip_ansi(&line).chars().count() <= width);
+                        assert!(display_width(&line) <= width);
                     }
                 }
             }
@@ -5558,8 +6912,674 @@ mod tests {
         let row = process_history_row(1_000, "2026-08-06", "terminal", "ttys001", 7, &process);
         // pid, ppid, cpu, footprint, resident.
         assert!(row.contains("\t42\t7\t12.5\t8192\t4096\t"));
-        assert!(row.ends_with("\tpython3\t/usr/bin/python3"));
+        assert!(row.ends_with("\tpython3\t/usr/bin/python3\ttrue"));
         assert!(!row.contains("server.py"));
         assert!(!row.contains("secret"));
+    }
+
+    #[test]
+    fn sustained_growth_is_detected_even_on_a_large_footprint() {
+        let start = Instant::now();
+        for baseline in [544 * 1024, 8 * 1024 * 1024] {
+            let samples = (0..=12)
+                .map(|index| {
+                    (
+                        start + Duration::from_secs(index * 20),
+                        baseline + index * 5 * 1024,
+                    )
+                })
+                .collect();
+            let trend = analyze_memory_history(&samples);
+            assert!(
+                trend.suspected,
+                "missed the same growth on baseline {baseline}"
+            );
+            assert_eq!(trend.span, Duration::from_secs(240));
+        }
+    }
+
+    #[test]
+    fn large_back_and_forth_allocations_are_not_a_steady_leak() {
+        let start = Instant::now();
+        let samples = (0..=12)
+            .map(|index| {
+                (
+                    start + Duration::from_secs(index * 20),
+                    (8 * 1024 + index * 8 + if index % 2 == 0 { 16 } else { 0 }) * 1024,
+                )
+            })
+            .collect();
+        assert!(!analyze_memory_history(&samples).suspected);
+    }
+
+    #[test]
+    fn growth_span_follows_the_retained_window() {
+        let start = Instant::now();
+        let mut history = MemoryHistory::default();
+        let mut trend = MemoryTrend::default();
+        for step in 0..=60 {
+            trend = history.record(
+                start + Duration::from_secs(step * 60),
+                (100 + step * 5) * 1024,
+                step * 60,
+            );
+        }
+        assert_eq!(trend.span, HISTORY_WINDOW);
+        assert!(trend.growth_kib < 300 * 1024);
+    }
+
+    #[test]
+    fn simultaneous_usage_writers_preserve_every_tab() {
+        let directory =
+            env::temp_dir().join(format!("ghostty-top-concurrent-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("usage.tsv");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let mut store = UsageStore::load(Some(path));
+                    store.add(
+                        "2026-08-18",
+                        &FocusedTab {
+                            tab_id: format!("tab-{index}"),
+                            tab_name: format!("Tab {index}"),
+                            terminal_id: String::new(),
+                            terminal_name: String::new(),
+                        },
+                        60,
+                    );
+                    barrier.wait();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        match store.save() {
+                            Ok(()) => break,
+                            Err(error)
+                                if error.kind() == io::ErrorKind::WouldBlock
+                                    && Instant::now() < deadline =>
+                            {
+                                thread::yield_now()
+                            }
+                            Err(error) => panic!("save failed: {error}"),
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let store = UsageStore::load(Some(path));
+        assert_eq!(store.days["2026-08-18"].len(), 8);
+        assert!(store.days["2026-08-18"]
+            .values()
+            .all(|tab| tab.seconds == 60));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_busy_usage_file_is_retried_without_losing_pending_time() {
+        let directory = env::temp_dir().join(format!("ghostty-top-locked-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("usage.tsv");
+        let lock = lock_file(&path).unwrap();
+        let mut store = UsageStore::load(Some(path.clone()));
+        store.add(
+            "2026-08-18",
+            &FocusedTab {
+                tab_id: "tab".into(),
+                tab_name: "Name".into(),
+                terminal_id: String::new(),
+                terminal_name: String::new(),
+            },
+            30,
+        );
+        assert_eq!(store.save().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(store.dirty);
+        assert!(!path.exists());
+        drop(lock);
+        store.save().unwrap();
+        assert_eq!(
+            UsageStore::load(Some(path)).days["2026-08-18"]["tab"].seconds,
+            30
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resident_fallback_is_visible_in_the_tab_and_process_readings() {
+        let mut process = p(11, 10, "ttys001", 0.0, 4 * 1024, "node");
+        process.footprint_available = false;
+        let processes = vec![
+            p(1, 0, "??", 0.0, 32 * 1024, "ghostty"),
+            p(10, 1, "ttys001", 0.0, 1024, "/usr/bin/login"),
+            process,
+        ];
+        let (ghostty, terminals) = aggregate(&processes);
+        assert!(!terminals[0].footprint_complete);
+        let mut app = App::new(Duration::from_secs(1));
+        app.terminals = terminals;
+        app.ghostty = ghostty;
+        app.expanded = true;
+        let (frame, _) = render_monitor(&app, 30, 100);
+        assert!(frame.iter().any(|line| line.contains("4.0MiB~")));
+        assert!(frame
+            .iter()
+            .any(|line| line.contains("resident-size fallback")));
+        assert!(process_history_row(
+            100,
+            "2026-08-18",
+            "terminal",
+            "ttys001",
+            10,
+            &app.terminals[0].processes[0]
+        )
+        .ends_with("\tfalse"));
+    }
+
+    #[test]
+    fn switching_memory_metrics_starts_a_new_leak_series() {
+        let start = Instant::now();
+        let mut history = MemoryHistory::default();
+        let mut process = p(11, 10, "ttys001", 0.0, 100 * 1024, "node");
+        history.record_reading(start, &process);
+        process.footprint_kib = 120 * 1024;
+        history.record_reading(start + Duration::from_secs(1), &process);
+        assert_eq!(history.samples.len(), 2);
+        process.footprint_available = false;
+        process.footprint_kib = process.rss_kib;
+        history.record_reading(start + Duration::from_secs(2), &process);
+        assert_eq!(history.samples.len(), 1);
+        assert_eq!(history.samples[0].1, 100 * 1024);
+    }
+
+    #[test]
+    fn history_rotation_keeps_recent_files_with_one_header_each() {
+        let directory =
+            env::temp_dir().join(format!("ghostty-top-rotation-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("resources-v3.tsv");
+        for index in 0..8 {
+            let mut file = open_history_file_with_limit(&path, "header", 10).unwrap();
+            writeln!(file, "record-{index}").unwrap();
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), "header\nrecord-7\n");
+        for index in 1..=HISTORY_BACKUPS {
+            assert_eq!(
+                fs::read_to_string(history_backup(&path, index)).unwrap(),
+                format!("header\nrecord-{}\n", 7 - index)
+            );
+        }
+        assert!(!history_backup(&path, HISTORY_BACKUPS + 1).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn new_telemetry_schema_removes_only_its_superseded_files() {
+        let directory =
+            env::temp_dir().join(format!("ghostty-top-migration-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        for name in [
+            "resources-v1.tsv",
+            "resources-v2.tsv",
+            "processes-v2.tsv",
+            "usage.tsv",
+            "tab-history-v1.tsv",
+        ] {
+            fs::write(directory.join(name), "keep-or-remove").unwrap();
+        }
+        let path = directory.join("resources-v3.tsv");
+        drop(open_history_file_with_limit(&path, "header", 10).unwrap());
+        assert!(!directory.join("resources-v1.tsv").exists());
+        assert!(!directory.join("resources-v2.tsv").exists());
+        for name in ["processes-v2.tsv", "usage.tsv", "tab-history-v1.tsv"] {
+            assert_eq!(
+                fs::read_to_string(directory.join(name)).unwrap(),
+                "keep-or-remove"
+            );
+        }
+        // Cleanup is a migration, not a deletion repeated at every append.
+        fs::write(
+            directory.join("resources-v2.tsv"),
+            "older tracker restarted",
+        )
+        .unwrap();
+        drop(open_history_file_with_limit(&path, "header", 10).unwrap());
+        assert!(directory.join("resources-v2.tsv").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_history_snapshot_excludes_other_writers_until_it_finishes() {
+        let directory =
+            env::temp_dir().join(format!("ghostty-top-history-lock-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("tab-history-v1.tsv");
+        let mut file = open_history_file_with_limit(&path, "header", 10).unwrap();
+        assert_eq!(
+            open_history_file_with_limit(&path, "header", 10)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        writeln!(file, "snapshot").unwrap();
+        drop(file);
+        drop(open_history_file_with_limit(&path, "header", 10).unwrap());
+        assert_eq!(
+            fs::read_to_string(history_backup(&path, 1)).unwrap(),
+            "header\nsnapshot\n"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn memory_figures_promote_before_rounding_widens_the_column() {
+        assert_eq!(human_bytes(1023), "1023 KiB");
+        assert_eq!(human_bytes(1024), "1.0 MiB");
+        assert_eq!(human_bytes(1_048_524), "1.0 GiB");
+        assert_eq!(human_bytes(1_023_948), "999.9 MiB");
+        assert_eq!(human_bytes(1_023_949), "1.0 GiB");
+        assert_eq!(human_bytes(1_048_525), "1.0 GiB");
+        assert_eq!(human_bytes(1024_u64.pow(3)), "1.0 TiB");
+        assert_eq!(human_bytes(u64::MAX), "16.0 ZiB");
+        for power in 1..=6 {
+            let boundary = 1024_u64.pow(power);
+            for value in [boundary - 1, boundary, boundary + 1] {
+                assert!(human_bytes(value).len() <= 9, "{value}");
+            }
+        }
+        for power in 1..=5 {
+            for amount in 999..=1025 {
+                let value = amount * 1024_u64.pow(power);
+                assert!(human_bytes(value).len() <= 9, "{value}");
+                assert!(memory_value(value, false).len() <= 9, "fallback {value}");
+            }
+        }
+        assert!(human_bytes(u64::MAX).len() <= 9);
+    }
+
+    #[test]
+    fn expanded_monitor_reserves_space_for_all_status_messages() {
+        let mut app = populated_app(UsageScale::Daily);
+        app.expanded = true;
+        app.terminals[0].processes = vec![p(201, 100, "ttys000", 1.0, 4096, "node"); 100];
+        app.terminals[0].footprint_complete = false;
+        app.usage_tracker.as_mut().unwrap().last_error = Some("focus query timed out".into());
+        app.last_error = Some("process query failed".into());
+        let (frame, _) = render_monitor(&app, 24, 100);
+        for text in [
+            "Tracking paused",
+            "~ RAM includes",
+            "Sampling error",
+            "over 15m",
+        ] {
+            assert!(
+                frame.iter().any(|line| strip_ansi(line).contains(text)),
+                "{text}"
+            );
+        }
+        assert!(frame.len() <= 24);
+    }
+
+    #[test]
+    fn joining_only_collapses_emoji_sequences() {
+        assert_eq!(display_width("a\u{200d}b"), 2);
+        assert_eq!(display_width("🐈\u{200d}x"), 3);
+        assert_eq!(display_width("👩🏽‍💻"), 2);
+        assert_eq!(display_width("🐈‍⬛"), 2);
+        assert_eq!(display_width("🌡"), 1);
+        assert_eq!(display_width("🌡️"), 2);
+    }
+
+    #[test]
+    fn narrow_footers_keep_the_primary_controls_clickable() {
+        for view in [View::Monitor, View::Usage] {
+            let action = if view == View::Monitor {
+                ClickAction::ShowUsage
+            } else {
+                ClickAction::ShowMonitor
+            };
+            for width in 1..=30 {
+                let (line, zones) = view_hint(4, width, view);
+                let text = strip_ansi(&line);
+                assert!(display_width(&line) <= width, "{text:?} at {width}");
+                assert!(zones.iter().any(|zone| zone.action == ClickAction::Quit));
+                if width >= 3 {
+                    assert!(zones.iter().any(|zone| zone.action == action));
+                }
+                for zone in zones {
+                    assert!(zone.start_column <= zone.end_column && zone.end_column <= width);
+                    assert_eq!(zone.row, 4);
+                    let first = text.chars().nth(zone.start_column - 1).unwrap();
+                    assert_eq!(
+                        first,
+                        if zone.action == ClickAction::Quit {
+                            'q'
+                        } else {
+                            'u'
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_is_measured_and_padded_in_terminal_columns() {
+        for (text, columns) in [
+            ("日本語", 6),
+            ("e\u{301}", 1),
+            ("🐈‍⬛", 2),
+            ("👩🏽‍💻", 2),
+            ("🇺🇸", 2),
+            ("1\u{fe0f}\u{20e3}", 2),
+            ("❤️", 2),
+            ("ＡＢ", 4),
+        ] {
+            assert_eq!(display_width(text), columns, "{text:?}");
+            assert_eq!(display_width(&pad_to_width(text, 12, false)), 12);
+            assert_eq!(display_width(&pad_to_width(text, 12, true)), 12);
+        }
+        assert_eq!(display_width("\x1b[31m日本語\x1b[0m"), 6);
+        assert_eq!(truncate("日本語", 4), "日…");
+        assert_eq!(truncate("abc", 0), "");
+        assert_eq!(truncate("🐈‍⬛abc", 2), "…");
+        assert_eq!(fit_to_width("e\u{301}xy", 1), "e\u{301}\x1b[0m");
+        assert_eq!(fit_to_width("🐈‍⬛abc", 2), "🐈‍⬛\x1b[0m");
+        assert_eq!(display_width(&fit_to_width("日", 1)), 0);
+    }
+
+    #[test]
+    fn multilingual_labels_keep_monitor_columns_aligned() {
+        let app = populated_app(UsageScale::Daily);
+        let (frame, _) = render_monitor(&app, 40, 160);
+        let (tab_width, _) = monitor_flex_widths(160);
+        let row = strip_ansi(&frame[4]);
+        let cpu = row.find("0.0%").unwrap();
+        assert_eq!(display_width(&row[..cpu]), 3 + tab_width + 4);
+        let (_, zones) = hint_line(1, &[("日本語", Some(ClickAction::Quit))]);
+        assert_eq!(zones[0].end_column, 6);
+    }
+
+    #[test]
+    fn short_frames_keep_controls_and_drop_hidden_click_targets() {
+        for scale in UsageScale::ALL {
+            let mut app = populated_app(scale);
+            app.selected_day = Some("2026-08-02".into());
+            app.hovered_day = Some("2026-08-02".into());
+            for expanded in [false, true] {
+                app.expanded = expanded;
+                for height in 0..=24 {
+                    for (frame, layout) in [
+                        render_monitor(&app, height, 100),
+                        render_usage(&app, height, 100),
+                    ] {
+                        assert!(frame.len() <= height);
+                        for zone in &layout.zones {
+                            assert!(zone.row > 0 && zone.row <= frame.len());
+                        }
+                        for cell in &layout.calendar_cells {
+                            assert!(cell.row > 0 && cell.row <= frame.len());
+                        }
+                        if height > 0 {
+                            assert!(strip_ansi(frame.last().unwrap()).contains("q quit"));
+                            assert!(layout
+                                .zones
+                                .iter()
+                                .any(|zone| zone.action == ClickAction::Quit
+                                    && zone.row == frame.len()));
+                        }
+                        if layout.shown_count > 0 {
+                            assert!(
+                                layout.terminal_start_row + layout.shown_count - 1 < frame.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_calendar_still_shows_clickable_days() {
+        let app = populated_app(UsageScale::Daily);
+        let (frame, layout) = render_usage(&app, 6, 100);
+        assert_eq!(frame.len(), 6);
+        assert_eq!(layout.calendar_cells.len(), 5);
+        assert!(strip_ansi(&frame[3]).contains("Su Mo Tu We Th Fr Sa"));
+        for cell in &layout.calendar_cells {
+            assert_eq!(cell.row, 5);
+            let weekday = sunday_index(date_to_day_number(&cell.day).unwrap()) as usize;
+            assert_eq!(cell.start_column, weekday * 3 + 1);
+        }
+        assert!(layout
+            .zones
+            .iter()
+            .any(|zone| zone.action == ClickAction::ShowMonitor));
+    }
+
+    #[test]
+    fn the_monitor_explains_when_focus_tracking_is_paused() {
+        let mut app = populated_app(UsageScale::Daily);
+        app.usage_tracker.as_mut().unwrap().last_error = Some("focus query timed out".into());
+        let (frame, _) = render_monitor(&app, 24, 100);
+        assert!(frame
+            .iter()
+            .any(|line| strip_ansi(line).contains("Tracking paused: focus query timed out")));
+    }
+
+    #[test]
+    fn presence_missing_clamshell_is_open_only_after_a_successful_probe() {
+        let absent = parse_ioreg_response(true, "", "AppleClamshellState").unwrap();
+        assert_eq!(parse_clamshell_state(absent), Ok(false));
+        assert!(parse_ioreg_response(false, "", "AppleClamshellState").is_err());
+        assert_eq!(parse_clamshell_state(Some("Yes")), Ok(true));
+        assert_eq!(parse_clamshell_state(Some("No")), Ok(false));
+        assert!(parse_clamshell_state(Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn presence_missing_or_malformed_idle_time_prevents_credit() {
+        for value in [
+            None,
+            Some(""),
+            Some("unknown"),
+            Some("-1"),
+            Some("18446744073709551616"),
+        ] {
+            assert!(
+                parse_idle_time(value).is_err(),
+                "accepted unknown idle time: {value:?}"
+            );
+        }
+        assert_eq!(
+            parse_idle_time(Some(" 123000000000 ")),
+            Ok(Duration::from_secs(123))
+        );
+        assert_eq!(parse_idle_time(Some("0")), Ok(Duration::ZERO));
+    }
+
+    #[test]
+    fn presence_failed_and_malformed_registry_responses_are_errors() {
+        assert!(parse_ioreg_response(false, "\"HIDIdleTime\" = 0", "HIDIdleTime").is_err());
+        assert!(parse_ioreg_response(true, "\"HIDIdleTime\" =", "HIDIdleTime").is_err());
+        assert!(
+            parse_ioreg_response(true, "\"AppleClamshellState\" No", "AppleClamshellState")
+                .is_err()
+        );
+        let idle = parse_ioreg_response(
+            true,
+            "    | |     \"HIDIdleTime\" = 42000000000\n",
+            "HIDIdleTime",
+        )
+        .unwrap();
+        assert_eq!(parse_idle_time(idle), Ok(Duration::from_secs(42)));
+        assert!(parse_idle_time(parse_ioreg_response(true, "", "HIDIdleTime").unwrap()).is_err());
+    }
+
+    #[test]
+    fn runtime_escape_expires_on_an_empty_input_poll() {
+        let mut decoder = InputDecoder::default();
+        let now = Instant::now();
+        assert!(decoder.push_at(b"\x1b", now).is_empty());
+        assert!(decoder
+            .push_at(b"", now + INPUT_SEQUENCE_TIMEOUT)
+            .is_empty());
+        assert!(decoder.pending.is_empty());
+        assert_eq!(
+            decoder.push_at(b"q", now + INPUT_SEQUENCE_TIMEOUT),
+            vec![InputEvent::Key(Key::Char(b'q'))]
+        );
+    }
+
+    #[test]
+    fn runtime_abandoned_mouse_report_does_not_swallow_the_next_key() {
+        let mut decoder = InputDecoder::default();
+        let now = Instant::now();
+        assert!(decoder.push_at(b"\x1b[<0;12", now).is_empty());
+        assert_eq!(
+            decoder.push_at(b"q", now + INPUT_SEQUENCE_TIMEOUT),
+            vec![InputEvent::Key(Key::Char(b'q'))]
+        );
+        assert!(decoder.pending.is_empty());
+    }
+
+    #[test]
+    fn runtime_invalid_mouse_fields_are_rejected_and_quit_survives() {
+        let mut decoder = InputDecoder::default();
+        assert_eq!(
+            decoder.push(b"\x1b[<0;;12;5Mq"),
+            vec![InputEvent::Key(Key::Char(b'q'))]
+        );
+        assert_eq!(
+            decoder.push(b"\x1b[<0;12q"),
+            vec![InputEvent::Key(Key::Char(b'q'))]
+        );
+        assert_eq!(
+            decoder.push(b"\x1b[<0;0;5Mq"),
+            vec![InputEvent::Key(Key::Char(b'q'))]
+        );
+        assert!(decoder.pending.is_empty());
+    }
+
+    #[test]
+    fn runtime_mouse_prefixes_have_a_fixed_storage_bound() {
+        let mut decoder = InputDecoder::default();
+        let mut malformed = b"\x1b[<".to_vec();
+        malformed.extend(std::iter::repeat_n(b'1', 10_000));
+        decoder.push(&malformed);
+        assert!(decoder.pending.len() < MAX_MOUSE_SEQUENCE_BYTES);
+        assert_eq!(decoder.push(b"q"), vec![InputEvent::Key(Key::Char(b'q'))]);
+    }
+
+    #[test]
+    fn runtime_process_worker_never_starts_a_second_sample_in_flight() {
+        let (sender, receiver) = mpsc::channel();
+        let mut sampler = ProcessSampler {
+            pending: Some(receiver),
+        };
+        sampler.start();
+        assert!(sampler.poll().is_none());
+        sender.send(Ok(Vec::new())).unwrap();
+        assert!(sampler.poll().unwrap().unwrap().is_empty());
+        assert!(sampler.pending.is_none());
+    }
+
+    #[test]
+    fn runtime_process_worker_reports_a_disconnection() {
+        let (sender, receiver) = mpsc::channel();
+        let mut sampler = ProcessSampler {
+            pending: Some(receiver),
+        };
+        drop(sender);
+        assert!(sampler.poll().unwrap().is_err());
+        assert!(sampler.pending.is_none());
+    }
+
+    #[test]
+    fn runtime_commands_drain_output_larger_than_a_pipe() {
+        let output = run_command_with_timeout(
+            Command::new("sh").args(["-c", "dd if=/dev/zero bs=65536 count=4 2>/dev/null"]),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 262_144);
+    }
+
+    #[test]
+    fn runtime_commands_are_killed_when_the_deadline_expires() {
+        let start = Instant::now();
+        let error = run_command_with_timeout(
+            Command::new("sh").args(["-c", "exec sleep 5"]),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn runtime_process_queries_request_no_arguments() {
+        assert!(PS_PROCESSES[1].ends_with("comm="));
+        assert!(is_login_process("login"));
+        assert!(is_login_process("/usr/bin/login"));
+        assert!(is_ghostty_app(
+            "/Applications/Ghostty.app/Contents/MacOS/ghostty"
+        ));
+        assert!(is_ghostty_app("ghostty"));
+    }
+
+    #[test]
+    fn runtime_deadline_closes_stdout_in_background_descendants() {
+        let pid_file = env::temp_dir().join(format!(
+            "ghostty-top-runtime-child-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let start = Instant::now();
+        let error = run_command_with_timeout(
+            Command::new("sh")
+                .env("GHOSTTY_TOP_CHILD_PID_FILE", &pid_file)
+                .args([
+                    "-c",
+                    "sleep 30 & echo $! > \"$GHOSTTY_TOP_CHILD_PID_FILE\"; exit 0",
+                ]),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let child_pid = fs::read_to_string(&pid_file).unwrap();
+        fs::remove_file(pid_file).unwrap();
+        let status = run_command_with_timeout(
+            Command::new("ps").args(["-p", child_pid.trim(), "-o", "stat="]),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let state = String::from_utf8_lossy(&status.stdout);
+        // A killed descendant can briefly be a zombie before the OS reaps it.
+        assert!(
+            state.trim().is_empty() || state.trim_start().starts_with('Z'),
+            "background child survived: {state}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_all_focus_probes_fit_inside_the_credit_window() {
+        assert!(
+            USAGE_POLL_INTERVAL
+                + USAGE_SAMPLE_TIMEOUT
+                + PRESENCE_QUERY_TIMEOUT * 2
+                + GHOSTTY_RUNNING_TIMEOUT
+                < MAX_CREDITED_GAP
+        );
     }
 }
