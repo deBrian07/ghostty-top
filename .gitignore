@@ -3,3 +3,4 @@
 /binaries/
 /node_modules/
 *.tgz
+AGENTS.md

@@ -49,8 +49,9 @@ Warnings are treated as errors, so a clippy warning will fail the build.
 
 All the code is in `src/main.rs`. It's one file on purpose.
 
-`AGENTS.md` is the most useful thing to read before changing anything. It
-explains the parts that look odd until you know why they are that way — how
+The comments in `src/main.rs` are the most useful thing to read before
+changing anything. They explain the parts that look odd until you know why
+they are that way — how
 mouse targets are worked out, why the slow lookups run on their own threads,
 why a tab sometimes shows a folder path instead of its name. Getting one of
 those wrong is the easiest way to break something quietly.
