@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -371,20 +372,27 @@ struct Process {
     command: String,
 }
 
+/// Ghostty tab names by tty, and herdr panes by shell pid.
+type Labels = (HashMap<String, String>, HashMap<i32, HerdrPane>);
+
 /// Tab names resolved off the render thread: the Ghostty query costs hundreds
 /// of milliseconds, far too long to block input handling on.
 #[derive(Default)]
 struct LabelCache {
     by_tty: HashMap<String, String>,
-    pending: Option<mpsc::Receiver<HashMap<String, String>>>,
+    herdr: HashMap<i32, HerdrPane>,
+    pending: Option<mpsc::Receiver<Labels>>,
     next_refresh: Option<Instant>,
 }
 
 impl LabelCache {
-    fn poll(&mut self, now: Instant, shells: Vec<(String, i32)>) {
+    fn poll(&mut self, now: Instant, shells: Vec<(String, i32)>, herdr_running: bool) {
         if let Some(pending) = &self.pending {
             match pending.try_recv() {
-                Ok(labels) => self.by_tty = labels,
+                Ok((labels, herdr)) => {
+                    self.by_tty = labels;
+                    self.herdr = herdr;
+                }
                 // A worker that died leaves the previous labels in place.
                 Err(mpsc::TryRecvError::Disconnected) => {}
                 Err(mpsc::TryRecvError::Empty) => return,
@@ -392,12 +400,13 @@ impl LabelCache {
             self.pending = None;
             self.next_refresh = Some(now + TAB_LABEL_REFRESH);
         }
-        if shells.is_empty() || self.next_refresh.is_some_and(|next| now < next) {
+        if (shells.is_empty() && !herdr_running) || self.next_refresh.is_some_and(|next| now < next)
+        {
             return;
         }
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let _ = sender.send(resolve_tab_labels(&shells));
+            let _ = sender.send((resolve_tab_labels(&shells), query_herdr_panes()));
         });
         self.pending = Some(receiver);
     }
@@ -434,6 +443,9 @@ struct Terminal {
     /// The process a leak warning is about, and how much it has grown.
     leak_process: String,
     leak_growth_kib: i64,
+    /// The herdr server a row belongs to. The server's own row holds its own
+    /// pid, and its tabs are drawn as branches beneath it.
+    herdr_server: Option<i32>,
     leak_span: Duration,
 }
 
@@ -650,6 +662,7 @@ impl App {
                 for terminal in &mut terminals {
                     terminal.label = self.labels.label_for(&terminal.tty);
                 }
+                terminals.extend(herdr_terminals(&processes, &self.labels.herdr));
                 self.update_memory_trends(&mut terminals, Instant::now());
                 sort_terminals(&mut terminals, self.sort, self.descending);
                 self.ghostty = ghostty;
@@ -863,12 +876,17 @@ impl App {
 
     /// Kicks off a tab-name refresh when the cached names are stale.
     fn poll_labels(&mut self, now: Instant) {
-        let shells = self
+        // herdr rows are named by herdr; joining them to Ghostty surfaces by
+        // directory would hand them the name of whichever tab shares it.
+        let (herdr, ghostty): (Vec<&Terminal>, Vec<&Terminal>) = self
             .terminals
+            .iter()
+            .partition(|terminal| terminal.herdr_server.is_some());
+        let shells = ghostty
             .iter()
             .map(|terminal| (terminal.tty.clone(), shell_pid(terminal)))
             .collect();
-        self.labels.poll(now, shells);
+        self.labels.poll(now, shells, !herdr.is_empty());
     }
 
     fn enable_usage_tracking(&mut self) {
@@ -1337,6 +1355,407 @@ fn shell_pid(terminal: &Terminal) -> i32 {
         .map_or(terminal.root_pid, |process| process.pid)
 }
 
+/// Where a herdr pane sits in its session, keyed by the pane's shell pid.
+#[derive(Clone, Debug, PartialEq)]
+struct HerdrPane {
+    session: String,
+    tab_id: String,
+    label: String,
+}
+
+/// herdr answers over a local socket in a millisecond or two; anything slower
+/// is a wedged server, not a slow one.
+const HERDR_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// `ps` is read without arguments, so `herdr server` and the `herdr` client
+/// share a name. The server is the one detached from any terminal; the client
+/// always runs inside one.
+fn is_herdr_server(process: &Process) -> bool {
+    command_name(&process.command) == "herdr" && !has_tty(&process.tty)
+}
+
+/// API sockets of the herdr sessions on this machine. Sessions attached over
+/// `--remote` or a saved machine have no socket here, which is the point:
+/// their panes run elsewhere and use none of this machine's resources.
+fn herdr_sockets() -> Vec<(String, PathBuf)> {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    let Some(base) = base.map(|base| base.join("herdr")) else {
+        return Vec::new();
+    };
+    let mut sockets = vec![("default".to_string(), base.join("herdr.sock"))];
+    if let Ok(entries) = fs::read_dir(base.join("sessions")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            sockets.push((name, entry.path().join("herdr.sock")));
+        }
+    }
+    sockets.retain(|(_, path)| path.exists());
+    sockets
+}
+
+/// One read-only request. herdr answers a single line per connection.
+fn herdr_request(socket: &Path, method: &str, params: &str) -> Option<Json> {
+    let mut stream = UnixStream::connect(socket).ok()?;
+    stream.set_read_timeout(Some(HERDR_QUERY_TIMEOUT)).ok()?;
+    stream.set_write_timeout(Some(HERDR_QUERY_TIMEOUT)).ok()?;
+    writeln!(
+        stream,
+        r#"{{"id":"ghostty-top","method":"{method}","params":{params}}}"#
+    )
+    .ok()?;
+    let mut reply = Vec::new();
+    io::BufReader::new(stream)
+        .take(4 * 1024 * 1024)
+        .read_until(b'\n', &mut reply)
+        .ok()?;
+    parse_json(std::str::from_utf8(&reply).ok()?)?.take("result")
+}
+
+/// `workspace › tab`, as herdr's own sidebar names them.
+fn herdr_tab_label(snapshot: &Json, tab_id: &str) -> Option<String> {
+    let find = |list: &str, key: &str, id: &str| {
+        snapshot
+            .get(list)?
+            .items()
+            .iter()
+            .find(|item| item.get(key).and_then(Json::text) == Some(id))
+    };
+    let tab = find("tabs", "tab_id", tab_id)?;
+    let workspace_id = tab.get("workspace_id")?.text()?;
+    let workspace = find("workspaces", "workspace_id", workspace_id)?;
+    Some(format!(
+        "{} › {}",
+        workspace.get("label")?.text()?,
+        tab.get("label")?.text()?
+    ))
+}
+
+/// Every local herdr pane, keyed by the pid of the shell herdr started in it.
+/// The shell pid is herdr's own answer, so the join to `ps` is exact rather
+/// than a guess by directory.
+fn query_herdr_panes() -> HashMap<i32, HerdrPane> {
+    let mut panes = HashMap::new();
+    for (session, socket) in herdr_sockets() {
+        let Some(snapshot) =
+            herdr_request(&socket, "session.snapshot", "{}").and_then(|r| r.take("snapshot"))
+        else {
+            continue;
+        };
+        for pane in snapshot.get("panes").map_or(&[][..], Json::items) {
+            let (Some(pane_id), Some(tab_id)) = (
+                pane.get("pane_id").and_then(Json::text),
+                pane.get("tab_id").and_then(Json::text),
+            ) else {
+                continue;
+            };
+            let params = format!(r#"{{"pane_id":"{}"}}"#, json_escape(pane_id));
+            let Some(shell_pid) = herdr_request(&socket, "pane.process_info", &params)
+                .and_then(|reply| reply.take("process_info"))
+                .and_then(|info| info.get("shell_pid").and_then(Json::number))
+            else {
+                continue;
+            };
+            let label = herdr_tab_label(&snapshot, tab_id).unwrap_or_else(|| tab_id.to_string());
+            panes.insert(
+                shell_pid as i32,
+                HerdrPane {
+                    session: session.clone(),
+                    tab_id: tab_id.to_string(),
+                    label,
+                },
+            );
+        }
+    }
+    panes
+}
+
+/// The herdr tab on screen in a focused Ghostty surface. herdr titles the
+/// terminal it runs in `{hostname}: {workspace}` by default, rendered by the
+/// server that owns the panes, so a surface titled with this machine's name and
+/// a local session's focused workspace is showing that session. A remote
+/// session names its own host and fails the match, as do a customised title and
+/// two local sessions showing the same workspace name; the time then stays
+/// with the Ghostty tab rather than going to a guess.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn herdr_focus(
+    focus: &FocusedTab,
+    hostname: &str,
+    sessions: &[(String, Json)],
+) -> Option<FocusedTab> {
+    let mut found = sessions.iter().filter_map(|(session, snapshot)| {
+        let workspace_id = snapshot.get("focused_workspace_id")?.text()?;
+        let workspace = snapshot
+            .get("workspaces")?
+            .items()
+            .iter()
+            .find(|item| item.get("workspace_id").and_then(Json::text) == Some(workspace_id))?
+            .get("label")?
+            .text()?;
+        if focus.terminal_name != format!("{hostname}: {workspace}") {
+            return None;
+        }
+        let tab_id = snapshot.get("focused_tab_id")?.text()?;
+        Some(FocusedTab {
+            tab_id: format!("herdr:{session}:{tab_id}"),
+            tab_name: format!("herdr › {}", herdr_tab_label(snapshot, tab_id)?),
+            terminal_id: snapshot
+                .get("focused_pane_id")
+                .and_then(Json::text)
+                .unwrap_or_default()
+                .to_string(),
+            terminal_name: focus.terminal_name.clone(),
+        })
+    });
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
+}
+
+#[cfg(target_os = "macos")]
+fn local_herdr_focus(focus: &FocusedTab) -> Option<FocusedTab> {
+    let sessions: Vec<(String, Json)> = herdr_sockets()
+        .into_iter()
+        .filter_map(|(name, socket)| {
+            let snapshot = herdr_request(&socket, "session.snapshot", "{}")?.take("snapshot")?;
+            Some((name, snapshot))
+        })
+        .collect();
+    if sessions.is_empty() {
+        return None;
+    }
+    // Read every time: macOS renames the host when the network changes, and
+    // herdr renders the title with whatever the name is now.
+    let output = Command::new("hostname")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    let hostname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    herdr_focus(focus, &hostname, &sessions)
+}
+
+fn json_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Just enough JSON to read herdr's replies.
+#[derive(Debug, PartialEq)]
+enum Json {
+    Null,
+    Bool(bool),
+    Number(f64),
+    Text(String),
+    Array(Vec<Json>),
+    Object(Vec<(String, Json)>),
+}
+
+impl Json {
+    fn get(&self, key: &str) -> Option<&Json> {
+        match self {
+            Json::Object(fields) => fields
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value),
+            _ => None,
+        }
+    }
+
+    fn take(self, key: &str) -> Option<Json> {
+        match self {
+            Json::Object(fields) => fields
+                .into_iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value),
+            _ => None,
+        }
+    }
+
+    fn text(&self) -> Option<&str> {
+        match self {
+            Json::Text(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn number(&self) -> Option<f64> {
+        match self {
+            Json::Number(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn items(&self) -> &[Json] {
+        match self {
+            Json::Array(items) => items,
+            _ => &[],
+        }
+    }
+}
+
+fn parse_json(text: &str) -> Option<Json> {
+    let mut parser = JsonParser {
+        bytes: text.as_bytes(),
+        at: 0,
+        depth: 0,
+    };
+    let value = parser.value()?;
+    parser.skip_space();
+    (parser.at == parser.bytes.len()).then_some(value)
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    depth: usize,
+}
+
+impl JsonParser<'_> {
+    fn skip_space(&mut self) {
+        while matches!(self.bytes.get(self.at), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.at += 1;
+        }
+    }
+
+    fn eat(&mut self, byte: u8) -> bool {
+        self.skip_space();
+        let found = self.bytes.get(self.at) == Some(&byte);
+        if found {
+            self.at += 1;
+        }
+        found
+    }
+
+    fn literal(&mut self, word: &str, value: Json) -> Option<Json> {
+        let found = self.bytes[self.at..].starts_with(word.as_bytes());
+        found.then(|| {
+            self.at += word.len();
+            value
+        })
+    }
+
+    fn value(&mut self) -> Option<Json> {
+        self.skip_space();
+        match *self.bytes.get(self.at)? {
+            open @ (b'{' | b'[') => {
+                // A reply from our own user's server is trusted, but a bound
+                // keeps a corrupt one from overflowing the stack.
+                self.depth += 1;
+                if self.depth > 64 {
+                    return None;
+                }
+                self.at += 1;
+                let close = if open == b'{' { b'}' } else { b']' };
+                let mut fields = Vec::new();
+                let mut items = Vec::new();
+                if !self.eat(close) {
+                    loop {
+                        if open == b'{' {
+                            self.skip_space();
+                            let key = self.string()?;
+                            if !self.eat(b':') {
+                                return None;
+                            }
+                            fields.push((key, self.value()?));
+                        } else {
+                            items.push(self.value()?);
+                        }
+                        if self.eat(close) {
+                            break;
+                        }
+                        if !self.eat(b',') {
+                            return None;
+                        }
+                    }
+                }
+                self.depth -= 1;
+                Some(if open == b'{' {
+                    Json::Object(fields)
+                } else {
+                    Json::Array(items)
+                })
+            }
+            b'"' => self.string().map(Json::Text),
+            b't' => self.literal("true", Json::Bool(true)),
+            b'f' => self.literal("false", Json::Bool(false)),
+            b'n' => self.literal("null", Json::Null),
+            _ => {
+                let start = self.at;
+                while matches!(
+                    self.bytes.get(self.at),
+                    Some(b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                ) {
+                    self.at += 1;
+                }
+                std::str::from_utf8(&self.bytes[start..self.at])
+                    .ok()?
+                    .parse()
+                    .ok()
+                    .map(Json::Number)
+            }
+        }
+    }
+
+    fn string(&mut self) -> Option<String> {
+        if self.bytes.get(self.at) != Some(&b'"') {
+            return None;
+        }
+        self.at += 1;
+        let mut out = Vec::new();
+        loop {
+            let byte = *self.bytes.get(self.at)?;
+            self.at += 1;
+            let decoded = match byte {
+                b'"' => return String::from_utf8(out).ok(),
+                b'\\' => {
+                    let escape = *self.bytes.get(self.at)?;
+                    self.at += 1;
+                    match escape {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'u' => {
+                            let high = self.hex4()?;
+                            let code = if (0xD800..0xDC00).contains(&high) {
+                                if !self.bytes[self.at..].starts_with(b"\\u") {
+                                    return None;
+                                }
+                                self.at += 2;
+                                let low = self.hex4()?;
+                                if !(0xDC00..0xE000).contains(&low) {
+                                    return None;
+                                }
+                                0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+                            } else {
+                                high
+                            };
+                            char::from_u32(code)?
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => {
+                    out.push(byte);
+                    continue;
+                }
+            };
+            let mut buffer = [0; 4];
+            out.extend_from_slice(decoded.encode_utf8(&mut buffer).as_bytes());
+        }
+    }
+
+    fn hex4(&mut self) -> Option<u32> {
+        let digits = self.bytes.get(self.at..self.at + 4)?;
+        self.at += 4;
+        u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
+    }
+}
+
 /// Time to credit between two observations, or None when the gap is too large
 /// to have been continuous use. Both clocks must agree: whether the platform
 /// freezes the monotonic clock across a sleep or keeps counting through it, one
@@ -1803,12 +2222,13 @@ end tell"#;
     if fields.len() != 4 {
         return Err("Ghostty returned an unexpected focus response".to_string());
     }
-    Ok(Some(FocusedTab {
+    let focus = FocusedTab {
         tab_id: fields[0].to_string(),
         tab_name: fields[1].to_string(),
         terminal_id: fields[2].to_string(),
         terminal_name: fields[3].to_string(),
-    }))
+    };
+    Ok(Some(local_herdr_focus(&focus).unwrap_or(focus)))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2509,6 +2929,7 @@ fn main() {
             .map(|terminal| (terminal.tty.clone(), shell_pid(terminal)))
             .collect::<Vec<_>>();
         app.labels.by_tty = resolve_tab_labels(&shells);
+        app.labels.herdr = query_herdr_panes();
         app.refresh();
         print_snapshot(&app);
         return;
@@ -2790,64 +3211,125 @@ fn aggregate(processes: &[Process]) -> (Option<Process>, Vec<Terminal>) {
         }
     }
 
-    let self_pid = std::process::id() as i32;
     let mut terminals = Vec::with_capacity(roots.len());
     for root in roots {
-        let mut members: Vec<Process> = processes
+        let members = processes
             .iter()
             .filter(|p| owner.get(&p.pid) == Some(&root.pid))
-            .filter(|p| {
-                p.pid != self_pid && !(p.ppid == self_pid && command_name(&p.command) == "ps")
-            })
             .cloned()
             .collect();
-        let cpu = members.iter().map(|p| p.cpu).sum();
-        let rss_kib = members.iter().map(|p| p.rss_kib).sum();
-        let footprint_kib = members.iter().map(|p| p.footprint_kib).sum();
-        let footprint_complete = members.iter().all(|p| p.footprint_available);
-        members.sort_by_key(|process| std::cmp::Reverse(process.footprint_kib));
-        // The kernel already knows what the tab is running: the tty hands the
-        // keyboard to one process group, and that group's leader is the
-        // program. Guessing from CPU used to name a busy background job.
-        let foreground = members.iter().find(|p| {
-            p.tpgid > 0 && p.pid == p.pgid && p.pgid == p.tpgid && !is_login_process(&p.command)
-        });
-        let activity = match foreground {
-            // A tab sitting at its prompt is running its shell, which is worth
-            // saying plainly rather than by name.
-            Some(process) if is_shell(&process.command) => "shell".to_string(),
-            Some(process) => command_name(&process.command),
-            // No foreground group is reported while a tab is between commands,
-            // so fall back to whatever is working hardest.
-            None => members
-                .iter()
-                .filter(|p| !is_login_process(&p.command) && !is_shell(&p.command))
-                .max_by(|a, b| a.cpu.total_cmp(&b.cpu).then(a.rss_kib.cmp(&b.rss_kib)))
-                .map(|p| command_name(&p.command))
-                .unwrap_or_else(|| "shell".to_string()),
-        };
-        terminals.push(Terminal {
-            root_pid: root.pid,
-            label: root.tty.clone(),
-            tty: root.tty.clone(),
-            cpu,
-            rss_kib,
-            footprint_kib,
-            footprint_complete,
-            processes: members,
-            activity,
-            elapsed: root.elapsed.clone(),
-            age_seconds: root.age_seconds,
-            memory_growth_kib: 0,
-            memory_slope_kib_per_min: 0.0,
-            memory_samples: 0,
-            leak_suspected: false,
-            leak_process: String::new(),
-            leak_growth_kib: 0,
-            leak_span: Duration::ZERO,
-        });
+        terminals.push(terminal_for(root, members));
     }
     (ghostty, terminals)
+}
+
+/// One row: the root process a terminal hangs from and everything it owns.
+fn terminal_for(root: &Process, mut members: Vec<Process>) -> Terminal {
+    let self_pid = std::process::id() as i32;
+    members
+        .retain(|p| p.pid != self_pid && !(p.ppid == self_pid && command_name(&p.command) == "ps"));
+    let cpu = members.iter().map(|p| p.cpu).sum();
+    let rss_kib = members.iter().map(|p| p.rss_kib).sum();
+    let footprint_kib = members.iter().map(|p| p.footprint_kib).sum();
+    let footprint_complete = members.iter().all(|p| p.footprint_available);
+    members.sort_by_key(|process| std::cmp::Reverse(process.footprint_kib));
+    // The kernel already knows what the tab is running: the tty hands the
+    // keyboard to one process group, and that group's leader is the
+    // program. Guessing from CPU used to name a busy background job.
+    let foreground = members.iter().find(|p| {
+        p.tpgid > 0 && p.pid == p.pgid && p.pgid == p.tpgid && !is_login_process(&p.command)
+    });
+    let activity = match foreground {
+        // A tab sitting at its prompt is running its shell, which is worth
+        // saying plainly rather than by name.
+        Some(process) if is_shell(&process.command) => "shell".to_string(),
+        Some(process) => command_name(&process.command),
+        // No foreground group is reported while a tab is between commands,
+        // so fall back to whatever is working hardest.
+        None => members
+            .iter()
+            .filter(|p| !is_login_process(&p.command) && !is_shell(&p.command))
+            .max_by(|a, b| a.cpu.total_cmp(&b.cpu).then(a.rss_kib.cmp(&b.rss_kib)))
+            .map(|p| command_name(&p.command))
+            .unwrap_or_else(|| "shell".to_string()),
+    };
+    Terminal {
+        root_pid: root.pid,
+        label: root.tty.clone(),
+        tty: root.tty.clone(),
+        cpu,
+        rss_kib,
+        footprint_kib,
+        footprint_complete,
+        processes: members,
+        activity,
+        elapsed: root.elapsed.clone(),
+        age_seconds: root.age_seconds,
+        memory_growth_kib: 0,
+        memory_slope_kib_per_min: 0.0,
+        memory_samples: 0,
+        leak_suspected: false,
+        leak_process: String::new(),
+        leak_growth_kib: 0,
+        leak_span: Duration::ZERO,
+        herdr_server: None,
+    }
+}
+
+/// herdr runs its panes under a detached server, not under Ghostty, so
+/// `aggregate` never sees them. Each server gets a row of its own holding only
+/// itself, and its panes are grouped by herdr tab into rows beneath it. A pane
+/// herdr has not described yet stands alone under its tty until it is.
+fn herdr_terminals(processes: &[Process], panes: &HashMap<i32, HerdrPane>) -> Vec<Terminal> {
+    let by_parent = child_map(processes);
+    let mut terminals = Vec::new();
+    for server in processes.iter().filter(|p| is_herdr_server(p)) {
+        let mut row = terminal_for(server, vec![server.clone()]);
+        // The Ghostty tab running the herdr client is often named "herdr" too.
+        row.label = "herdr server".to_string();
+        row.tty = "herdr".to_string();
+        row.herdr_server = Some(server.pid);
+        let server_row = terminals.len();
+        terminals.push(row);
+
+        let mut tabs: BTreeMap<String, Vec<&Process>> = BTreeMap::new();
+        for shell in processes
+            .iter()
+            .filter(|p| p.ppid == server.pid && has_tty(&p.tty))
+        {
+            let key = panes
+                .get(&shell.pid)
+                .map_or_else(|| shell.tty.clone(), |pane| pane.tab_id.clone());
+            tabs.entry(key).or_default().push(shell);
+        }
+        for shells in tabs.values() {
+            let mut owner = HashMap::new();
+            for shell in shells {
+                owner.insert(shell.pid, shell.pid);
+                assign_descendants(shell.pid, shell.pid, &by_parent, &mut owner);
+            }
+            // Orphans reparented to pid 1 still hold the pane's tty.
+            let ttys: HashSet<&str> = shells.iter().map(|shell| shell.tty.as_str()).collect();
+            let members = processes
+                .iter()
+                .filter(|p| owner.contains_key(&p.pid) || ttys.contains(p.tty.as_str()))
+                .cloned()
+                .collect();
+            let Some(root) = shells.iter().min_by_key(|shell| shell.pid) else {
+                continue;
+            };
+            let mut row = terminal_for(root, members);
+            if let Some(pane) = shells.iter().find_map(|shell| panes.get(&shell.pid)) {
+                row.label = pane.label.clone();
+                if pane.session != "default" {
+                    terminals[server_row].label = format!("herdr server · {}", pane.session);
+                }
+            }
+            row.herdr_server = Some(server.pid);
+            terminals.push(row);
+        }
+    }
+    terminals
 }
 
 fn child_map(processes: &[Process]) -> HashMap<i32, Vec<i32>> {
@@ -3039,6 +3521,38 @@ fn sort_terminals(terminals: &mut [Terminal], sort: SortBy, descending: bool) {
             order
         }
     });
+    // herdr tabs stay under their server whatever the sort, in sorted order.
+    let sorted = terminals.to_vec();
+    let is_branch = |t: &Terminal| t.herdr_server.is_some_and(|server| server != t.root_pid);
+    let mut grouped = Vec::with_capacity(sorted.len());
+    for top in sorted.iter().filter(|t| !is_branch(t)) {
+        grouped.push(top.clone());
+        if top.herdr_server.is_some() {
+            grouped.extend(
+                sorted
+                    .iter()
+                    .filter(|t| is_branch(t) && t.herdr_server == Some(top.root_pid))
+                    .cloned(),
+            );
+        }
+    }
+    if grouped.len() == terminals.len() {
+        terminals.clone_from_slice(&grouped);
+    }
+}
+
+/// A herdr tab drawn as a branch of its server's row.
+fn tree_label(terminals: &[Terminal], index: usize) -> String {
+    let terminal = &terminals[index];
+    match terminal.herdr_server {
+        Some(server) if server != terminal.root_pid => {
+            let last = terminals
+                .get(index + 1)
+                .is_none_or(|next| next.herdr_server != Some(server));
+            format!("{} {}", if last { "└─" } else { "├─" }, terminal.label)
+        }
+        _ => terminal.label.clone(),
+    }
 }
 
 fn natural_tty(tty: &str) -> u32 {
@@ -3099,8 +3613,9 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
     } else {
         format!("{DIM}·  press{RESET} u {DIM}for the usage calendar{RESET}")
     };
-    lines.push(format!(
-        "{BOLD}{GREEN}ghostty-top{RESET}  {calendar_teaser}{alert_status}",
+    lines.push(with_version(
+        format!("{BOLD}{GREEN}ghostty-top{RESET}  {calendar_teaser}{alert_status}"),
+        width,
     ));
     lines.push(format!(
         "Ghostty  {YELLOW}{shared_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}    {} terminals  {YELLOW}{terminal_cpu:.1}%{RESET} CPU {DIM}·{RESET} {CYAN}{}{RESET}",
@@ -3160,7 +3675,7 @@ fn render_monitor(app: &App, height: usize, width: usize) -> (Vec<String>, Layou
             let marker = if selected { "›" } else { " " };
             line.push_str(&format!(
                 "{marker}  {} {YELLOW}{:>6.1}%{RESET}{row_style} {CYAN}{:>9}{RESET}{row_style} {}{row_style} {:>7} {:>11} {}",
-                pad_to_width(&terminal.label, tab_width, false),
+                pad_to_width(&tree_label(&app.terminals, index), tab_width, false),
                 terminal.cpu,
                 memory_value(terminal.footprint_kib, terminal.footprint_complete),
                 trend_cell(terminal),
@@ -3247,8 +3762,11 @@ fn render_usage(app: &App, height: usize, width: usize) -> (Vec<String>, Layout)
     }
     const WEEKDAYS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
     let weeks = visible_weeks(width);
-    let mut lines = vec![format!(
-        "{BOLD}{GREEN}ghostty-top{RESET}  {BOLD}usage calendar{RESET}  {DIM}time spent with each Ghostty tab focused{RESET}"
+    let mut lines = vec![with_version(
+        format!(
+            "{BOLD}{GREEN}ghostty-top{RESET}  {BOLD}usage calendar{RESET}  {DIM}time spent with each Ghostty tab focused{RESET}"
+        ),
+        width,
     )];
     let mut layout = Layout::default();
     let tracker = app.usage_tracker.as_ref();
@@ -3444,7 +3962,10 @@ fn render_usage_compact(app: &App, height: usize, width: usize) -> (Vec<String>,
     let weeks = if by_week { visible_weeks(width) } else { 1 };
     let start = today_number - sunday_index(today_number) - (weeks as i64 - 1) * 7;
     let daily = daily_totals(tracker, start, weeks, today_number);
-    let mut lines = vec![format!("{BOLD}{GREEN}ghostty-top{RESET}  usage calendar")];
+    let mut lines = vec![with_version(
+        format!("{BOLD}{GREEN}ghostty-top{RESET}  usage calendar"),
+        width,
+    )];
     let mut layout = Layout::default();
     if height >= 6 {
         lines.push(format!(
@@ -4159,10 +4680,10 @@ fn print_snapshot(app: &App) {
         "{:<24} {:>7}  {:>9}  {:>11}  {:>5}  {:>11}  ACTIVITY",
         "TAB", "CPU", "RAM", "TREND", "PROCS", "AGE"
     );
-    for terminal in &app.terminals {
+    for (index, terminal) in app.terminals.iter().enumerate() {
         println!(
             "{} {:>6.1}%  {:>9}  {:>11}  {:>5}  {:>11}  {}{}",
-            pad_to_width(&terminal.label, 24, false),
+            pad_to_width(&tree_label(&app.terminals, index), 24, false),
             terminal.cpu,
             memory_value(terminal.footprint_kib, terminal.footprint_complete),
             if terminal.memory_samples < 2 {
@@ -4214,6 +4735,18 @@ fn human_bytes(kib: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// Puts the version at the right edge of a title line, clipping the line
+/// to make room. Only a very narrow window drops the version instead.
+fn with_version(line: String, width: usize) -> String {
+    let version = concat!("v", env!("CARGO_PKG_VERSION"));
+    if width < 40 {
+        return line;
+    }
+    let line = fit_to_width(&line, width - version.len() - 2);
+    let gap = " ".repeat(width - display_width(&line) - version.len());
+    format!("{line}{gap}{DIM}{version}{RESET}")
 }
 
 /// Terminal columns, rather than Rust's scalar count: combining marks occupy
@@ -5112,6 +5645,222 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    fn herdr_pane(tab_id: &str, label: &str) -> HerdrPane {
+        HerdrPane {
+            session: "default".into(),
+            tab_id: tab_id.into(),
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn herdr_panes_are_grouped_by_tab_under_their_server() {
+        let processes = vec![
+            p(10, 1, "??", 0.5, 30_000, "/Users/me/.local/bin/herdr"),
+            p(11, 10, "ttys011", 0.0, 2_000, "-zsh"),
+            p(12, 11, "ttys011", 4.0, 400_000, "claude"),
+            p(13, 10, "ttys013", 0.0, 2_000, "-zsh"),
+            p(14, 13, "ttys013", 1.0, 100_000, "codex"),
+            p(15, 10, "ttys015", 0.0, 2_000, "-zsh"),
+            // Orphaned, but still on a pane's tty.
+            p(16, 1, "ttys015", 2.0, 9_000, "node server.js"),
+            // The client in a Ghostty tab is not part of the server.
+            p(20, 19, "ttys005", 0.1, 15_000, "herdr"),
+        ];
+        let panes = HashMap::from([
+            (11, herdr_pane("w1:t1", "Agents › 2nd-brain")),
+            (13, herdr_pane("w1:t1", "Agents › 2nd-brain")),
+            (15, herdr_pane("w1:t2", "Agents › Notes")),
+        ]);
+        let mut terminals = herdr_terminals(&processes, &panes);
+        sort_terminals(&mut terminals, SortBy::Memory, true);
+
+        let rows: Vec<(String, usize, u64)> = (0..terminals.len())
+            .map(|index| {
+                (
+                    tree_label(&terminals, index),
+                    terminals[index].processes.len(),
+                    terminals[index].footprint_kib,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("herdr server".to_string(), 1, 30_000),
+                ("├─ Agents › 2nd-brain".to_string(), 4, 504_000),
+                ("└─ Agents › Notes".to_string(), 2, 11_000),
+            ]
+        );
+        assert!(terminals.iter().all(|t| t.herdr_server == Some(10)));
+    }
+
+    #[test]
+    fn herdr_tabs_stay_under_their_server_whatever_the_sort() {
+        let mut terminals = vec![
+            Terminal {
+                root_pid: 10,
+                label: "herdr server".into(),
+                footprint_kib: 10,
+                herdr_server: Some(10),
+                ..Terminal::default()
+            },
+            Terminal {
+                root_pid: 11,
+                label: "Agents › big".into(),
+                footprint_kib: 900,
+                herdr_server: Some(10),
+                ..Terminal::default()
+            },
+            Terminal {
+                root_pid: 20,
+                label: "ghostty tab".into(),
+                footprint_kib: 500,
+                ..Terminal::default()
+            },
+        ];
+        sort_terminals(&mut terminals, SortBy::Memory, true);
+        let order: Vec<i32> = terminals.iter().map(|t| t.root_pid).collect();
+        assert_eq!(order, vec![20, 10, 11]);
+    }
+
+    #[test]
+    fn an_undescribed_herdr_pane_stands_alone_under_its_tty() {
+        let processes = vec![
+            p(10, 1, "??", 0.0, 1_000, "herdr"),
+            p(11, 10, "ttys011", 0.0, 2_000, "-zsh"),
+            p(21, 10, "ttys021", 0.0, 2_000, "-zsh"),
+        ];
+        let mut work = herdr_pane("w1:t1", "Agents › api");
+        work.session = "work".into();
+        let terminals = herdr_terminals(&processes, &HashMap::from([(21, work)]));
+        let labels: Vec<String> = (0..terminals.len())
+            .map(|index| tree_label(&terminals, index))
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["herdr server · work", "├─ ttys011", "└─ Agents › api"]
+        );
+    }
+
+    #[test]
+    fn the_herdr_server_is_the_herdr_without_a_terminal() {
+        assert!(is_herdr_server(&p(
+            1,
+            1,
+            "??",
+            0.0,
+            1,
+            "/Users/me/.local/bin/herdr"
+        )));
+        assert!(is_herdr_server(&p(1, 1, "?", 0.0, 1, "herdr")));
+        // The client runs inside a Ghostty tab.
+        assert!(!is_herdr_server(&p(1, 1, "ttys005", 0.0, 1, "herdr")));
+        assert!(!is_herdr_server(&p(1, 1, "??", 0.0, 1, "node")));
+    }
+
+    #[test]
+    fn reads_herdr_json_replies() {
+        let reply = parse_json(
+            r#" {"id":"x","result":{"n":-1.5e2,"ok":true,"none":null,
+               "list":[1, "a\"b\\c\/\n", "é😀", "✳ raw"],"empty":{}}}"#,
+        )
+        .unwrap();
+        let result = reply.take("result").unwrap();
+        assert_eq!(result.get("n").and_then(Json::number), Some(-150.0));
+        assert_eq!(result.get("ok"), Some(&Json::Bool(true)));
+        assert_eq!(result.get("none"), Some(&Json::Null));
+        let list = result.get("list").unwrap().items();
+        assert_eq!(list[1].text(), Some("a\"b\\c/\n"));
+        assert_eq!(list[2].text(), Some("é😀"));
+        assert_eq!(list[3].text(), Some("✳ raw"));
+        assert_eq!(result.get("empty"), Some(&Json::Object(Vec::new())));
+
+        assert_eq!(parse_json(r#"{"a":1"#), None);
+        assert_eq!(parse_json(r#"{"a":1} trailing"#), None);
+        assert_eq!(parse_json(r#""\ud83d""#), None);
+        assert_eq!(parse_json(&"[".repeat(1_000)), None);
+    }
+
+    #[test]
+    fn names_a_herdr_tab_by_workspace_and_tab() {
+        let snapshot = parse_json(
+            r#"{"workspaces":[{"workspace_id":"w1","label":"Agents"}],
+               "tabs":[{"tab_id":"w1:t2","workspace_id":"w1","label":"2nd-brain"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            herdr_tab_label(&snapshot, "w1:t2").as_deref(),
+            Some("Agents › 2nd-brain")
+        );
+        assert_eq!(herdr_tab_label(&snapshot, "w1:t9"), None);
+    }
+
+    #[test]
+    fn focused_time_goes_to_the_herdr_tab_only_when_the_title_proves_it_is_local() {
+        let snapshot = |workspace: &str| {
+            parse_json(&format!(
+                r#"{{"focused_workspace_id":"w1","focused_tab_id":"w1:t4","focused_pane_id":"w1:p4",
+                   "workspaces":[{{"workspace_id":"w1","label":"{workspace}"}}],
+                   "tabs":[{{"tab_id":"w1:t4","workspace_id":"w1","label":"ghostty-top"}}]}}"#
+            ))
+            .unwrap()
+        };
+        let ghostty = |title: &str| FocusedTab {
+            tab_id: "tab-1".into(),
+            tab_name: "herdr".into(),
+            terminal_id: "T1".into(),
+            terminal_name: title.into(),
+        };
+        let local = vec![("default".to_string(), snapshot("Agents"))];
+
+        let focus = herdr_focus(&ghostty("mac.local: Agents"), "mac.local", &local).unwrap();
+        assert_eq!(focus.tab_id, "herdr:default:w1:t4");
+        assert_eq!(focus.tab_name, "herdr › Agents › ghostty-top");
+        assert_eq!(focus.terminal_id, "w1:p4");
+
+        // A remote session renders its own hostname into the title.
+        assert_eq!(
+            herdr_focus(&ghostty("devbox: Agents"), "mac.local", &local),
+            None
+        );
+        // An ordinary Ghostty tab, or a customised herdr title.
+        assert_eq!(herdr_focus(&ghostty("~/code"), "mac.local", &local), None);
+        // Two local sessions on the same workspace name cannot be told apart.
+        let twins = vec![
+            ("default".to_string(), snapshot("Agents")),
+            ("work".to_string(), snapshot("Agents")),
+        ];
+        assert_eq!(
+            herdr_focus(&ghostty("mac.local: Agents"), "mac.local", &twins),
+            None
+        );
+    }
+
+    #[test]
+    fn the_version_sits_at_the_right_edge_when_there_is_room() {
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        let line = with_version(format!("{BOLD}ghostty-top{RESET}"), 40);
+        let gap = " ".repeat(40 - "ghostty-top".len() - version.len());
+        assert_eq!(
+            line,
+            format!("{BOLD}ghostty-top{RESET}{gap}{DIM}{version}{RESET}")
+        );
+
+        // A long line is clipped to make room rather than hiding the version.
+        let long = with_version("x".repeat(60), 40);
+        assert_eq!(
+            long,
+            format!(
+                "{}{RESET}  {DIM}{version}{RESET}",
+                "x".repeat(40 - 2 - version.len())
+            )
+        );
+
+        // Too narrow for both: the title keeps its words.
+        assert_eq!(with_version("ghostty-top".to_string(), 30), "ghostty-top");
+    }
+
     #[test]
     fn groups_descendants_under_ghostty_terminals() {
         let processes = vec![
@@ -5858,6 +6607,7 @@ mod tests {
                 leak_suspected: index % 4 == 0,
                 leak_process: "node".into(),
                 leak_growth_kib: 96 * 1024,
+                herdr_server: None,
                 leak_span: Duration::from_secs(900),
             });
         }

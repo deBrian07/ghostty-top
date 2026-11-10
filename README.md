@@ -33,6 +33,11 @@ ghostty-top --once   # print once and exit
 Each row is one Ghostty tab. Ghostty draws all tabs in a single process, so the
 memory that process uses is shown on its own line at the top.
 
+If you use [herdr](https://herdr.dev), its panes run under a background server
+rather than under Ghostty. Each local herdr server gets a `herdr server` row,
+with its tabs branched underneath as `├─ workspace › tab`. Sessions on other
+machines are left out, since they use none of this Mac's memory.
+
 You can use the mouse for everything. Click a column title to sort by it, click
 it again to flip the order, click a row to select it, and click it once more to
 see the processes inside. The controls at the bottom are buttons too.
@@ -57,6 +62,11 @@ Press `u`. There are three ways to look at it, with `d`, `w`, and `c`:
 
 Point at any square or bar to see its total. Click it to see which tabs the
 time went to.
+
+Time in a local herdr session goes to the herdr tab you're on, shown as
+`herdr › workspace › tab`. That relies on herdr's default window title
+(`{hostname}: {workspace}`); with a custom title, or a remote session, the time
+goes to the Ghostty tab instead.
 
 This part is macOS only. Time only counts when Ghostty is the app you're using
 and you're actually at your Mac. Nothing is counted when the lid is closed, when the screen has been
